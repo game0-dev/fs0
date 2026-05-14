@@ -1,0 +1,20 @@
+[package]
+name = "fs0-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs0-core = { version = "0.1.0", path = "../fs0-core" }
+fs0-transport = { version = "0.1.0", path = "../fs0-transport" }
+iroh.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+
+[dev-dependencies]
+fs0-central = { version = "0.1.0", path = "../fs0-central" }
+fs0-storage = { version = "0.1.0", path = "../fs0-storage" }
+fs0-volume = { version = "0.1.0", path = "../fs0-volume" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

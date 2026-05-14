@@ -1,0 +1,20 @@
+[package]
+name = "fs0-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs0-volume = { version = "0.1.0", path = "../fs0-volume" }
+fs0-core = { version = "0.1.0", path = "../fs0-core" }
+fs0-transport = { version = "0.1.0", path = "../fs0-transport" }
+iroh.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

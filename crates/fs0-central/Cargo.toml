@@ -1,0 +1,23 @@
+[package]
+name = "fs0-central"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+fs0-core = { version = "0.1.0", path = "../fs0-core" }
+fs0-transport = { version = "0.1.0", path = "../fs0-transport" }
+iroh-relay = { version = "1.0.0-rc.0", features = ["server"] }
+rcgen = "0.14.8"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

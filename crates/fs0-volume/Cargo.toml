@@ -1,0 +1,16 @@
+[package]
+name = "fs0-volume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs0-core = { version = "0.1.0", path = "../fs0-core" }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

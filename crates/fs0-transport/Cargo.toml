@@ -1,0 +1,15 @@
+[package]
+name = "fs0-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs0-core = { version = "0.1.0", path = "../fs0-core" }
+iroh.workspace = true
+iroh-relay = "1.0.0-rc.0"
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
