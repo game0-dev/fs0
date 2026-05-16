@@ -1,7 +1,6 @@
-use crate::db::{CommitFileState, InsertChunk, VolumeDb, to_usize};
+use crate::db::{InsertChunk, VolumeDb, to_usize};
 use crate::error::{Result, VolumeError};
 use fs0_core::ChunkId;
-use fs0_core::blake3_hash;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -26,23 +25,11 @@ pub struct VolumeMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileMeta {
-    pub file_id: u64,
-    pub version: u64,
-    pub size_bytes: u64,
-    pub compressed_size_bytes: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkMeta {
-    pub file_id: u64,
-    pub chunk_index: u64,
+    pub chunk_id: ChunkId,
     pub volume_offset: u64,
     pub raw_len: u64,
     pub compressed_len: u64,
-    pub hash: ChunkId,
 }
 
 #[derive(Debug, Clone)]
@@ -123,32 +110,20 @@ impl Volume {
             .clone()
     }
 
-    pub async fn file_meta(&self, file_id: u64) -> Result<FileMeta> {
-        let state = self.state.lock().await;
-        state
-            .db
-            .load_file_meta(file_id)?
-            .ok_or(VolumeError::FileNotFound(file_id))
-    }
-
     pub async fn put_chunk(
         &self,
-        file_id: u64,
-        chunk_index: u64,
+        chunk_id: ChunkId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
-        validate_chunk(raw_len, &compressed_bytes)?;
+        validate_chunk(chunk_id, raw_len, &compressed_bytes)?;
 
-        let hash = blake3_hash(&compressed_bytes);
         let compressed_len = compressed_bytes.len() as u64;
         let (insert, next_active_offset) = {
             let mut state = self.state.lock().await;
-            match state.db.load_chunk(file_id, chunk_index)? {
+            match state.db.load_chunk(chunk_id)? {
                 Some(existing)
-                    if existing.hash == hash
-                        && existing.raw_len == raw_len
-                        && existing.compressed_len == compressed_len =>
+                    if existing.raw_len == raw_len && existing.compressed_len == compressed_len =>
                 {
                     return Ok(existing);
                 }
@@ -180,12 +155,10 @@ impl Volume {
 
             (
                 InsertChunk {
-                    file_id,
-                    chunk_index,
+                    chunk_id,
                     volume_offset,
                     raw_len,
                     compressed_len,
-                    hash,
                 },
                 next_active_offset,
             )
@@ -203,7 +176,7 @@ impl Volume {
         let now = now_ms();
         state
             .db
-            .upsert_chunk_and_update_active_offset(&insert, next_active_offset, now)?;
+            .insert_chunk_and_update_active_offset(&insert, next_active_offset, now)?;
         state.meta = state.db.load_meta()?;
         *self
             .meta_cache
@@ -212,11 +185,8 @@ impl Volume {
 
         state
             .db
-            .load_chunk(file_id, chunk_index)?
-            .ok_or(VolumeError::ChunkNotFound {
-                file_id,
-                chunk_index,
-            })
+            .load_chunk(chunk_id)?
+            .ok_or(VolumeError::ChunkNotFound(chunk_id))
     }
 
     async fn persist_reserved_offset(&self, reserved_active_offset: u64) -> Result<()> {
@@ -232,63 +202,36 @@ impl Volume {
         Ok(())
     }
 
-    pub async fn read_chunk(&self, file_id: u64, chunk_index: u64) -> Result<Vec<u8>> {
+    pub async fn read_chunk(&self, chunk_id: ChunkId) -> Result<Vec<u8>> {
         let chunk = {
             let state = self.state.lock().await;
             state
                 .db
-                .load_chunk(file_id, chunk_index)?
-                .ok_or(VolumeError::ChunkNotFound {
-                    file_id,
-                    chunk_index,
-                })?
+                .load_chunk(chunk_id)?
+                .ok_or(VolumeError::ChunkNotFound(chunk_id))?
         };
         self.read_chunk_bytes(&chunk).await
     }
 
-    pub async fn get_chunks_meta(&self, file_id: u64, indexes: Vec<u64>) -> Result<Vec<ChunkMeta>> {
+    pub async fn chunk_meta(&self, chunk_id: ChunkId) -> Result<ChunkMeta> {
         let state = self.state.lock().await;
-        state.db.load_chunks_by_indexes(file_id, &indexes)
-    }
-
-    pub async fn commit_file(
-        &self,
-        file_id: u64,
-        version: u64,
-        size_bytes: u64,
-        compressed_size_bytes: u64,
-    ) -> Result<FileMeta> {
-        let mut state = self.state.lock().await;
-        let created_at_ms = state
+        state
             .db
-            .load_file_meta(file_id)?
-            .map_or_else(now_ms, |file| file.created_at_ms);
-        state.db.commit_file_state(
-            &CommitFileState {
-                file_id,
-                version,
-                size_bytes,
-                compressed_size_bytes,
-                updated_at_ms: now_ms(),
-            },
-            created_at_ms,
-        )
+            .load_chunk(chunk_id)?
+            .ok_or(VolumeError::ChunkNotFound(chunk_id))
     }
 
-    pub async fn delete_file(&self, file_id: u64) -> Result<()> {
+    pub async fn delete_chunk(&self, chunk_id: ChunkId) -> Result<()> {
         let mut state = self.state.lock().await;
-        if state.db.load_file_meta(file_id)?.is_none() {
-            return Err(VolumeError::FileNotFound(file_id));
-        }
-        state.db.delete_file(file_id)
+        state.db.delete_chunk(chunk_id)
     }
 
     async fn read_chunk_bytes(&self, chunk: &ChunkMeta) -> Result<Vec<u8>> {
         let compressed_bytes = self
             .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
             .await?;
-        let actual_hash = blake3_hash(&compressed_bytes);
-        if actual_hash != chunk.hash {
+        let actual_hash = fs0_core::blake3_hash(&compressed_bytes);
+        if actual_hash != chunk.chunk_id {
             return Err(VolumeError::HashMismatch {
                 volume_offset: chunk.volume_offset,
             });
@@ -348,7 +291,7 @@ fn validate_options(max_bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_chunk(raw_len: u64, compressed_bytes: &[u8]) -> Result<()> {
+fn validate_chunk(chunk_id: ChunkId, raw_len: u64, compressed_bytes: &[u8]) -> Result<()> {
     if raw_len == 0 {
         return Err(VolumeError::InvalidChunk(
             "raw_len must be greater than zero".to_owned(),
@@ -364,6 +307,12 @@ fn validate_chunk(raw_len: u64, compressed_bytes: &[u8]) -> Result<()> {
         return Err(VolumeError::InvalidChunk(format!(
             "compressed chunk length {compressed_len} exceeds data file size {DATA_FILE_SIZE}"
         )));
+    }
+    let actual_hash = fs0_core::blake3_hash(compressed_bytes);
+    if actual_hash != chunk_id {
+        return Err(VolumeError::InvalidChunk(
+            "chunk id does not match compressed bytes".to_owned(),
+        ));
     }
     Ok(())
 }

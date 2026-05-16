@@ -1,5 +1,10 @@
-use fs0_core::{DataRequest, DataResponse, FRAME_LEN_BYTES, MAX_FRAME_BODY_LEN};
-use iroh::{Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl, endpoint::presets};
+use fs0_core::{
+    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, MAX_FRAME_BODY_LEN,
+};
+use iroh::{
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl,
+    endpoint::{Connection, presets},
+};
 use iroh_relay::RelayQuicConfig;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -70,17 +75,26 @@ pub async fn bind_data_endpoint_accepting(
     relay_url: &str,
     relay_quic_port: u16,
 ) -> Result<Endpoint> {
-    Endpoint::builder(presets::N0)
-        .relay_mode(relay_mode(relay_url, relay_quic_port)?)
-        .alpns(vec![fs0_core::DATA_ALPN.to_vec()])
-        .bind()
-        .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))
+    bind_endpoint(
+        relay_url,
+        relay_quic_port,
+        vec![fs0_core::DATA_ALPN.to_vec()],
+    )
+    .await
 }
 
 pub async fn bind_data_endpoint(relay_url: &str, relay_quic_port: u16) -> Result<Endpoint> {
+    bind_endpoint(relay_url, relay_quic_port, Vec::new()).await
+}
+
+pub async fn bind_endpoint(
+    relay_url: &str,
+    relay_quic_port: u16,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .relay_mode(relay_mode(relay_url, relay_quic_port)?)
+        .alpns(alpns)
         .bind()
         .await
         .map_err(|err| TransportError::Iroh(err.to_string()))
@@ -92,6 +106,28 @@ pub fn encode_endpoint_addr(endpoint: &Endpoint) -> Result<Vec<u8>> {
 
 pub fn decode_endpoint_addr(bytes: &[u8]) -> Result<EndpointAddr> {
     Ok(postcard::from_bytes(bytes)?)
+}
+
+pub async fn connect_control(endpoint: &Endpoint, control_endpoint: &[u8]) -> Result<Connection> {
+    let addr = decode_endpoint_addr(control_endpoint)?;
+    endpoint
+        .connect(addr, fs0_core::CONTROL_ALPN)
+        .await
+        .map_err(|err| TransportError::Iroh(err.to_string()))
+}
+
+pub async fn control_rpc(
+    connection: &Connection,
+    request: ControlRequest,
+) -> Result<ControlResponse> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    write_frame(&mut send, &request).await?;
+    send.finish()
+        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    read_frame(&mut recv).await
 }
 
 pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {

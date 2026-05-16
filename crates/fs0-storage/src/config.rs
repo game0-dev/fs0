@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub struct StorageConfig {
     pub storage_id: u64,
     pub name: String,
-    pub central: String,
+    pub central_endpoint: Vec<u8>,
     pub cert: PathBuf,
     pub p2p_relay: StorageP2pRelayConfig,
     pub volumes: Vec<StorageVolumeConfig>,

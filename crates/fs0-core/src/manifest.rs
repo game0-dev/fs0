@@ -84,42 +84,19 @@ fn validate_path(value: &str) -> Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectManifest {
-    pub object_id: u64,
-    pub file_id: u64,
-    pub base_file_version: u64,
-    pub logical_offset: u64,
-    pub raw_len: u64,
-    pub compressed_len: u64,
-    pub chunk_raw_size: u32,
-    pub chunks: Vec<ChunkManifest>,
-    pub object_hash: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChunkManifest {
-    pub index: u32,
-    pub logical_offset_in_object: u64,
-    pub raw_len: u32,
-    pub compressed_len: u32,
-    pub chunk_id: ChunkId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileManifest {
     pub file_id: u64,
     pub path: Fs0Path,
-    pub version: u64,
     pub size: u64,
-    pub objects: Vec<FileObjectRef>,
+    pub chunks: Vec<FileChunkRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileObjectRef {
-    pub object_id: u64,
-    pub logical_offset: u64,
+pub struct FileChunkRef {
+    pub chunk_index: u64,
     pub raw_len: u64,
     pub compressed_len: u64,
+    pub chunk_id: ChunkId,
     pub replicas: Vec<ReplicaLocation>,
 }
 

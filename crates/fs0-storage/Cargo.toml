@@ -6,9 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fs0-volume = { version = "0.1.0", path = "../fs0-volume" }
-fs0-core = { version = "0.1.0", path = "../fs0-core" }
-fs0-transport = { version = "0.1.0", path = "../fs0-transport" }
+fs0-core.workspace = true
+fs0-transport.workspace = true
+fs0-volume.workspace = true
 iroh.workspace = true
 serde.workspace = true
 thiserror.workspace = true

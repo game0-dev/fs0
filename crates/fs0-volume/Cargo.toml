@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fs0-core = { version = "0.1.0", path = "../fs0-core" }
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+fs0-core.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 

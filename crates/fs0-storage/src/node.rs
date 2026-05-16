@@ -1,16 +1,20 @@
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use fs0_core::{
-    ControlRequest, ControlResponse, DataRequest, DataResponse, RegisterStorageRequest,
-    StorageVolumeInfo,
+    ChunkId, ControlRequest, ControlResponse, DataRequest, DataResponse, RegisterStorageRequest,
+    SessionMessage, StorageVolumeInfo, blake3_hash,
 };
-use fs0_transport::{bind_data_endpoint_accepting, encode_endpoint_addr, read_frame, write_frame};
-use fs0_volume::{ChunkMeta, FileMeta, Volume, VolumeMeta};
-use iroh::Endpoint;
+use fs0_transport::{
+    bind_endpoint, connect_control, control_rpc, encode_endpoint_addr, read_frame, write_frame,
+};
+use fs0_volume::{ChunkMeta, Volume, VolumeMeta};
+use iroh::{
+    Endpoint,
+    endpoint::{Connection, SendStream},
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -29,7 +33,8 @@ pub struct VolumeHandle {
 pub struct StorageDaemon {
     storage_id: u64,
     node: StorageNode,
-    control: Arc<Mutex<TcpStream>>,
+    control: Connection,
+    _session: Arc<Mutex<SendStream>>,
     endpoint: Endpoint,
     data_task: JoinHandle<()>,
 }
@@ -92,78 +97,60 @@ impl StorageNode {
     pub async fn put_chunk(
         &self,
         volume_id: u64,
-        file_id: u64,
-        chunk_index: u64,
+        chunk_id: ChunkId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
         self.volume(volume_id)?
-            .put_chunk(file_id, chunk_index, raw_len, compressed_bytes)
+            .put_chunk(chunk_id, raw_len, compressed_bytes)
             .await
     }
 
-    pub async fn read_chunk(
-        &self,
-        volume_id: u64,
-        file_id: u64,
-        chunk_index: u64,
-    ) -> Result<Vec<u8>> {
-        self.volume(volume_id)?
-            .read_chunk(file_id, chunk_index)
-            .await
+    pub async fn read_chunk(&self, volume_id: u64, chunk_id: ChunkId) -> Result<Vec<u8>> {
+        self.volume(volume_id)?.read_chunk(chunk_id).await
     }
 
-    pub async fn get_chunks_meta(
-        &self,
-        volume_id: u64,
-        file_id: u64,
-        indexes: Vec<u64>,
-    ) -> Result<Vec<ChunkMeta>> {
-        self.volume(volume_id)?
-            .get_chunks_meta(file_id, indexes)
-            .await
-    }
-
-    pub async fn commit_file(
-        &self,
-        volume_id: u64,
-        file_id: u64,
-        version: u64,
-        size_bytes: u64,
-        compressed_size_bytes: u64,
-    ) -> Result<FileMeta> {
-        self.volume(volume_id)?
-            .commit_file(file_id, version, size_bytes, compressed_size_bytes)
-            .await
-    }
-
-    pub async fn delete_file(&self, volume_id: u64, file_id: u64) -> Result<()> {
-        self.volume(volume_id)?.delete_file(file_id).await
+    pub async fn chunk_meta(&self, volume_id: u64, chunk_id: ChunkId) -> Result<ChunkMeta> {
+        self.volume(volume_id)?.chunk_meta(chunk_id).await
     }
 }
 
 impl StorageDaemon {
     pub async fn start(config: StorageConfig) -> Result<Self> {
         let node = StorageNode::open(config)?;
-        let endpoint = bind_data_endpoint_accepting(
+        let endpoint = bind_endpoint(
             &node.config.p2p_relay.public_url,
             node.config.p2p_relay.quic_port,
+            vec![fs0_core::DATA_ALPN.to_vec()],
         )
         .await?;
         let data_endpoint = encode_endpoint_addr(&endpoint)?;
-        let data_task = spawn_data_accept_loop(endpoint.clone());
+        let data_task = spawn_data_accept_loop(endpoint.clone(), node.clone());
 
-        let mut control = TcpStream::connect(&node.config.central).await?;
-        let response = register_storage(&mut control, &node, data_endpoint).await?;
+        let control = connect_control(&endpoint, &node.config.central_endpoint).await?;
+        let (session_send, response) = register_storage(&control, &node, data_endpoint).await?;
         let storage_id = match response {
-            ControlResponse::StorageRegistered { storage_id } => storage_id,
-            response => return Err(StorageError::UnexpectedControlResponse(response)),
+            SessionMessage::StorageRegistered { storage_id } => storage_id,
+            SessionMessage::Error(err) => {
+                return Err(StorageError::UnexpectedControlResponse(
+                    ControlResponse::Error(err),
+                ));
+            }
+            response => {
+                return Err(StorageError::UnexpectedControlResponse(
+                    ControlResponse::Error(fs0_core::ControlError {
+                        code: fs0_core::ControlErrorCode::InvalidRequest,
+                        message: format!("unexpected session response: {response:?}"),
+                    }),
+                ));
+            }
         };
 
         Ok(Self {
             storage_id,
             node,
-            control: Arc::new(Mutex::new(control)),
+            control,
+            _session: Arc::new(Mutex::new(session_send)),
             endpoint,
             data_task,
         })
@@ -189,9 +176,7 @@ impl StorageDaemon {
     }
 
     pub async fn ping_central(&self) -> Result<()> {
-        let mut control = self.control.lock().await;
-        write_frame(&mut *control, &ControlRequest::Ping).await?;
-        match read_frame(&mut *control).await? {
+        match control_rpc(&self.control, ControlRequest::Ping).await? {
             ControlResponse::Pong => Ok(()),
             response => Err(StorageError::UnexpectedControlResponse(response)),
         }
@@ -209,55 +194,37 @@ impl VolumeHandle {
         self.volume.meta()
     }
 
-    pub async fn file_meta(&self, file_id: u64) -> Result<FileMeta> {
-        Ok(self.volume.file_meta(file_id).await?)
-    }
-
     pub async fn put_chunk(
         &self,
-        file_id: u64,
-        chunk_index: u64,
+        chunk_id: ChunkId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
         Ok(self
             .volume
-            .put_chunk(file_id, chunk_index, raw_len, compressed_bytes)
+            .put_chunk(chunk_id, raw_len, compressed_bytes)
             .await?)
     }
 
-    pub async fn read_chunk(&self, file_id: u64, chunk_index: u64) -> Result<Vec<u8>> {
-        Ok(self.volume.read_chunk(file_id, chunk_index).await?)
+    pub async fn read_chunk(&self, chunk_id: ChunkId) -> Result<Vec<u8>> {
+        Ok(self.volume.read_chunk(chunk_id).await?)
     }
 
-    pub async fn get_chunks_meta(&self, file_id: u64, indexes: Vec<u64>) -> Result<Vec<ChunkMeta>> {
-        Ok(self.volume.get_chunks_meta(file_id, indexes).await?)
+    pub async fn chunk_meta(&self, chunk_id: ChunkId) -> Result<ChunkMeta> {
+        Ok(self.volume.chunk_meta(chunk_id).await?)
     }
 
-    pub async fn commit_file(
-        &self,
-        file_id: u64,
-        version: u64,
-        size_bytes: u64,
-        compressed_size_bytes: u64,
-    ) -> Result<FileMeta> {
-        Ok(self
-            .volume
-            .commit_file(file_id, version, size_bytes, compressed_size_bytes)
-            .await?)
-    }
-
-    pub async fn delete_file(&self, file_id: u64) -> Result<()> {
-        Ok(self.volume.delete_file(file_id).await?)
+    pub async fn delete_chunk(&self, chunk_id: ChunkId) -> Result<()> {
+        Ok(self.volume.delete_chunk(chunk_id).await?)
     }
 }
 
 async fn register_storage(
-    control: &mut TcpStream,
+    control: &Connection,
     node: &StorageNode,
     data_endpoint: Vec<u8>,
-) -> Result<ControlResponse> {
-    let request = ControlRequest::RegisterStorage(RegisterStorageRequest {
+) -> Result<(SendStream, SessionMessage)> {
+    let request = SessionMessage::RegisterStorage(RegisterStorageRequest {
         storage_id: node.config.storage_id,
         name: node.config.name.clone(),
         volumes: node
@@ -265,19 +232,25 @@ async fn register_storage(
             .into_iter()
             .map(|volume| StorageVolumeInfo {
                 volume_id: volume.volume_id,
+                name: None,
                 max_bytes: volume.max_bytes,
                 active_volume_offset: volume.active_volume_offset,
             })
             .collect(),
         data_endpoint,
     });
-    write_frame(control, &request).await?;
-    Ok(read_frame(control).await?)
+    let (mut send, mut recv) = control.open_bi().await.map_err(|err| {
+        StorageError::Transport(fs0_transport::TransportError::Iroh(err.to_string()))
+    })?;
+    write_frame(&mut send, &request).await?;
+    let response = read_frame(&mut recv).await?;
+    Ok((send, response))
 }
 
-fn spawn_data_accept_loop(endpoint: Endpoint) -> JoinHandle<()> {
+fn spawn_data_accept_loop(endpoint: Endpoint, node: StorageNode) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
+            let node = node.clone();
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
@@ -290,7 +263,56 @@ fn spawn_data_accept_loop(endpoint: Endpoint) -> JoinHandle<()> {
                 };
                 let response = match request {
                     DataRequest::Ping => DataResponse::Pong,
-                    _ => DataResponse::Pong,
+                    DataRequest::UploadChunk {
+                        volume_id,
+                        chunk_id,
+                        raw_len,
+                        compressed_bytes,
+                        upload_token: _,
+                    } => {
+                        let compressed_len = compressed_bytes.len() as u64;
+                        if blake3_hash(&compressed_bytes) != chunk_id {
+                            DataResponse::Bytes(Vec::new())
+                        } else if node
+                            .put_chunk(volume_id, chunk_id, raw_len, compressed_bytes)
+                            .await
+                            .is_err()
+                        {
+                            DataResponse::Bytes(Vec::new())
+                        } else {
+                            DataResponse::ChunkStored {
+                                chunk_id,
+                                raw_len,
+                                compressed_len,
+                            }
+                        }
+                    }
+                    DataRequest::GetChunk {
+                        volume_id,
+                        chunk_id,
+                    } => match node.read_chunk(volume_id, chunk_id).await {
+                        Ok(bytes) => DataResponse::Bytes(bytes),
+                        Err(_) => DataResponse::Bytes(Vec::new()),
+                    },
+                    DataRequest::GetRange {
+                        volume_id,
+                        chunk_id,
+                        offset,
+                        len,
+                    } => match node.read_chunk(volume_id, chunk_id).await {
+                        Ok(bytes) => {
+                            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                            let len = usize::try_from(len).unwrap_or(usize::MAX);
+                            if start >= bytes.len() {
+                                DataResponse::Bytes(Vec::new())
+                            } else {
+                                let end = start.saturating_add(len).min(bytes.len());
+                                DataResponse::Bytes(bytes[start..end].to_vec())
+                            }
+                        }
+                        Err(_) => DataResponse::Bytes(Vec::new()),
+                    },
+                    DataRequest::RepairCopy { .. } => DataResponse::RepairStarted,
                 };
                 let _ = write_frame(&mut send, &response).await;
                 let _ = send.finish();

@@ -1,11 +1,18 @@
 use fs0_core::{
-    ControlError, ControlRequest, ControlResponse, DirectoryEntries, FileRecord, Fs0Path,
-    ListDirectoryRequest, StoragePeerInfo,
+    AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkPlans, CommitAppendRequest,
+    ControlError, ControlRequest, ControlResponse, DirectoryEntries, FileEvents, FileManifest,
+    FileRecord, Fs0Path, ListDirectoryRequest, ListFileEventsRequest, PlanChunksRequest,
+    SessionMessage, StoragePeerInfo,
 };
-use fs0_transport::{TransportError, bind_data_endpoint, ping_data_peer, read_frame, write_frame};
-use iroh::Endpoint;
+use fs0_transport::{
+    TransportError, bind_endpoint, connect_control, control_rpc, ping_data_peer, read_frame,
+    write_frame,
+};
+use iroh::{
+    Endpoint,
+    endpoint::{Connection, SendStream},
+};
 use std::sync::Arc;
-use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -31,36 +38,41 @@ pub enum ClientError {
 #[derive(Debug, Clone)]
 pub struct Fs0Client {
     client_id: u64,
-    control: Arc<Mutex<TcpStream>>,
+    control: Connection,
+    _session: Arc<Mutex<SendStream>>,
     endpoint: Endpoint,
 }
 
 impl Fs0Client {
     pub async fn connect(
-        central_addr: impl ToSocketAddrs,
+        central_endpoint: &[u8],
         name: Option<String>,
         relay_url: &str,
         relay_quic_port: u16,
     ) -> Result<Self> {
-        let stream = TcpStream::connect(central_addr).await?;
-        let endpoint = bind_data_endpoint(relay_url, relay_quic_port).await?;
-        let client = Self {
-            client_id: 0,
-            control: Arc::new(Mutex::new(stream)),
-            endpoint,
-        };
-        let response = client
-            .request(ControlRequest::RegisterClient { name })
-            .await?;
+        let endpoint = bind_endpoint(relay_url, relay_quic_port, Vec::new()).await?;
+        let control = connect_control(&endpoint, central_endpoint).await?;
+        let (mut session_send, mut session_recv) = control
+            .open_bi()
+            .await
+            .map_err(|err| TransportError::Iroh(err.to_string()))?;
+        write_frame(&mut session_send, &SessionMessage::RegisterClient { name }).await?;
+        let response = read_frame(&mut session_recv).await?;
         let client_id = match response {
-            ControlResponse::ClientRegistered { client_id } => client_id,
-            response => return Err(ClientError::UnexpectedControlResponse(response)),
+            SessionMessage::ClientRegistered { client_id } => client_id,
+            SessionMessage::Error(err) => return Err(ClientError::Control(err)),
+            response => {
+                return Err(ClientError::Transport(TransportError::InvalidFrame(
+                    format!("unexpected session response: {response:?}"),
+                )));
+            }
         };
 
         Ok(Self {
             client_id,
-            control: client.control,
-            endpoint: client.endpoint,
+            control,
+            _session: Arc::new(Mutex::new(session_send)),
+            endpoint,
         })
     }
 
@@ -101,6 +113,60 @@ impl Fs0Client {
         }
     }
 
+    pub async fn begin_append(&self, request: BeginAppendRequest) -> Result<AppendLease> {
+        match self.request(ControlRequest::BeginAppend(request)).await? {
+            ControlResponse::AppendLease(lease) => Ok(lease),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
+    pub async fn plan_chunks(&self, request: PlanChunksRequest) -> Result<ChunkPlans> {
+        match self.request(ControlRequest::PlanChunks(request)).await? {
+            ControlResponse::ChunkPlans(plans) => Ok(plans),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
+    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileManifest> {
+        match self.request(ControlRequest::CommitAppend(request)).await? {
+            ControlResponse::AppendCommitted { file_manifest } => Ok(file_manifest),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
+    pub async fn abort_append(&self, request: AbortAppendRequest) -> Result<()> {
+        match self.request(ControlRequest::AbortAppend(request)).await? {
+            ControlResponse::AppendAborted => Ok(()),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
+    pub async fn list_file_events(&self, request: ListFileEventsRequest) -> Result<FileEvents> {
+        match self
+            .request(ControlRequest::ListFileEvents(request))
+            .await?
+        {
+            ControlResponse::FileEvents(events) => Ok(events),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
+    pub async fn get_file_manifest(&self, path: Fs0Path) -> Result<FileManifest> {
+        match self
+            .request(ControlRequest::GetFileManifest { path })
+            .await?
+        {
+            ControlResponse::FileManifest(manifest) => Ok(manifest),
+            ControlResponse::Error(err) => Err(ClientError::Control(err)),
+            response => Err(ClientError::UnexpectedControlResponse(response)),
+        }
+    }
+
     pub async fn ping_storage_peer(&self, peer: &StoragePeerInfo) -> Result<()> {
         Ok(ping_data_peer(&self.endpoint, &peer.data_endpoint).await?)
     }
@@ -116,8 +182,6 @@ impl Fs0Client {
     }
 
     async fn request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        let mut control = self.control.lock().await;
-        write_frame(&mut *control, &request).await?;
-        Ok(read_frame(&mut *control).await?)
+        Ok(control_rpc(&self.control, request).await?)
     }
 }

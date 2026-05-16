@@ -988,6 +988,7 @@ dependencies = [
  "clap",
  "fs0-core",
  "fs0-transport",
+ "iroh",
  "iroh-relay",
  "rcgen",
  "rusqlite",

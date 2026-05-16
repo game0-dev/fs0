@@ -6,9 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fs0-core = { version = "0.1.0", path = "../fs0-core" }
+fs0-core.workspace = true
 iroh.workspace = true
-iroh-relay = "1.0.0-rc.0"
+iroh-relay.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

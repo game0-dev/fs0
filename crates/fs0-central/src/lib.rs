@@ -3,47 +3,40 @@ mod db;
 mod error;
 
 pub use config::{CentralConfig, CentralP2pRelayConfig};
-pub use db::{CommitFileLocation, VolumeRecord};
+pub use db::VolumeRecord;
 pub use error::{CentralError, Result};
 
 use db::CentralDb;
 use fs0_core::{
-    ControlError, ControlErrorCode, ControlRequest, ControlResponse, CreateStorageRequest,
-    CreateVolumeRequest, DirectoryEntries, FileRecord, Fs0Path, ListDirectoryRequest,
-    RegisterStorageRequest, StoragePeerInfo,
+    AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkPlan, ChunkPlanAction, ChunkPlans,
+    CommitAppendRequest, ControlRequest, ControlResponse, CreateVolumeRequest, DirectoryEntries,
+    FileEvents, FileManifest, FileRecord, Fs0Path, ListDirectoryRequest, ListFileEventsRequest,
+    PlanChunksRequest, RegisterStorageRequest, ReplicaLocation, SessionMessage, StoragePeerInfo,
+    UploadTarget,
 };
-use fs0_transport::{read_frame, write_frame};
+use fs0_transport::{bind_endpoint, encode_endpoint_addr, read_frame, write_frame};
+use iroh::endpoint::Connection;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 #[derive(Clone)]
 pub struct CentralServer {
     state: Arc<CentralState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageRecord {
-    pub storage_id: u64,
-    pub name: String,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
 struct CentralState {
     config: Arc<CentralConfig>,
     next_client_id: AtomicU64,
-    next_storage_id: AtomicU64,
-    storage_records: RwLock<HashMap<u64, StorageRecord>>,
     storages: RwLock<HashMap<u64, StoragePeerInfo>>,
     online_volumes: RwLock<HashMap<u64, u64>>,
     db: Mutex<CentralDb>,
+    control_endpoint: RwLock<Option<Vec<u8>>>,
+    ready: Notify,
 }
 
 impl CentralServer {
@@ -54,11 +47,11 @@ impl CentralServer {
             state: Arc::new(CentralState {
                 config: Arc::new(config),
                 next_client_id: AtomicU64::new(1),
-                next_storage_id: AtomicU64::new(1),
-                storage_records: RwLock::new(HashMap::new()),
                 storages: RwLock::new(HashMap::new()),
                 online_volumes: RwLock::new(HashMap::new()),
                 db: Mutex::new(db),
+                control_endpoint: RwLock::new(None),
+                ready: Notify::new(),
             }),
         })
     }
@@ -70,14 +63,36 @@ impl CentralServer {
 
     pub async fn run(&self) -> Result<()> {
         let _relay = self.start_relay().await?;
-        let listener = TcpListener::bind(localhost_addr(self.state.config.tcp_port)).await?;
+        let endpoint = bind_endpoint(
+            &self.state.config.p2p_relay.public_url,
+            self.state.config.p2p_relay.quic_port,
+            vec![fs0_core::CONTROL_ALPN.to_vec()],
+        )
+        .await?;
+        {
+            let mut control_endpoint = self.state.control_endpoint.write().await;
+            *control_endpoint = Some(encode_endpoint_addr(&endpoint)?);
+        }
+        self.state.ready.notify_waiters();
 
-        loop {
-            let (stream, peer_addr) = listener.accept().await?;
+        while let Some(incoming) = endpoint.accept().await {
             let server = self.clone();
             tokio::spawn(async move {
-                let _ = server.handle_connection(stream, peer_addr).await;
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let _ = server.handle_control_connection(connection).await;
             });
+        }
+        Ok(())
+    }
+
+    pub async fn wait_control_endpoint(&self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(endpoint) = self.state.control_endpoint.read().await.clone() {
+                return Ok(endpoint);
+            }
+            self.state.ready.notified().await;
         }
     }
 
@@ -85,59 +100,24 @@ impl CentralServer {
         self.state.next_client_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn create_storage(&self, request: CreateStorageRequest) -> Result<StorageRecord> {
-        let now = now_ms();
-        let record = StorageRecord {
-            storage_id: self.state.next_storage_id.fetch_add(1, Ordering::Relaxed),
-            name: request.name,
-            created_at_ms: now,
-            updated_at_ms: now,
-        };
-        self.state
-            .storage_records
-            .write()
-            .await
-            .insert(record.storage_id, record.clone());
-        Ok(record)
-    }
-
     pub async fn create_volume(&self, request: CreateVolumeRequest) -> Result<VolumeRecord> {
-        self.state
-            .db
-            .lock()
-            .await
-            .create_volume(request.name.as_deref(), request.max_bytes)
+        self.state.db.lock().await.create_volume(request)
     }
 
     pub async fn register_storage(
         &self,
-        request: RegisterStorageRequest,
+        mut request: RegisterStorageRequest,
     ) -> Result<StoragePeerInfo> {
         {
-            let storage_records = self.state.storage_records.read().await;
-            let storage = storage_records.get(&request.storage_id).ok_or_else(|| {
-                CentralError::not_found(format!(
-                    "storage {} was not found in central state",
-                    request.storage_id
-                ))
-            })?;
-            if storage.name != request.name {
-                return Err(CentralError::invalid_request(format!(
-                    "storage {} is named {}, not {}",
-                    request.storage_id, storage.name, request.name
-                )));
-            }
-        }
-
-        {
             let db = self.state.db.lock().await;
-            for volume in &request.volumes {
+            for volume in &mut request.volumes {
                 let registered = db.get_volume(volume.volume_id)?.ok_or_else(|| {
                     CentralError::not_found(format!(
                         "volume {} was not found in central metadata",
                         volume.volume_id
                     ))
                 })?;
+                volume.name = registered.name.clone();
                 if registered.max_bytes != volume.max_bytes {
                     return Err(CentralError::invalid_request(format!(
                         "volume {} max_bytes mismatch: central={}, storage={}",
@@ -202,10 +182,6 @@ impl CentralServer {
         peers
     }
 
-    pub async fn commit_file_location(&self, request: CommitFileLocation) -> Result<FileRecord> {
-        self.state.db.lock().await.commit_file_location(request)
-    }
-
     pub async fn get_file_by_path(&self, path: &Fs0Path) -> Result<Option<FileRecord>> {
         self.state.db.lock().await.get_file_by_path(path)
     }
@@ -215,37 +191,180 @@ impl CentralServer {
     }
 
     pub async fn list_directory(&self, request: ListDirectoryRequest) -> Result<DirectoryEntries> {
-        self.state.db.lock().await.list_directory(
-            &request.parent_path,
-            request.limit,
-            request.cursor,
-        )
+        self.state
+            .db
+            .lock()
+            .await
+            .list_directory(&request.dir, request.limit, request.cursor)
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream, _peer_addr: SocketAddr) -> Result<()> {
-        let mut storage_id = None;
+    pub async fn begin_append(&self, request: BeginAppendRequest) -> Result<AppendLease> {
+        self.state.db.lock().await.begin_append(request, 0)
+    }
 
-        loop {
-            let request = match read_frame::<ControlRequest, _>(&mut stream).await {
-                Ok(request) => request,
-                Err(err) => {
-                    if let Some(storage_id) = storage_id {
-                        self.unregister_storage(storage_id).await?;
-                    }
-                    return Err(err.into());
+    pub async fn plan_chunks(&self, request: PlanChunksRequest) -> Result<ChunkPlans> {
+        let peers = self.storage_peers().await;
+        let mut plans = Vec::with_capacity(request.chunks.len());
+        let prefer_volume_name = self.preferred_volume_name(request.lease_id).await?;
+        let db = self.state.db.lock().await;
+        for chunk in request.chunks {
+            let replicas = self
+                .hydrate_replicas(db.chunk_replicas(chunk.chunk_id)?)
+                .await;
+            let targets = upload_targets(&peers, &replicas, prefer_volume_name.as_deref());
+            let action = if replicas.is_empty() {
+                ChunkPlanAction::Upload { targets }
+            } else if targets.is_empty() {
+                ChunkPlanAction::Reuse { replicas }
+            } else {
+                ChunkPlanAction::AddReplica {
+                    existing_replicas: replicas,
+                    targets,
                 }
             };
-            let (response, registered_storage_id) = self.handle_control_request(request).await;
-            if let Some(id) = registered_storage_id {
-                storage_id = Some(id);
+            plans.push(ChunkPlan {
+                chunk_id: chunk.chunk_id,
+                action,
+            });
+        }
+        Ok(ChunkPlans { chunks: plans })
+    }
+
+    async fn hydrate_replicas(&self, replicas: Vec<ReplicaLocation>) -> Vec<ReplicaLocation> {
+        let online_volumes = self.state.online_volumes.read().await;
+        replicas
+            .into_iter()
+            .filter_map(|replica| {
+                online_volumes
+                    .get(&replica.volume_id)
+                    .map(|storage_id| ReplicaLocation {
+                        storage_id: *storage_id,
+                        volume_id: replica.volume_id,
+                    })
+            })
+            .collect()
+    }
+
+    async fn preferred_volume_name(&self, lease_id: u64) -> Result<Option<String>> {
+        self.state
+            .db
+            .lock()
+            .await
+            .lease_prefer_volume_name(lease_id)
+    }
+
+    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileManifest> {
+        let manifest = self.state.db.lock().await.commit_append(request)?;
+        Ok(self.hydrate_manifest_replicas(manifest).await)
+    }
+
+    pub async fn abort_append(&self, request: AbortAppendRequest) -> Result<()> {
+        self.state.db.lock().await.abort_append(request)
+    }
+
+    pub async fn list_file_events(&self, request: ListFileEventsRequest) -> Result<FileEvents> {
+        self.state.db.lock().await.list_file_events(request)
+    }
+
+    pub async fn get_file_manifest(&self, path: &Fs0Path) -> Result<FileManifest> {
+        let manifest = self.state.db.lock().await.get_file_manifest(path)?;
+        Ok(self.hydrate_manifest_replicas(manifest).await)
+    }
+
+    async fn hydrate_manifest_replicas(&self, mut manifest: FileManifest) -> FileManifest {
+        for chunk in &mut manifest.chunks {
+            chunk.replicas = self
+                .hydrate_replicas(std::mem::take(&mut chunk.replicas))
+                .await;
+        }
+        manifest
+    }
+
+    async fn handle_control_connection(&self, connection: Connection) -> Result<()> {
+        let mut storage_id = None;
+        let (mut session_send, mut session_recv) = connection.accept_bi().await.map_err(|err| {
+            CentralError::Transport(fs0_transport::TransportError::Iroh(err.to_string()))
+        })?;
+        match read_frame::<SessionMessage, _>(&mut session_recv).await? {
+            SessionMessage::RegisterClient { .. } => {
+                write_frame(
+                    &mut session_send,
+                    &SessionMessage::ClientRegistered {
+                        client_id: self.alloc_client_id(),
+                    },
+                )
+                .await?;
             }
-            if let Err(err) = write_frame(&mut stream, &response).await {
-                if let Some(storage_id) = storage_id {
-                    self.unregister_storage(storage_id).await?;
+            SessionMessage::RegisterStorage(request) => {
+                let id = request.storage_id;
+                match self.register_storage(request).await {
+                    Ok(_) => {
+                        storage_id = Some(id);
+                        write_frame(
+                            &mut session_send,
+                            &SessionMessage::StorageRegistered { storage_id: id },
+                        )
+                        .await?;
+                    }
+                    Err(err) => {
+                        write_frame(
+                            &mut session_send,
+                            &SessionMessage::Error(err.to_control_error()),
+                        )
+                        .await?;
+                    }
                 }
-                return Err(err.into());
+            }
+            SessionMessage::Heartbeat => {
+                write_frame(&mut session_send, &SessionMessage::Pong).await?;
+            }
+            _ => {
+                write_frame(
+                    &mut session_send,
+                    &SessionMessage::Error(
+                        CentralError::invalid_request(
+                            "first session message must register a client or storage",
+                        )
+                        .to_control_error(),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
         }
+
+        loop {
+            tokio::select! {
+                request = read_frame::<SessionMessage, _>(&mut session_recv) => {
+                    match request {
+                        Ok(SessionMessage::Heartbeat) => {
+                            write_frame(&mut session_send, &SessionMessage::Pong).await?;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                stream = connection.accept_bi() => {
+                    let Ok((mut send, mut recv)) = stream else {
+                        break;
+                    };
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        let Ok(request) = read_frame::<ControlRequest, _>(&mut recv).await else {
+                            return;
+                        };
+                        let (response, _) = server.handle_control_request(request).await;
+                        let _ = write_frame(&mut send, &response).await;
+                        let _ = send.finish();
+                    });
+                }
+            }
+        }
+
+        if let Some(storage_id) = storage_id {
+            self.unregister_storage(storage_id).await?;
+        }
+        Ok(())
     }
 
     async fn handle_control_request(
@@ -259,15 +378,6 @@ impl CentralServer {
                 },
                 None,
             ),
-            ControlRequest::CreateStorage(request) => match self.create_storage(request).await {
-                Ok(storage) => (
-                    ControlResponse::StorageCreated {
-                        storage_id: storage.storage_id,
-                    },
-                    None,
-                ),
-                Err(err) => (ControlResponse::Error(err.into()), None),
-            },
             ControlRequest::CreateVolume(request) => match self.create_volume(request).await {
                 Ok(volume) => (
                     ControlResponse::VolumeCreated {
@@ -305,17 +415,31 @@ impl CentralServer {
                     Err(err) => (ControlResponse::Error(err.into()), None),
                 }
             }
+            ControlRequest::ListFileEvents(request) => match self.list_file_events(request).await {
+                Ok(events) => (ControlResponse::FileEvents(events), None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
             ControlRequest::Ping => (ControlResponse::Pong, None),
-            ControlRequest::BeginAppend(_)
-            | ControlRequest::PrepareUpload(_)
-            | ControlRequest::CommitAppend(_)
-            | ControlRequest::GetFileManifest { .. } => (
-                ControlResponse::Error(ControlError {
-                    code: ControlErrorCode::Unsupported,
-                    message: "control method is not implemented yet".to_owned(),
-                }),
-                None,
-            ),
+            ControlRequest::BeginAppend(request) => match self.begin_append(request).await {
+                Ok(lease) => (ControlResponse::AppendLease(lease), None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
+            ControlRequest::PlanChunks(request) => match self.plan_chunks(request).await {
+                Ok(plans) => (ControlResponse::ChunkPlans(plans), None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
+            ControlRequest::CommitAppend(request) => match self.commit_append(request).await {
+                Ok(file_manifest) => (ControlResponse::AppendCommitted { file_manifest }, None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
+            ControlRequest::AbortAppend(request) => match self.abort_append(request).await {
+                Ok(()) => (ControlResponse::AppendAborted, None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
+            ControlRequest::GetFileManifest { path } => match self.get_file_manifest(&path).await {
+                Ok(manifest) => (ControlResponse::FileManifest(manifest), None),
+                Err(err) => (ControlResponse::Error(err.into()), None),
+            },
         }
     }
 
@@ -349,11 +473,52 @@ fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before Unix epoch")
-        .as_millis() as u64
+fn upload_targets(
+    peers: &[StoragePeerInfo],
+    existing_replicas: &[ReplicaLocation],
+    prefer_volume_name: Option<&str>,
+) -> Vec<UploadTarget> {
+    let target_count = 2usize.saturating_sub(existing_replicas.len());
+    if target_count == 0 {
+        return Vec::new();
+    }
+    let mut targets = Vec::new();
+    for (peer, volume) in preferred_peer_volumes(peers, prefer_volume_name) {
+        if existing_replicas
+            .iter()
+            .any(|replica| replica.storage_id == peer.storage_id)
+        {
+            continue;
+        }
+        targets.push(UploadTarget {
+            storage_id: peer.storage_id,
+            volume_id: volume.volume_id,
+            data_endpoint: peer.data_endpoint.clone(),
+        });
+        if targets.len() >= target_count {
+            break;
+        }
+    }
+    targets
+}
+
+fn preferred_peer_volumes<'a>(
+    peers: &'a [StoragePeerInfo],
+    prefer_volume_name: Option<&str>,
+) -> Vec<(&'a StoragePeerInfo, &'a fs0_core::StorageVolumeInfo)> {
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for peer in peers {
+        for volume in &peer.volumes {
+            if prefer_volume_name.is_some_and(|name| volume.name.as_deref() == Some(name)) {
+                preferred.push((peer, volume));
+            } else {
+                fallback.push((peer, volume));
+            }
+        }
+    }
+    preferred.extend(fallback);
+    preferred
 }
 
 fn self_signed_quic_server_config() -> Result<rustls::ServerConfig> {

@@ -1,3 +1,4 @@
+use fs0_core::ChunkId;
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, VolumeError>;
@@ -16,11 +17,8 @@ pub enum VolumeError {
     #[error("volume does not exist: {}", .0.display())]
     NotFound(PathBuf),
 
-    #[error("file {0} was not found in volume")]
-    FileNotFound(u64),
-
-    #[error("chunk {chunk_index} for file {file_id} was not found in volume")]
-    ChunkNotFound { file_id: u64, chunk_index: u64 },
+    #[error("chunk {0:?} was not found in volume")]
+    ChunkNotFound(ChunkId),
 
     #[error("volume capacity exceeded: required end {required_end}, max {max_bytes}")]
     CapacityExceeded { required_end: u64, max_bytes: u64 },
