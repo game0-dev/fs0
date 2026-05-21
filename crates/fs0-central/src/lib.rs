@@ -342,13 +342,13 @@ impl CentralServer {
                     Err(err) => {
                         write_frame(
                             &mut session_send,
-                            &SessionMessage::Error(err.to_control_error()),
+                            &SessionMessage::Error(err.to_protocol_error()),
                         )
                         .await?;
                     }
                 }
             }
-            SessionMessage::Heartbeat => {
+            SessionMessage::Ping => {
                 write_frame(&mut session_send, &SessionMessage::Pong).await?;
             }
             _ => {
@@ -358,7 +358,7 @@ impl CentralServer {
                         CentralError::invalid_request(
                             "first session message must register a client or storage",
                         )
-                        .to_control_error(),
+                        .to_protocol_error(),
                     ),
                 )
                 .await?;
@@ -370,7 +370,7 @@ impl CentralServer {
             tokio::select! {
                 request = read_frame::<SessionMessage, _>(&mut session_recv) => {
                     match request {
-                        Ok(SessionMessage::Heartbeat) => {
+                        Ok(SessionMessage::Ping) => {
                             write_frame(&mut session_send, &SessionMessage::Pong).await?;
                         }
                         Ok(_) => {}

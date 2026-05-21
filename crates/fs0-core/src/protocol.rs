@@ -1,6 +1,7 @@
 use crate::id::ChunkId;
 use crate::manifest::{FileManifest, ReplicaLocation};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -41,7 +42,7 @@ pub enum ControlResponse {
     LookupPath(Option<FileRecord>),
     GetFileRecord(Option<FileRecord>),
     ListFileEvents(FileEvents),
-    Error(ControlError),
+    Error(Fs0ProtocolError),
     BeginAppend(AppendLease),
     PlanChunks(ChunkPlans),
     CommitAppend(FileManifest),
@@ -56,21 +57,15 @@ pub enum SessionMessage {
     RegisterStorage { request: RegisterStorageRequest },
     ClientRegistered { client_id: u64 },
     StorageRegistered { storage_id: u64 },
-    Heartbeat,
+    Ping,
     Pong,
     UploadLease(UploadLease),
     RevokeUploadLease { lease_id: u64 },
-    Error(ControlError),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlError {
-    pub code: ControlErrorCode,
-    pub message: String,
+    Error(Fs0ProtocolError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlErrorCode {
+pub enum Fs0ProtocolError {
     Unsupported,
     NotFound,
     AlreadyExists,
@@ -78,8 +73,20 @@ pub enum ControlErrorCode {
     VersionConflict,
     ChunkNotReady,
     InvalidRequest,
+    Unauthorized,
+    UnknownVolume,
+    HashMismatch,
+    CapacityExceeded,
     Internal,
 }
+
+impl fmt::Display for Fs0ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for Fs0ProtocolError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateVolumeRequest {
@@ -322,6 +329,7 @@ pub enum DataRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataResponse {
     Pong,
+    Error(Fs0ProtocolError),
     ChunkPresence {
         exists: bool,
         raw_len: Option<u64>,

@@ -1,12 +1,12 @@
-use fs0_core::{ControlError, ControlErrorCode};
+use fs0_core::Fs0ProtocolError;
 use std::fmt::Display;
 
 pub type Result<T> = std::result::Result<T, CentralError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CentralError {
-    #[error("control error: {0:?}")]
-    Control(ControlError),
+    #[error("protocol error: {0:?}")]
+    Protocol(Fs0ProtocolError),
 
     #[error("io error")]
     Io(#[from] std::io::Error),
@@ -35,26 +35,23 @@ pub enum CentralError {
 
 impl CentralError {
     #[must_use]
-    pub fn control(code: ControlErrorCode, message: impl Into<String>) -> Self {
-        Self::Control(ControlError {
-            code,
-            message: message.into(),
-        })
+    pub fn control(error: Fs0ProtocolError, _message: impl Into<String>) -> Self {
+        Self::Protocol(error)
     }
 
     #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::control(ControlErrorCode::NotFound, message)
+        Self::control(Fs0ProtocolError::NotFound, message)
     }
 
     #[must_use]
     pub fn invalid_request(message: impl Into<String>) -> Self {
-        Self::control(ControlErrorCode::InvalidRequest, message)
+        Self::control(Fs0ProtocolError::InvalidRequest, message)
     }
 
     #[must_use]
     pub fn version_conflict() -> Self {
-        Self::control(ControlErrorCode::VersionConflict, "file version conflict")
+        Self::control(Fs0ProtocolError::VersionConflict, "file version conflict")
     }
 
     #[must_use]
@@ -63,52 +60,43 @@ impl CentralError {
         mounted_by_storage_id: impl Display,
     ) -> Self {
         Self::control(
-            ControlErrorCode::VolumeAlreadyMounted,
+            Fs0ProtocolError::VolumeAlreadyMounted,
             format!("volume {volume_id} is already mounted by storage {mounted_by_storage_id}"),
         )
     }
 
     #[must_use]
-    pub fn to_control_error(&self) -> ControlError {
+    pub fn to_protocol_error(&self) -> Fs0ProtocolError {
         match self {
-            Self::Control(err) => err.clone(),
+            Self::Protocol(err) => err.clone(),
             Self::Sqlite(err)
                 if matches!(
                     err.sqlite_error_code(),
                     Some(rusqlite::ErrorCode::ConstraintViolation)
                 ) =>
             {
-                ControlError {
-                    code: ControlErrorCode::AlreadyExists,
-                    message: "central metadata already exists".to_owned(),
-                }
+                Fs0ProtocolError::AlreadyExists
             }
-            Self::Core(err) => ControlError {
-                code: ControlErrorCode::InvalidRequest,
-                message: err.to_string(),
-            },
+            Self::Core(_) => Fs0ProtocolError::InvalidRequest,
             Self::Io(_)
             | Self::Transport(_)
             | Self::Sqlite(_)
             | Self::TomlDecode(_)
             | Self::Config(_)
             | Self::Relay(_)
-            | Self::IntegerConversion(_) => ControlError {
-                code: ControlErrorCode::Internal,
-                message: "central internal error".to_owned(),
-            },
+            | Self::IntegerConversion(_) => Fs0ProtocolError::Internal,
         }
     }
 }
 
-impl From<ControlError> for CentralError {
-    fn from(value: ControlError) -> Self {
-        Self::Control(value)
+impl From<Fs0ProtocolError> for CentralError {
+    fn from(value: Fs0ProtocolError) -> Self {
+        Self::Protocol(value)
     }
 }
 
-impl From<CentralError> for ControlError {
+impl From<CentralError> for Fs0ProtocolError {
     fn from(value: CentralError) -> Self {
-        value.to_control_error()
+        value.to_protocol_error()
     }
 }

@@ -118,7 +118,7 @@ impl CentralDb {
             .optional()?;
         if active_lease.is_some() {
             return Err(CentralError::control(
-                fs0_core::ControlErrorCode::AlreadyExists,
+                fs0_core::Fs0ProtocolError::AlreadyExists,
                 format!("append lease already exists for {}", request.path),
             ));
         }
@@ -200,7 +200,7 @@ impl CentralDb {
             )?;
             if replica_count == 0 {
                 return Err(CentralError::control(
-                    fs0_core::ControlErrorCode::ChunkNotReady,
+                    fs0_core::Fs0ProtocolError::ChunkNotReady,
                     format!(
                         "chunk {:?} has not been reported by volume {}",
                         chunk.chunk_id, lease.volume_id

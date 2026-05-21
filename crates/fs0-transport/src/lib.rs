@@ -1,5 +1,6 @@
 use fs0_core::{
-    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, MAX_FRAME_BODY_LEN,
+    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, Fs0ProtocolError,
+    MAX_FRAME_BODY_LEN,
 };
 use iroh::{
     Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl,
@@ -24,6 +25,9 @@ pub enum TransportError {
 
     #[error("postcard error")]
     Postcard(#[from] postcard::Error),
+
+    #[error("protocol error: {0:?}")]
+    Protocol(#[from] Fs0ProtocolError),
 
     #[error("iroh error: {0}")]
     Iroh(String),
@@ -185,6 +189,7 @@ pub async fn has_data_chunk(
             compressed_len: Some(compressed_len),
         } => Ok(Some((raw_len, compressed_len))),
         DataResponse::ChunkPresence { exists: false, .. } => Ok(None),
+        DataResponse::Error(err) => Err(err.into()),
         response => Err(TransportError::InvalidFrame(format!(
             "expected chunk presence, got {response:?}"
         ))),
@@ -194,6 +199,7 @@ pub async fn has_data_chunk(
 pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {
     match data_rpc(endpoint, data_endpoint, DataRequest::Ping).await? {
         DataResponse::Pong => Ok(()),
+        DataResponse::Error(err) => Err(err.into()),
         response => Err(TransportError::InvalidFrame(format!(
             "expected data pong, got {response:?}"
         ))),
