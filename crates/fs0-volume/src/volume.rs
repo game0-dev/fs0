@@ -226,6 +226,30 @@ impl Volume {
         state.db.delete_chunk(chunk_id)
     }
 
+    pub async fn pending_central_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<fs0_core::StorageChunkEvent>> {
+        let state = self.state.lock().await;
+        state.db.pending_central_events(limit)
+    }
+
+    pub async fn ack_pending_central_events(&self, event_ids: &[u64]) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.db.ack_pending_central_events(event_ids)
+    }
+
+    pub async fn mark_pending_central_events_failed(
+        &self,
+        event_ids: &[u64],
+        failed_at_ms: u64,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state
+            .db
+            .mark_pending_central_events_failed(event_ids, failed_at_ms)
+    }
+
     async fn read_chunk_bytes(&self, chunk: &ChunkMeta) -> Result<Vec<u8>> {
         let compressed_bytes = self
             .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
@@ -321,7 +345,7 @@ fn next_data_file_offset(active_offset: u64) -> u64 {
     ((active_offset / DATA_FILE_SIZE) + 1) * DATA_FILE_SIZE
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time is before unix epoch")

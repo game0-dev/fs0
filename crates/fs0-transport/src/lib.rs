@@ -116,6 +116,14 @@ pub async fn connect_control(endpoint: &Endpoint, control_endpoint: &[u8]) -> Re
         .map_err(|err| TransportError::Iroh(err.to_string()))
 }
 
+pub async fn connect_data(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<Connection> {
+    let addr = decode_endpoint_addr(data_endpoint)?;
+    endpoint
+        .connect(addr, fs0_core::DATA_ALPN)
+        .await
+        .map_err(|err| TransportError::Iroh(err.to_string()))
+}
+
 pub async fn control_rpc(
     connection: &Connection,
     request: ControlRequest,
@@ -130,26 +138,62 @@ pub async fn control_rpc(
     read_frame(&mut recv).await
 }
 
-pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {
-    let addr = decode_endpoint_addr(data_endpoint)?;
-    let conn = endpoint
-        .connect(addr, fs0_core::DATA_ALPN)
-        .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))?;
-    let (mut send, mut recv) = conn
+pub async fn data_rpc(
+    endpoint: &Endpoint,
+    data_endpoint: &[u8],
+    request: DataRequest,
+) -> Result<DataResponse> {
+    let conn = connect_data(endpoint, data_endpoint).await?;
+    let response = data_rpc_on_connection(&conn, request).await;
+    conn.close(0u32.into(), b"fs0 data rpc complete");
+    response
+}
+
+pub async fn data_rpc_on_connection(
+    connection: &Connection,
+    request: DataRequest,
+) -> Result<DataResponse> {
+    let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    write_frame(&mut send, &request).await?;
+    send.finish()
+        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    read_frame(&mut recv).await
+}
 
-    write_frame(&mut send, &DataRequest::Ping).await?;
+pub async fn has_data_chunk(
+    endpoint: &Endpoint,
+    data_endpoint: &[u8],
+    volume_id: u64,
+    chunk_id: fs0_core::ChunkId,
+) -> Result<Option<(u64, u64)>> {
+    match data_rpc(
+        endpoint,
+        data_endpoint,
+        DataRequest::HasChunk {
+            volume_id,
+            chunk_id,
+        },
+    )
+    .await?
+    {
+        DataResponse::ChunkPresence {
+            exists: true,
+            raw_len: Some(raw_len),
+            compressed_len: Some(compressed_len),
+        } => Ok(Some((raw_len, compressed_len))),
+        DataResponse::ChunkPresence { exists: false, .. } => Ok(None),
+        response => Err(TransportError::InvalidFrame(format!(
+            "expected chunk presence, got {response:?}"
+        ))),
+    }
+}
 
-    match read_frame::<DataResponse, _>(&mut recv).await? {
-        DataResponse::Pong => {
-            send.finish()
-                .map_err(|err| TransportError::Iroh(err.to_string()))?;
-            conn.close(0u32.into(), b"fs0 ping complete");
-            Ok(())
-        }
+pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {
+    match data_rpc(endpoint, data_endpoint, DataRequest::Ping).await? {
+        DataResponse::Pong => Ok(()),
         response => Err(TransportError::InvalidFrame(format!(
             "expected data pong, got {response:?}"
         ))),

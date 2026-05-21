@@ -1,5 +1,5 @@
 use crate::id::ChunkId;
-use crate::manifest::{FileManifest, Fs0Path, ReplicaLocation};
+use crate::manifest::{FileManifest, ReplicaLocation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,50 +13,53 @@ pub struct PeerInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
-    RegisterClient { name: Option<String> },
+    Ping,
     CreateVolume(CreateVolumeRequest),
     RegisterStorage(RegisterStorageRequest),
     ListStoragePeers,
     ListFiles,
     ListDirectory(ListDirectoryRequest),
-    LookupPath { path: Fs0Path },
-    GetFileRecord { path: Fs0Path },
+    LookupPath { path: String },
+    GetFileRecord { path: String },
     ListFileEvents(ListFileEventsRequest),
-    Ping,
     BeginAppend(BeginAppendRequest),
     PlanChunks(PlanChunksRequest),
     CommitAppend(CommitAppendRequest),
     AbortAppend(AbortAppendRequest),
-    GetFileManifest { path: Fs0Path },
+    GetFileManifest { path: String },
+    RecordChunkEvents(StorageChunkEvents),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
-    ClientRegistered { client_id: u64 },
-    VolumeCreated { volume_id: u64 },
-    StorageRegistered { storage_id: u64 },
-    StoragePeers(Vec<StoragePeerInfo>),
-    Files(Vec<FileRecord>),
-    DirectoryEntries(DirectoryEntries),
-    FileRecord(Option<FileRecord>),
-    FileEvents(FileEvents),
-    Pong,
+    Ping,
+    CreateVolume(u64),
+    RegisterStorage(u64),
+    ListStoragePeers(Vec<StoragePeerInfo>),
+    ListFiles(Vec<FileRecord>),
+    ListDirectory(DirectoryEntries),
+    LookupPath(Option<FileRecord>),
+    GetFileRecord(Option<FileRecord>),
+    ListFileEvents(FileEvents),
     Error(ControlError),
-    AppendLease(AppendLease),
-    ChunkPlans(ChunkPlans),
-    AppendCommitted { file_manifest: FileManifest },
-    AppendAborted,
-    FileManifest(FileManifest),
+    BeginAppend(AppendLease),
+    PlanChunks(ChunkPlans),
+    CommitAppend(FileManifest),
+    AbortAppend,
+    GetFileManifest(FileManifest),
+    RecordChunkEvents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionMessage {
     RegisterClient { name: Option<String> },
+    RegisterStorage { request: RegisterStorageRequest },
     ClientRegistered { client_id: u64 },
-    RegisterStorage(RegisterStorageRequest),
     StorageRegistered { storage_id: u64 },
     Heartbeat,
     Pong,
+    UploadLease(UploadLease),
+    RevokeUploadLease { lease_id: u64 },
     Error(ControlError),
 }
 
@@ -73,6 +76,7 @@ pub enum ControlErrorCode {
     AlreadyExists,
     VolumeAlreadyMounted,
     VersionConflict,
+    ChunkNotReady,
     InvalidRequest,
     Internal,
 }
@@ -110,7 +114,7 @@ pub struct StoragePeerInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     pub file_id: u64,
-    pub path: Fs0Path,
+    pub path: String,
     pub size_bytes: u64,
     pub compressed_size_bytes: u64,
     pub created_at_ms: u64,
@@ -120,7 +124,7 @@ pub struct FileRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub name: String,
-    pub path: Fs0Path,
+    pub path: String,
     pub file_id: u64,
     pub size_bytes: u64,
 }
@@ -133,14 +137,14 @@ pub struct DirectoryEntries {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListDirectoryRequest {
-    pub dir: Fs0Path,
+    pub dir: String,
     pub limit: u32,
     pub cursor: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginAppendRequest {
-    pub path: Fs0Path,
+    pub path: String,
     pub expected_size: u64,
     pub create: bool,
     pub prefer_volume_name: Option<String>,
@@ -150,6 +154,17 @@ pub struct BeginAppendRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendLease {
     pub lease_id: u64,
+    pub file_id: u64,
+    pub volume_id: u64,
+    pub base_size: u64,
+    pub expires_at_ms: u64,
+    pub prefer_volume_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadLease {
+    pub lease_id: u64,
+    pub client_id: u64,
     pub file_id: u64,
     pub volume_id: u64,
     pub base_size: u64,
@@ -215,7 +230,27 @@ pub struct CommittedChunk {
     pub chunk_id: ChunkId,
     pub raw_len: u64,
     pub compressed_len: u64,
-    pub replicas: Vec<ReplicaLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageChunkEvents {
+    pub events: Vec<StorageChunkEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageChunkEvent {
+    pub event_id: u64,
+    pub kind: StorageChunkEventKind,
+    pub volume_id: u64,
+    pub chunk_id: ChunkId,
+    pub raw_len: Option<u64>,
+    pub compressed_len: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageChunkEventKind {
+    Stored,
+    Deleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,8 +275,8 @@ pub struct FileEvent {
     pub event_id: u64,
     pub kind: FileEventKind,
     pub file_id: Option<u64>,
-    pub old_path: Option<Fs0Path>,
-    pub new_path: Option<Fs0Path>,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
     pub created_at_ms: u64,
 }
 
@@ -256,12 +291,15 @@ pub enum FileEventKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataRequest {
     Ping,
+    HasChunk {
+        volume_id: u64,
+        chunk_id: ChunkId,
+    },
     UploadChunk {
         volume_id: u64,
         chunk_id: ChunkId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
-        upload_token: Vec<u8>,
     },
     GetChunk {
         volume_id: u64,
@@ -284,6 +322,11 @@ pub enum DataRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataResponse {
     Pong,
+    ChunkPresence {
+        exists: bool,
+        raw_len: Option<u64>,
+        compressed_len: Option<u64>,
+    },
     ChunkStored {
         chunk_id: ChunkId,
         raw_len: u64,

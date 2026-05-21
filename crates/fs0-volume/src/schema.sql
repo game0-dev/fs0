@@ -16,3 +16,13 @@ CREATE TABLE chunks (
 );
 
 CREATE INDEX idx_chunks_volume_offset ON chunks(volume_offset);
+
+CREATE TABLE pending_central_events (
+  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL CHECK (event_type IN ('chunk_stored', 'chunk_deleted')),
+  chunk_id BLOB NOT NULL CHECK (length(chunk_id) = 32),
+  last_failed_at_ms INTEGER
+);
+
+CREATE INDEX idx_pending_central_events_order
+  ON pending_central_events(event_id);

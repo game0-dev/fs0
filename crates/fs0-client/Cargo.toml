@@ -10,7 +10,7 @@ fs0-core.workspace = true
 fs0-transport.workspace = true
 iroh.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]
 fs0-central.workspace = true

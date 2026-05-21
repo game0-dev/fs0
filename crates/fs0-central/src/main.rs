@@ -18,9 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let config = CentralConfig::load_from(args.config)?;
     eprintln!(
-        "starting central: control=127.0.0.1:{}, relay={}, relay_quic=127.0.0.1:{}",
-        config.tcp_port, config.p2p_relay.public_url, config.p2p_relay.quic_port
+        "starting central: relay={}, relay_quic=127.0.0.1:{}",
+        config.p2p_relay.public_url, config.p2p_relay.quic_port
     );
-    CentralServer::new(config)?.run().await?;
+    let _server = CentralServer::run(config).await?;
+    std::future::pending::<()>().await;
     Ok(())
 }

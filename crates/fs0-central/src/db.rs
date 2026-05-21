@@ -2,7 +2,8 @@ use crate::{CentralError, Result};
 use fs0_core::{
     AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkId, CommittedChunk,
     CreateVolumeRequest, DirectoryEntries, DirectoryEntry, FileChunkRef, FileEvent, FileEventKind,
-    FileEvents, FileManifest, FileRecord, Fs0Path, ListFileEventsRequest, ReplicaLocation,
+    FileEvents, FileManifest, FileRecord, ListFileEventsRequest, StorageChunkEventKind,
+    StorageChunkEvents,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -187,9 +188,24 @@ impl CentralDb {
             params![to_i64(lease.file_id, "file_id")?],
         )?;
         for chunk in &request.chunks {
-            upsert_chunk(&tx, chunk)?;
-            for replica in &chunk.replicas {
-                insert_chunk_replica(&tx, chunk.chunk_id, replica)?;
+            let replica_count = tx.query_row(
+                "SELECT COUNT(*)
+                 FROM chunk_replicas
+                 WHERE chunk_id = ?1 AND volume_id = ?2",
+                params![
+                    chunk.chunk_id.as_bytes().as_slice(),
+                    to_i64(lease.volume_id, "volume_id")?,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if replica_count == 0 {
+                return Err(CentralError::control(
+                    fs0_core::ControlErrorCode::ChunkNotReady,
+                    format!(
+                        "chunk {:?} has not been reported by volume {}",
+                        chunk.chunk_id, lease.volume_id
+                    ),
+                ));
             }
             tx.execute(
                 "INSERT INTO file_chunks (
@@ -267,8 +283,8 @@ impl CentralDb {
             })
     }
 
-    pub(crate) fn get_file_by_path(&self, path: &Fs0Path) -> Result<Option<FileRecord>> {
-        let (dir, name) = split_path(path.as_str())?;
+    pub(crate) fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
+        let (dir, name) = split_path(path)?;
         let file = self
             .conn
             .query_row(
@@ -300,7 +316,7 @@ impl CentralDb {
 
     pub(crate) fn list_directory(
         &self,
-        dir: &Fs0Path,
+        dir: &str,
         limit: u32,
         cursor: Option<u64>,
     ) -> Result<DirectoryEntries> {
@@ -315,7 +331,7 @@ impl CentralDb {
         )?;
         let rows = stmt.query_map(
             params![
-                dir.as_str(),
+                dir,
                 to_i64(limit as u64 + 1, "limit")?,
                 to_i64(offset, "cursor")?,
             ],
@@ -379,7 +395,7 @@ impl CentralDb {
         })
     }
 
-    pub(crate) fn chunk_replicas(&self, chunk_id: ChunkId) -> Result<Vec<ReplicaLocation>> {
+    pub(crate) fn chunk_replica_volumes(&self, chunk_id: ChunkId) -> Result<Vec<u64>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT volume_id
              FROM chunk_replicas
@@ -387,10 +403,7 @@ impl CentralDb {
              ORDER BY volume_id",
         )?;
         let rows = stmt.query_map(params![chunk_id.as_bytes().as_slice()], |row| {
-            Ok(ReplicaLocation {
-                storage_id: 0,
-                volume_id: from_i64(row.get(0)?, "volume_id").map_err(to_sql_error)?,
-            })
+            from_i64(row.get(0)?, "volume_id").map_err(to_sql_error)
         })?;
         let mut replicas = Vec::new();
         for row in rows {
@@ -399,7 +412,58 @@ impl CentralDb {
         Ok(replicas)
     }
 
-    pub(crate) fn get_file_manifest(&self, path: &Fs0Path) -> Result<FileManifest> {
+    pub(crate) fn record_chunk_events(&mut self, events: StorageChunkEvents) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for event in events.events {
+            match event.kind {
+                StorageChunkEventKind::Stored => {
+                    let raw_len = event.raw_len.ok_or_else(|| {
+                        CentralError::invalid_request("chunk stored event missing raw_len")
+                    })?;
+                    let compressed_len = event.compressed_len.ok_or_else(|| {
+                        CentralError::invalid_request("chunk stored event missing compressed_len")
+                    })?;
+                    tx.execute(
+                        "INSERT INTO chunks (
+                            chunk_id, raw_len, compressed_len
+                         ) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(chunk_id) DO UPDATE SET
+                            raw_len = excluded.raw_len,
+                            compressed_len = excluded.compressed_len",
+                        params![
+                            event.chunk_id.as_bytes().as_slice(),
+                            to_i64(raw_len, "raw_len")?,
+                            to_i64(compressed_len, "compressed_len")?,
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO chunk_replicas (
+                            chunk_id, volume_id
+                         ) VALUES (?1, ?2)
+                         ON CONFLICT(chunk_id, volume_id) DO NOTHING",
+                        params![
+                            event.chunk_id.as_bytes().as_slice(),
+                            to_i64(event.volume_id, "volume_id")?,
+                        ],
+                    )?;
+                }
+                StorageChunkEventKind::Deleted => {
+                    tx.execute(
+                        "DELETE FROM chunk_replicas
+                         WHERE chunk_id = ?1 AND volume_id = ?2",
+                        params![
+                            event.chunk_id.as_bytes().as_slice(),
+                            to_i64(event.volume_id, "volume_id")?,
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn get_file_manifest(&self, path: &str) -> Result<FileManifest> {
         let file = self
             .get_file_by_path(path)?
             .ok_or_else(|| CentralError::not_found(format!("file was not found: {path}")))?;
@@ -434,7 +498,7 @@ impl CentralDb {
                 raw_len,
                 compressed_len,
                 chunk_id,
-                replicas: self.chunk_replicas(chunk_id)?,
+                replicas: Vec::new(),
             });
         }
         Ok(FileManifest {
@@ -460,6 +524,7 @@ struct FileIdentity {
 #[derive(Debug)]
 struct LeaseRecord {
     file_id: u64,
+    volume_id: u64,
     base_size_bytes: u64,
 }
 
@@ -568,7 +633,7 @@ fn load_file_by_id_tx(
 
 fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Result<LeaseRecord> {
     tx.query_row(
-        "SELECT file_id, base_size_bytes
+        "SELECT file_id, volume_id, base_size_bytes
          FROM append_leases
          WHERE lease_id = ?1
            AND state = 'active'",
@@ -576,7 +641,8 @@ fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Result<Le
         |row| {
             Ok(LeaseRecord {
                 file_id: from_i64(row.get(0)?, "file_id").map_err(to_sql_error)?,
-                base_size_bytes: from_i64(row.get(1)?, "base_size_bytes").map_err(to_sql_error)?,
+                volume_id: from_i64(row.get(1)?, "volume_id").map_err(to_sql_error)?,
+                base_size_bytes: from_i64(row.get(2)?, "base_size_bytes").map_err(to_sql_error)?,
             })
         },
     )
@@ -597,11 +663,6 @@ fn validate_committed_chunks(chunks: &[CommittedChunk], new_size: u64) -> Result
                 "chunk lengths must be non-zero",
             ));
         }
-        if chunk.replicas.is_empty() {
-            return Err(CentralError::invalid_request(
-                "chunk must have at least one replica",
-            ));
-        }
         total_size = total_size
             .checked_add(chunk.raw_len)
             .ok_or_else(|| CentralError::IntegerConversion("file size overflow".to_owned()))?;
@@ -611,41 +672,6 @@ fn validate_committed_chunks(chunks: &[CommittedChunk], new_size: u64) -> Result
             "committed chunk sizes do not match new_size",
         ));
     }
-    Ok(())
-}
-
-fn upsert_chunk(tx: &rusqlite::Transaction<'_>, chunk: &CommittedChunk) -> Result<()> {
-    tx.execute(
-        "INSERT INTO chunks (
-            chunk_id, raw_len, compressed_len
-         ) VALUES (?1, ?2, ?3)
-         ON CONFLICT(chunk_id) DO UPDATE SET
-            raw_len = excluded.raw_len,
-            compressed_len = excluded.compressed_len",
-        params![
-            chunk.chunk_id.as_bytes().as_slice(),
-            to_i64(chunk.raw_len, "raw_len")?,
-            to_i64(chunk.compressed_len, "compressed_len")?,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_chunk_replica(
-    tx: &rusqlite::Transaction<'_>,
-    chunk_id: ChunkId,
-    replica: &ReplicaLocation,
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO chunk_replicas (
-            chunk_id, volume_id
-         ) VALUES (?1, ?2)
-         ON CONFLICT(chunk_id, volume_id) DO NOTHING",
-        params![
-            chunk_id.as_bytes().as_slice(),
-            to_i64(replica.volume_id, "volume_id")?,
-        ],
-    )?;
     Ok(())
 }
 
@@ -731,6 +757,16 @@ fn file_to_record(file: FileIdentity) -> Result<FileRecord> {
 }
 
 fn split_path(path: &str) -> Result<(String, String)> {
+    if !path.starts_with('/') {
+        return Err(CentralError::invalid_request(format!(
+            "path must be absolute: {path}"
+        )));
+    }
+    if path.split('/').any(|component| component == "..") {
+        return Err(CentralError::invalid_request(format!(
+            "path cannot contain '..': {path}"
+        )));
+    }
     if path == "/" {
         return Err(CentralError::invalid_request(
             "root path cannot be a file".to_owned(),
@@ -748,15 +784,15 @@ fn split_path(path: &str) -> Result<(String, String)> {
     Ok((parent.to_owned(), name.to_owned()))
 }
 
-fn join_path(dir: &str, name: &str) -> Result<Fs0Path> {
+fn join_path(dir: &str, name: &str) -> Result<String> {
     if dir == "/" {
-        Fs0Path::new(format!("/{name}")).map_err(CentralError::from)
+        Ok(format!("/{name}"))
     } else {
-        Fs0Path::new(format!("{dir}/{name}")).map_err(CentralError::from)
+        Ok(format!("{dir}/{name}"))
     }
 }
 
-fn join_optional_path(dir: Option<&str>, name: Option<&str>) -> Result<Option<Fs0Path>> {
+fn join_optional_path(dir: Option<&str>, name: Option<&str>) -> Result<Option<String>> {
     match (dir, name) {
         (Some(dir), Some(name)) => join_path(dir, name).map(Some),
         _ => Ok(None),

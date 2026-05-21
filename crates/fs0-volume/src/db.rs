@@ -1,6 +1,6 @@
 use crate::error::{Result, VolumeError};
 use crate::volume::{ChunkMeta, VOLUME_DB_FILE, VolumeMeta};
-use fs0_core::ChunkId;
+use fs0_core::{ChunkId, StorageChunkEvent, StorageChunkEventKind};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -109,6 +109,12 @@ impl VolumeDb {
             ],
         )?;
         tx.execute(
+            "INSERT INTO pending_central_events (
+                event_type, chunk_id
+            ) VALUES ('chunk_stored', ?1)",
+            params![chunk.chunk_id.as_bytes().as_slice()],
+        )?;
+        tx.execute(
             "UPDATE volume_meta
              SET active_volume_offset = MAX(active_volume_offset, ?1),
                  updated_at_ms = ?2
@@ -143,10 +149,99 @@ impl VolumeDb {
     }
 
     pub(crate) fn delete_chunk(&mut self, chunk_id: ChunkId) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM chunks WHERE chunk_id = ?1",
             params![chunk_id.as_bytes().as_slice()],
         )?;
+        tx.execute(
+            "INSERT INTO pending_central_events (
+                event_type, chunk_id
+            ) VALUES ('chunk_deleted', ?1)",
+            params![chunk_id.as_bytes().as_slice()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_central_events(&self, limit: usize) -> Result<Vec<StorageChunkEvent>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.event_id, e.event_type, e.chunk_id,
+                    c.raw_len, c.compressed_len
+             FROM pending_central_events e
+             LEFT JOIN chunks c ON c.chunk_id = e.chunk_id
+             ORDER BY e.event_id
+             LIMIT ?1",
+        )?;
+        let volume_id = self.load_meta()?.volume_id;
+        let rows = stmt.query_map(params![Self::to_i64(limit as u64, "limit")?], |row| {
+            let event_type: String = row.get(1)?;
+            let kind = match event_type.as_str() {
+                "chunk_stored" => StorageChunkEventKind::Stored,
+                "chunk_deleted" => StorageChunkEventKind::Deleted,
+                other => {
+                    return Err(Self::to_sql_error(VolumeError::InvalidChunk(format!(
+                        "invalid pending central event type: {other}"
+                    ))));
+                }
+            };
+            let chunk_id: Vec<u8> = row.get(2)?;
+            Ok(StorageChunkEvent {
+                event_id: Self::from_i64(row.get(0)?, "event_id").map_err(Self::to_sql_error)?,
+                kind,
+                volume_id,
+                chunk_id: ChunkId(
+                    Self::blob_to_hash(chunk_id, "chunk_id").map_err(Self::to_sql_error)?,
+                ),
+                raw_len: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| Self::from_i64(value, "raw_len"))
+                    .transpose()
+                    .map_err(Self::to_sql_error)?,
+                compressed_len: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(|value| Self::from_i64(value, "compressed_len"))
+                    .transpose()
+                    .map_err(Self::to_sql_error)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn mark_pending_central_events_failed(
+        &mut self,
+        event_ids: &[u64],
+        failed_at_ms: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for event_id in event_ids {
+            tx.execute(
+                "UPDATE pending_central_events
+                 SET last_failed_at_ms = ?2
+                 WHERE event_id = ?1",
+                params![
+                    Self::to_i64(*event_id, "event_id")?,
+                    Self::to_i64(failed_at_ms, "last_failed_at_ms")?,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn ack_pending_central_events(&mut self, event_ids: &[u64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for event_id in event_ids {
+            tx.execute(
+                "DELETE FROM pending_central_events WHERE event_id = ?1",
+                params![Self::to_i64(*event_id, "event_id")?],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

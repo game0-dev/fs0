@@ -1,6 +1,6 @@
 use fs0_core::{
-    ChunkId, DEFAULT_ZSTD_LEVEL, Fs0Path, MAX_FRAME_BODY_LEN, blake3_hash, decode_frame,
-    encode_frame, zstd_compress, zstd_decompress,
+    ChunkId, DEFAULT_ZSTD_LEVEL, MAX_FRAME_BODY_LEN, blake3_hash, decode_frame, encode_frame,
+    zstd_compress, zstd_decompress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,22 +82,4 @@ fn frame_rejects_declared_body_over_limit() {
 
     let err = decode_frame::<TestPayload>(&encoded).unwrap_err();
     assert!(err.to_string().contains("exceeds maximum"));
-}
-
-#[test]
-fn fs0_path_accepts_valid_absolute_paths() {
-    assert_eq!(Fs0Path::new("/").unwrap().as_str(), "/");
-    assert_eq!(
-        Fs0Path::new("/binance/depth/BTCUSDT.jsonl")
-            .unwrap()
-            .as_str(),
-        "/binance/depth/BTCUSDT.jsonl"
-    );
-}
-
-#[test]
-fn fs0_path_rejects_relative_path_and_parent_components() {
-    assert!(Fs0Path::new("").is_err());
-    assert!(Fs0Path::new("binance/depth").is_err());
-    assert!(Fs0Path::new("/binance/../depth").is_err());
 }
