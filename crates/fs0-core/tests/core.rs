@@ -1,6 +1,6 @@
 use fs0_core::{
-    ChunkId, DEFAULT_ZSTD_LEVEL, MAX_FRAME_BODY_LEN, blake3_hash, decode_frame, encode_frame,
-    zstd_compress, zstd_decompress,
+    DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, MAX_FRAME_BODY_LEN, blake3_hash, decode_frame,
+    encode_frame, zstd_compress, zstd_decompress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 struct TestPayload {
     object_id: u64,
     client_id: u64,
-    chunk_id: ChunkId,
+    chunk_id: HashId,
     name: String,
 }
 
@@ -17,7 +17,7 @@ fn u64_ids_postcard_roundtrip() {
     let payload = TestPayload {
         object_id: 7,
         client_id: 9,
-        chunk_id: ChunkId([42; 32]),
+        chunk_id: HashId([42; 32]),
         name: "payload".to_owned(),
     };
 
@@ -28,11 +28,11 @@ fn u64_ids_postcard_roundtrip() {
 }
 
 #[test]
-fn blake3_hash_returns_chunk_id() {
-    let chunk_id = blake3_hash(b"hello fs0");
+fn blake3_hash_returns_hash_id() {
+    let hash_id = blake3_hash(b"hello fs0");
     let expected = *blake3::hash(b"hello fs0").as_bytes();
 
-    assert_eq!(chunk_id, ChunkId(expected));
+    assert_eq!(hash_id, HashId(expected));
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn frame_rejects_truncated_body() {
     encoded.pop();
 
     let err = decode_frame::<TestPayload>(&encoded).unwrap_err();
-    assert!(err.to_string().contains("length mismatch"));
+    assert_eq!(err, Fs0Error::InvalidFrame);
 }
 
 #[test]
@@ -81,5 +81,5 @@ fn frame_rejects_declared_body_over_limit() {
     encoded.extend_from_slice(&((MAX_FRAME_BODY_LEN as u32) + 1).to_le_bytes());
 
     let err = decode_frame::<TestPayload>(&encoded).unwrap_err();
-    assert!(err.to_string().contains("exceeds maximum"));
+    assert_eq!(err, Fs0Error::FrameTooLarge);
 }
