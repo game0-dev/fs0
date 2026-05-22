@@ -109,9 +109,19 @@ impl VolumeDb {
             ],
         )?;
         tx.execute(
+            "INSERT INTO bundle_chunks (
+                bundle_id, chunk_index, chunk_id
+            ) VALUES (?1, 0, ?1)
+            ON CONFLICT(bundle_id, chunk_index) DO NOTHING",
+            params![chunk.chunk_id.as_bytes().as_slice()],
+        )?;
+        tx.execute(
             "INSERT INTO pending_central_events (
-                event_type, chunk_id
-            ) VALUES ('chunk_stored', ?1)",
+                event_type, bundle_id
+            ) VALUES ('bundle_stored', ?1)
+            ON CONFLICT(bundle_id) DO UPDATE SET
+                event_type = 'bundle_stored',
+                last_failed_at_ms = NULL",
             params![chunk.chunk_id.as_bytes().as_slice()],
         )?;
         tx.execute(
@@ -151,13 +161,20 @@ impl VolumeDb {
     pub(crate) fn delete_chunk(&mut self, chunk_id: ChunkId) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
+            "DELETE FROM bundle_chunks WHERE bundle_id = ?1",
+            params![chunk_id.as_bytes().as_slice()],
+        )?;
+        tx.execute(
             "DELETE FROM chunks WHERE chunk_id = ?1",
             params![chunk_id.as_bytes().as_slice()],
         )?;
         tx.execute(
             "INSERT INTO pending_central_events (
-                event_type, chunk_id
-            ) VALUES ('chunk_deleted', ?1)",
+                event_type, bundle_id
+            ) VALUES ('bundle_deleted', ?1)
+            ON CONFLICT(bundle_id) DO UPDATE SET
+                event_type = 'bundle_deleted',
+                last_failed_at_ms = NULL",
             params![chunk_id.as_bytes().as_slice()],
         )?;
         tx.commit()?;
@@ -166,10 +183,12 @@ impl VolumeDb {
 
     pub(crate) fn pending_central_events(&self, limit: usize) -> Result<Vec<StorageChunkEvent>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT e.event_id, e.event_type, e.chunk_id,
+            "SELECT e.event_id, e.event_type, e.bundle_id,
                     c.raw_len, c.compressed_len
              FROM pending_central_events e
-             LEFT JOIN chunks c ON c.chunk_id = e.chunk_id
+             LEFT JOIN bundle_chunks bc
+               ON bc.bundle_id = e.bundle_id AND bc.chunk_index = 0
+             LEFT JOIN chunks c ON c.chunk_id = bc.chunk_id
              ORDER BY e.event_id
              LIMIT ?1",
         )?;
@@ -177,8 +196,8 @@ impl VolumeDb {
         let rows = stmt.query_map(params![Self::to_i64(limit as u64, "limit")?], |row| {
             let event_type: String = row.get(1)?;
             let kind = match event_type.as_str() {
-                "chunk_stored" => StorageChunkEventKind::Stored,
-                "chunk_deleted" => StorageChunkEventKind::Deleted,
+                "bundle_stored" => StorageChunkEventKind::Stored,
+                "bundle_deleted" => StorageChunkEventKind::Deleted,
                 other => {
                     return Err(Self::to_sql_error(VolumeError::InvalidChunk(format!(
                         "invalid pending central event type: {other}"
@@ -242,26 +261,6 @@ impl VolumeDb {
             )?;
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn insert_compacting_data_file(
-        &self,
-        data_file_index: u64,
-        phase: &str,
-        now_ms: u64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO compacting_data_files (
-                data_file_index, phase, started_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?3)",
-            params![
-                Self::to_i64(data_file_index, "data_file_index")?,
-                phase,
-                Self::to_i64(now_ms, "now_ms")?,
-            ],
-        )?;
         Ok(())
     }
 

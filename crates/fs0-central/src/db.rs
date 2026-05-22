@@ -1,9 +1,8 @@
 use crate::{CentralError, Result};
 use fs0_core::{
-    AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkId, CommittedChunk,
-    CreateVolumeRequest, DirectoryEntries, DirectoryEntry, FileChunkRef, FileEvent, FileEventKind,
-    FileEvents, FileManifest, FileRecord, ListFileEventsRequest, StorageChunkEventKind,
-    StorageChunkEvents,
+    AppendLease, BeginAppendRequest, ChunkId, CommittedChunk, DirectoryEntries, DirectoryEntry,
+    FileChunkRef, FileEvent, FileEventKind, FileEvents, FileManifest, FileRecord,
+    StorageChunkEventKind, StorageChunkEvents,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -33,14 +32,14 @@ impl CentralDb {
         Ok(Self { conn })
     }
 
-    pub(crate) fn create_volume(&mut self, request: CreateVolumeRequest) -> Result<VolumeRecord> {
+    pub(crate) fn create_volume(&mut self, name: String, max_bytes: u64) -> Result<VolumeRecord> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO volumes (name, max_bytes, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?3)",
             params![
-                request.name.as_deref(),
-                to_i64(request.max_bytes, "max_bytes")?,
+                name.as_str(),
+                to_i64(max_bytes, "max_bytes")?,
                 to_i64(now, "created_at_ms")?,
             ],
         )?;
@@ -97,10 +96,8 @@ impl CentralDb {
         let volume_id = select_append_volume(&tx, request.prefer_volume_name.as_deref())?;
 
         tx.execute(
-            "UPDATE append_leases
-             SET state = 'expired'
+            "DELETE FROM append_leases
              WHERE file_id = ?1
-               AND state = 'active'
                AND expires_at_ms <= ?2",
             params![to_i64(file_id, "file_id")?, to_i64(now, "expires_at_ms")?],
         )?;
@@ -110,7 +107,6 @@ impl CentralDb {
                 "SELECT lease_id
                  FROM append_leases
                  WHERE file_id = ?1
-                   AND state = 'active'
                  LIMIT 1",
                 params![to_i64(file_id, "file_id")?],
                 |row| row.get::<_, i64>(0),
@@ -126,8 +122,8 @@ impl CentralDb {
         tx.execute(
             "INSERT INTO append_leases (
                 file_id, client_id, volume_id, base_size_bytes, prefer_volume_name,
-                state, expires_at_ms, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+                expires_at_ms, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 to_i64(file_id, "file_id")?,
                 to_i64(client_id, "client_id")?,
@@ -184,14 +180,14 @@ impl CentralDb {
             })?;
 
         tx.execute(
-            "DELETE FROM file_chunks WHERE file_id = ?1",
+            "DELETE FROM file_bundles WHERE file_id = ?1",
             params![to_i64(lease.file_id, "file_id")?],
         )?;
         for chunk in &request.chunks {
             let replica_count = tx.query_row(
                 "SELECT COUNT(*)
-                 FROM chunk_replicas
-                 WHERE chunk_id = ?1 AND volume_id = ?2",
+                 FROM bundle_replicas
+                 WHERE bundle_id = ?1 AND volume_id = ?2",
                 params![
                     chunk.chunk_id.as_bytes().as_slice(),
                     to_i64(lease.volume_id, "volume_id")?,
@@ -208,8 +204,8 @@ impl CentralDb {
                 ));
             }
             tx.execute(
-                "INSERT INTO file_chunks (
-                    file_id, chunk_index, chunk_id
+                "INSERT INTO file_bundles (
+                    file_id, bundle_index, bundle_id
                  ) VALUES (?1, ?2, ?3)",
                 params![
                     to_i64(lease.file_id, "file_id")?,
@@ -233,8 +229,7 @@ impl CentralDb {
             ],
         )?;
         tx.execute(
-            "UPDATE append_leases
-             SET state = 'committed'
+            "DELETE FROM append_leases
              WHERE lease_id = ?1",
             params![to_i64(request.lease_id, "lease_id")?],
         )?;
@@ -255,14 +250,13 @@ impl CentralDb {
         self.get_file_manifest_by_id(lease.file_id)
     }
 
-    pub(crate) fn abort_append(&mut self, request: AbortAppendRequest) -> Result<()> {
+    pub(crate) fn abort_append(&mut self, lease_id: u64) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let _lease = load_active_lease(&tx, request.lease_id)?;
+        let _lease = load_active_lease(&tx, lease_id)?;
         tx.execute(
-            "UPDATE append_leases
-             SET state = 'aborted'
+            "DELETE FROM append_leases
              WHERE lease_id = ?1",
-            params![to_i64(request.lease_id, "lease_id")?],
+            params![to_i64(lease_id, "lease_id")?],
         )?;
         tx.commit()?;
         Ok(())
@@ -362,8 +356,8 @@ impl CentralDb {
         })
     }
 
-    pub(crate) fn list_file_events(&self, request: ListFileEventsRequest) -> Result<FileEvents> {
-        let limit = request.limit.clamp(1, 1024) as usize;
+    pub(crate) fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
+        let limit = limit.clamp(1, 1024) as usize;
         let mut stmt = self.conn.prepare_cached(
             "SELECT event_id, event_type, file_id,
                     old_dir, old_name, new_dir, new_name, created_at_ms
@@ -374,7 +368,7 @@ impl CentralDb {
         )?;
         let rows = stmt.query_map(
             params![
-                to_i64(request.after_event_id, "after_event_id")?,
+                to_i64(after_event_id, "after_event_id")?,
                 to_i64(limit as u64 + 1, "limit")?,
             ],
             row_to_file_event,
@@ -398,8 +392,8 @@ impl CentralDb {
     pub(crate) fn chunk_replica_volumes(&self, chunk_id: ChunkId) -> Result<Vec<u64>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT volume_id
-             FROM chunk_replicas
-             WHERE chunk_id = ?1
+             FROM bundle_replicas
+             WHERE bundle_id = ?1
              ORDER BY volume_id",
         )?;
         let rows = stmt.query_map(params![chunk_id.as_bytes().as_slice()], |row| {
@@ -424,10 +418,10 @@ impl CentralDb {
                         CentralError::invalid_request("chunk stored event missing compressed_len")
                     })?;
                     tx.execute(
-                        "INSERT INTO chunks (
-                            chunk_id, raw_len, compressed_len
+                        "INSERT INTO bundles (
+                            bundle_id, raw_len, compressed_len
                          ) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(chunk_id) DO UPDATE SET
+                         ON CONFLICT(bundle_id) DO UPDATE SET
                             raw_len = excluded.raw_len,
                             compressed_len = excluded.compressed_len",
                         params![
@@ -437,10 +431,10 @@ impl CentralDb {
                         ],
                     )?;
                     tx.execute(
-                        "INSERT INTO chunk_replicas (
-                            chunk_id, volume_id
+                        "INSERT INTO bundle_replicas (
+                            bundle_id, volume_id
                          ) VALUES (?1, ?2)
-                         ON CONFLICT(chunk_id, volume_id) DO NOTHING",
+                         ON CONFLICT(bundle_id, volume_id) DO NOTHING",
                         params![
                             event.chunk_id.as_bytes().as_slice(),
                             to_i64(event.volume_id, "volume_id")?,
@@ -449,8 +443,8 @@ impl CentralDb {
                 }
                 StorageChunkEventKind::Deleted => {
                     tx.execute(
-                        "DELETE FROM chunk_replicas
-                         WHERE chunk_id = ?1 AND volume_id = ?2",
+                        "DELETE FROM bundle_replicas
+                         WHERE bundle_id = ?1 AND volume_id = ?2",
                         params![
                             event.chunk_id.as_bytes().as_slice(),
                             to_i64(event.volume_id, "volume_id")?,
@@ -475,11 +469,11 @@ impl CentralDb {
             CentralError::not_found(format!("file {file_id} was not found in central metadata"))
         })?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT fc.chunk_index, fc.chunk_id, c.raw_len, c.compressed_len
-             FROM file_chunks fc
-             JOIN chunks c ON c.chunk_id = fc.chunk_id
-             WHERE fc.file_id = ?1
-             ORDER BY chunk_index",
+            "SELECT fb.bundle_index, fb.bundle_id, b.raw_len, b.compressed_len
+             FROM file_bundles fb
+             JOIN bundles b ON b.bundle_id = fb.bundle_id
+             WHERE fb.file_id = ?1
+             ORDER BY bundle_index",
         )?;
         let rows = stmt.query_map(params![to_i64(file.file_id, "file_id")?], |row| {
             let chunk_id = blob_to_chunk_id(row.get(1)?, "chunk_id").map_err(to_sql_error)?;
@@ -636,8 +630,8 @@ fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Result<Le
         "SELECT file_id, volume_id, base_size_bytes
          FROM append_leases
          WHERE lease_id = ?1
-           AND state = 'active'",
-        params![to_i64(lease_id, "lease_id")?],
+           AND expires_at_ms > ?2",
+        params![to_i64(lease_id, "lease_id")?, to_i64(now_ms(), "now_ms")?],
         |row| {
             Ok(LeaseRecord {
                 file_id: from_i64(row.get(0)?, "file_id").map_err(to_sql_error)?,

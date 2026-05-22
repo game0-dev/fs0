@@ -8,11 +8,10 @@ pub use error::{CentralError, Result};
 
 use db::CentralDb;
 use fs0_core::{
-    AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkPlan, ChunkPlanAction, ChunkPlans,
-    CommitAppendRequest, ControlRequest, ControlResponse, CreateVolumeRequest, DirectoryEntries,
-    FileEvents, FileManifest, FileRecord, ListDirectoryRequest, ListFileEventsRequest,
-    PlanChunksRequest, RegisterStorageRequest, ReplicaLocation, SessionMessage, StorageChunkEvents,
-    StoragePeerInfo, UploadTarget,
+    AppendLease, BeginAppendRequest, ChunkPlan, ChunkPlanAction, ChunkPlanInput, ChunkPlans,
+    CommitAppendRequest, ControlRequest, ControlResponse, DirectoryEntries, FileEvents,
+    FileManifest, FileRecord, RegisterStorageRequest, ReplicaLocation, SessionMessage,
+    StorageChunkEvents, StoragePeerInfo, UploadTarget,
 };
 use fs0_transport::{bind_endpoint, encode_endpoint_addr, read_frame, write_frame};
 use iroh::Endpoint;
@@ -93,8 +92,8 @@ impl CentralServer {
         self.state.next_client_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn create_volume(&self, request: CreateVolumeRequest) -> Result<VolumeRecord> {
-        self.state.db.lock().await.create_volume(request)
+    pub async fn create_volume(&self, name: String, max_bytes: u64) -> Result<VolumeRecord> {
+        self.state.db.lock().await.create_volume(name, max_bytes)
     }
 
     pub async fn register_storage(
@@ -183,26 +182,34 @@ impl CentralServer {
         self.state.db.lock().await.list_files()
     }
 
-    pub async fn list_directory(&self, request: ListDirectoryRequest) -> Result<DirectoryEntries> {
+    pub async fn list_directory(
+        &self,
+        dir: &str,
+        limit: u32,
+        cursor: Option<u64>,
+    ) -> Result<DirectoryEntries> {
         self.state
             .db
             .lock()
             .await
-            .list_directory(&request.dir, request.limit, request.cursor)
+            .list_directory(dir, limit, cursor)
     }
 
     pub async fn begin_append(&self, request: BeginAppendRequest) -> Result<AppendLease> {
         self.state.db.lock().await.begin_append(request, 0)
     }
 
-    pub async fn plan_chunks(&self, request: PlanChunksRequest) -> Result<ChunkPlans> {
+    pub async fn plan_chunks(
+        &self,
+        lease_id: u64,
+        chunks: Vec<ChunkPlanInput>,
+    ) -> Result<ChunkPlans> {
         let peers = self.storage_peers().await;
-        let mut plans = Vec::with_capacity(request.chunks.len());
-        let prefer_volume_name = self.preferred_volume_name(request.lease_id).await?;
+        let mut plans = Vec::with_capacity(chunks.len());
+        let prefer_volume_name = self.preferred_volume_name(lease_id).await?;
         let chunks = {
             let db = self.state.db.lock().await;
-            request
-                .chunks
+            chunks
                 .into_iter()
                 .map(|chunk| {
                     let volume_ids = db.chunk_replica_volumes(chunk.chunk_id)?;
@@ -259,12 +266,16 @@ impl CentralServer {
         self.hydrate_manifest_replicas(manifest).await
     }
 
-    pub async fn abort_append(&self, request: AbortAppendRequest) -> Result<()> {
-        self.state.db.lock().await.abort_append(request)
+    pub async fn abort_append(&self, lease_id: u64) -> Result<()> {
+        self.state.db.lock().await.abort_append(lease_id)
     }
 
-    pub async fn list_file_events(&self, request: ListFileEventsRequest) -> Result<FileEvents> {
-        self.state.db.lock().await.list_file_events(request)
+    pub async fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
+        self.state
+            .db
+            .lock()
+            .await
+            .list_file_events(after_event_id, limit)
     }
 
     pub async fn record_chunk_events(
@@ -320,10 +331,12 @@ impl CentralServer {
         })?;
         match read_frame::<SessionMessage, _>(&mut session_recv).await? {
             SessionMessage::RegisterClient { .. } => {
+                let storages = self.storage_peers().await;
                 write_frame(
                     &mut session_send,
                     &SessionMessage::ClientRegistered {
                         client_id: self.alloc_client_id(),
+                        storages,
                     },
                 )
                 .await?;
@@ -333,9 +346,13 @@ impl CentralServer {
                 match self.register_storage(request).await {
                     Ok(_) => {
                         storage_id = Some(id);
+                        let storages = self.storage_peers().await;
                         write_frame(
                             &mut session_send,
-                            &SessionMessage::StorageRegistered { storage_id: id },
+                            &SessionMessage::StorageRegistered {
+                                storage_id: id,
+                                storages,
+                            },
                         )
                         .await?;
                     }
@@ -407,10 +424,12 @@ impl CentralServer {
     ) -> (ControlResponse, Option<u64>) {
         match request {
             ControlRequest::Ping => (ControlResponse::Ping, None),
-            ControlRequest::CreateVolume(request) => match self.create_volume(request).await {
-                Ok(volume) => (ControlResponse::CreateVolume(volume.volume_id), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
-            },
+            ControlRequest::CreateVolume { name, max_bytes } => {
+                match self.create_volume(name, max_bytes).await {
+                    Ok(volume) => (ControlResponse::CreateVolume(volume.volume_id), None),
+                    Err(err) => (ControlResponse::Error(err.into()), None),
+                }
+            }
             ControlRequest::RegisterStorage(request) => {
                 let storage_id = request.storage_id;
                 match self.register_storage(request).await {
@@ -429,10 +448,12 @@ impl CentralServer {
                 Ok(files) => (ControlResponse::ListFiles(files), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },
-            ControlRequest::ListDirectory(request) => match self.list_directory(request).await {
-                Ok(entries) => (ControlResponse::ListDirectory(entries), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
-            },
+            ControlRequest::ListDirectory { dir, limit, cursor } => {
+                match self.list_directory(&dir, limit, cursor).await {
+                    Ok(entries) => (ControlResponse::ListDirectory(entries), None),
+                    Err(err) => (ControlResponse::Error(err.into()), None),
+                }
+            }
             ControlRequest::LookupPath { path } => match self.get_file_by_path(&path).await {
                 Ok(file) => (ControlResponse::LookupPath(file), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
@@ -441,7 +462,10 @@ impl CentralServer {
                 Ok(file) => (ControlResponse::GetFileRecord(file), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },
-            ControlRequest::ListFileEvents(request) => match self.list_file_events(request).await {
+            ControlRequest::ListFileEvents {
+                after_event_id,
+                limit,
+            } => match self.list_file_events(after_event_id, limit).await {
                 Ok(events) => (ControlResponse::ListFileEvents(events), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },
@@ -449,15 +473,17 @@ impl CentralServer {
                 Ok(lease) => (ControlResponse::BeginAppend(lease), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },
-            ControlRequest::PlanChunks(request) => match self.plan_chunks(request).await {
-                Ok(plans) => (ControlResponse::PlanChunks(plans), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
-            },
+            ControlRequest::PlanChunks { lease_id, chunks } => {
+                match self.plan_chunks(lease_id, chunks).await {
+                    Ok(plans) => (ControlResponse::PlanChunks(plans), None),
+                    Err(err) => (ControlResponse::Error(err.into()), None),
+                }
+            }
             ControlRequest::CommitAppend(request) => match self.commit_append(request).await {
                 Ok(file_manifest) => (ControlResponse::CommitAppend(file_manifest), None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },
-            ControlRequest::AbortAppend(request) => match self.abort_append(request).await {
+            ControlRequest::AbortAppend { lease_id } => match self.abort_append(lease_id).await {
                 Ok(()) => (ControlResponse::AbortAppend, None),
                 Err(err) => (ControlResponse::Error(err.into()), None),
             },

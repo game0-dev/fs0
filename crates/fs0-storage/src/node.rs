@@ -197,7 +197,7 @@ impl StorageDaemon {
         let control = connect_control(&endpoint, &node.config.central_endpoint).await?;
         let (session_send, response) = register_storage(&control, &node, data_endpoint).await?;
         let storage_id = match response {
-            SessionMessage::StorageRegistered { storage_id } => storage_id,
+            SessionMessage::StorageRegistered { storage_id, .. } => storage_id,
             SessionMessage::Error(err) => {
                 return Err(StorageError::UnexpectedControlResponse(
                     ControlResponse::Error(err),

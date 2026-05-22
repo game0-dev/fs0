@@ -1,8 +1,7 @@
 use fs0_core::{
-    AbortAppendRequest, AppendLease, BeginAppendRequest, ChunkId, ChunkPlans, CommitAppendRequest,
-    Fs0ProtocolError, ControlRequest, ControlResponse, DataRequest, DataResponse, DirectoryEntries,
-    FileEvents, FileManifest, FileRecord, ListDirectoryRequest, ListFileEventsRequest,
-    PlanChunksRequest, SessionMessage, StoragePeerInfo, UploadTarget,
+    AppendLease, BeginAppendRequest, ChunkId, ChunkPlanInput, ChunkPlans, CommitAppendRequest,
+    ControlRequest, ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileEvents,
+    FileManifest, FileRecord, Fs0ProtocolError, SessionMessage, StoragePeerInfo, UploadTarget,
 };
 use fs0_transport::{
     TransportError, bind_endpoint, connect_control, connect_data, control_rpc, data_rpc,
@@ -80,7 +79,7 @@ impl Fs0Client {
         write_frame(&mut session_send, &SessionMessage::RegisterClient { name }).await?;
         let response = read_frame(&mut session_recv).await?;
         let client_id = match response {
-            SessionMessage::ClientRegistered { client_id } => client_id,
+            SessionMessage::ClientRegistered { client_id, .. } => client_id,
             SessionMessage::Error(err) => return Err(ClientError::Protocol(err)),
             response => {
                 return Err(ClientError::Transport(TransportError::InvalidFrame(
@@ -126,8 +125,16 @@ impl Fs0Client {
         }
     }
 
-    pub async fn list_directory(&self, request: ListDirectoryRequest) -> Result<DirectoryEntries> {
-        match self.request(ControlRequest::ListDirectory(request)).await? {
+    pub async fn list_directory(
+        &self,
+        dir: String,
+        limit: u32,
+        cursor: Option<u64>,
+    ) -> Result<DirectoryEntries> {
+        match self
+            .request(ControlRequest::ListDirectory { dir, limit, cursor })
+            .await?
+        {
             ControlResponse::ListDirectory(entries) => Ok(entries),
             ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
             response => Err(ClientError::UnexpectedControlResponse(response)),
@@ -142,8 +149,15 @@ impl Fs0Client {
         }
     }
 
-    pub async fn plan_chunks(&self, request: PlanChunksRequest) -> Result<ChunkPlans> {
-        match self.request(ControlRequest::PlanChunks(request)).await? {
+    pub async fn plan_chunks(
+        &self,
+        lease_id: u64,
+        chunks: Vec<ChunkPlanInput>,
+    ) -> Result<ChunkPlans> {
+        match self
+            .request(ControlRequest::PlanChunks { lease_id, chunks })
+            .await?
+        {
             ControlResponse::PlanChunks(plans) => Ok(plans),
             ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
             response => Err(ClientError::UnexpectedControlResponse(response)),
@@ -158,17 +172,23 @@ impl Fs0Client {
         }
     }
 
-    pub async fn abort_append(&self, request: AbortAppendRequest) -> Result<()> {
-        match self.request(ControlRequest::AbortAppend(request)).await? {
+    pub async fn abort_append(&self, lease_id: u64) -> Result<()> {
+        match self
+            .request(ControlRequest::AbortAppend { lease_id })
+            .await?
+        {
             ControlResponse::AbortAppend => Ok(()),
             ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
             response => Err(ClientError::UnexpectedControlResponse(response)),
         }
     }
 
-    pub async fn list_file_events(&self, request: ListFileEventsRequest) -> Result<FileEvents> {
+    pub async fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
         match self
-            .request(ControlRequest::ListFileEvents(request))
+            .request(ControlRequest::ListFileEvents {
+                after_event_id,
+                limit,
+            })
             .await?
         {
             ControlResponse::ListFileEvents(events) => Ok(events),

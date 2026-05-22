@@ -4,30 +4,69 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub storage_id: u64,
-    pub endpoint_id: Vec<u8>,
-    pub relay_url: String,
-    pub direct_addrs: Vec<String>,
-    pub supported_alpns: Vec<Vec<u8>>,
+pub enum SessionMessage {
+    Ping,
+    Pong,
+    Error(Fs0ProtocolError),
+    RegisterClient {
+        name: Option<String>,
+    },
+    ClientRegistered {
+        client_id: u64,
+        storages: Vec<StoragePeerInfo>,
+    },
+    RegisterStorage {
+        request: RegisterStorageRequest,
+    },
+    StorageRegistered {
+        storage_id: u64,
+        storages: Vec<StoragePeerInfo>,
+    },
+    StorageChanged(StoragePeerInfo),
+    StorageRemoved { storage_id: u64 },
+    UploadLease(UploadLease),
+    RevokeUploadLease {
+        lease_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
     Ping,
-    CreateVolume(CreateVolumeRequest),
+    CreateVolume {
+        name: String,
+        max_bytes: u64,
+    },
     RegisterStorage(RegisterStorageRequest),
     ListStoragePeers,
     ListFiles,
-    ListDirectory(ListDirectoryRequest),
-    LookupPath { path: String },
-    GetFileRecord { path: String },
-    ListFileEvents(ListFileEventsRequest),
+    ListDirectory {
+        dir: String,
+        limit: u32,
+        cursor: Option<u64>,
+    },
+    LookupPath {
+        path: String,
+    },
+    GetFileRecord {
+        path: String,
+    },
+    ListFileEvents {
+        after_event_id: u64,
+        limit: u32,
+    },
     BeginAppend(BeginAppendRequest),
-    PlanChunks(PlanChunksRequest),
+    PlanChunks {
+        lease_id: u64,
+        chunks: Vec<ChunkPlanInput>,
+    },
     CommitAppend(CommitAppendRequest),
-    AbortAppend(AbortAppendRequest),
-    GetFileManifest { path: String },
+    AbortAppend {
+        lease_id: u64,
+    },
+    GetFileManifest {
+        path: String,
+    },
     RecordChunkEvents(StorageChunkEvents),
 }
 
@@ -52,16 +91,52 @@ pub enum ControlResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionMessage {
-    RegisterClient { name: Option<String> },
-    RegisterStorage { request: RegisterStorageRequest },
-    ClientRegistered { client_id: u64 },
-    StorageRegistered { storage_id: u64 },
+pub enum DataRequest {
     Ping,
+    HasChunk {
+        volume_id: u64,
+        chunk_id: ChunkId,
+    },
+    UploadChunk {
+        volume_id: u64,
+        chunk_id: ChunkId,
+        raw_len: u64,
+        compressed_bytes: Vec<u8>,
+    },
+    GetChunk {
+        volume_id: u64,
+        chunk_id: ChunkId,
+    },
+    GetRange {
+        volume_id: u64,
+        chunk_id: ChunkId,
+        offset: u64,
+        len: u64,
+    },
+    RepairCopy {
+        job_id: u64,
+        source_volume_id: u64,
+        chunk_id: ChunkId,
+        target: ReplicaLocation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataResponse {
     Pong,
-    UploadLease(UploadLease),
-    RevokeUploadLease { lease_id: u64 },
     Error(Fs0ProtocolError),
+    ChunkPresence {
+        exists: bool,
+        raw_len: Option<u64>,
+        compressed_len: Option<u64>,
+    },
+    ChunkStored {
+        chunk_id: ChunkId,
+        raw_len: u64,
+        compressed_len: u64,
+    },
+    Bytes(Vec<u8>),
+    RepairStarted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,12 +162,6 @@ impl fmt::Display for Fs0ProtocolError {
 }
 
 impl std::error::Error for Fs0ProtocolError {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateVolumeRequest {
-    pub name: Option<String>,
-    pub max_bytes: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterStorageRequest {
@@ -143,13 +212,6 @@ pub struct DirectoryEntries {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListDirectoryRequest {
-    pub dir: String,
-    pub limit: u32,
-    pub cursor: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginAppendRequest {
     pub path: String,
     pub expected_size: u64,
@@ -177,12 +239,6 @@ pub struct UploadLease {
     pub base_size: u64,
     pub expires_at_ms: u64,
     pub prefer_volume_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanChunksRequest {
-    pub lease_id: u64,
-    pub chunks: Vec<ChunkPlanInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,17 +317,6 @@ pub enum StorageChunkEventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AbortAppendRequest {
-    pub lease_id: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListFileEventsRequest {
-    pub after_event_id: u64,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEvents {
     pub events: Vec<FileEvent>,
     pub next_event_id: Option<u64>,
@@ -293,53 +338,4 @@ pub enum FileEventKind {
     Updated,
     Moved,
     Deleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DataRequest {
-    Ping,
-    HasChunk {
-        volume_id: u64,
-        chunk_id: ChunkId,
-    },
-    UploadChunk {
-        volume_id: u64,
-        chunk_id: ChunkId,
-        raw_len: u64,
-        compressed_bytes: Vec<u8>,
-    },
-    GetChunk {
-        volume_id: u64,
-        chunk_id: ChunkId,
-    },
-    GetRange {
-        volume_id: u64,
-        chunk_id: ChunkId,
-        offset: u64,
-        len: u64,
-    },
-    RepairCopy {
-        job_id: u64,
-        source_volume_id: u64,
-        chunk_id: ChunkId,
-        target: ReplicaLocation,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DataResponse {
-    Pong,
-    Error(Fs0ProtocolError),
-    ChunkPresence {
-        exists: bool,
-        raw_len: Option<u64>,
-        compressed_len: Option<u64>,
-    },
-    ChunkStored {
-        chunk_id: ChunkId,
-        raw_len: u64,
-        compressed_len: u64,
-    },
-    Bytes(Vec<u8>),
-    RepairStarted,
 }
