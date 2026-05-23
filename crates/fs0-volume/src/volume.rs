@@ -1,19 +1,31 @@
 use crate::Result;
-use crate::db::{InsertChunk, VolumeDb, to_usize};
-use fs0_core::{BundleChunkRef, BundleReplicaEvent, Fs0Error, HashId};
+use crate::data_file_cache::DataFileCache;
+use crate::db::{InsertChunk, VolumeDb};
+use fs0_core::{
+    BundleChunkRef, BundleReplicaEvent, DATA_FILE_SIZE, Fs0Error, HashId, VOLUME_FORMAT_VERSION,
+    VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY,
+};
+use parking_lot::{Mutex, MutexGuard};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-
-pub const RAW_CHUNK_SIZE: u64 = 512 * 1024;
-pub const DATA_FILE_SIZE: u64 = 512 * 1024 * 1024;
 pub const VOLUME_DB_FILE: &str = ".f0.volume.sqlite";
-pub const VOLUME_FORMAT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeOptions {
+    pub read_concurrency: usize,
+    pub write_concurrency: usize,
+}
+
+impl Default for VolumeOptions {
+    fn default() -> Self {
+        Self {
+            read_concurrency: VOLUME_READ_CONCURRENCY,
+            write_concurrency: VOLUME_WRITE_CONCURRENCY,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeMeta {
@@ -41,21 +53,23 @@ pub struct BundleMeta {
     pub chunk_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Volume {
     root: PathBuf,
-    state: Arc<Mutex<VolumeState>>,
-    meta_cache: Arc<RwLock<VolumeMeta>>,
-}
-
-#[derive(Debug)]
-struct VolumeState {
-    db: VolumeDb,
-    meta: VolumeMeta,
+    db: Mutex<VolumeDb>,
+    files: DataFileCache,
 }
 
 impl Volume {
-    pub fn init(path: impl Into<PathBuf>, volume_id: u64, max_bytes: u64) -> Result<Self> {
+    pub fn init(path: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
+        Self::init_with_options(path, max_bytes, VolumeOptions::default())
+    }
+
+    pub fn init_with_options(
+        path: impl Into<PathBuf>,
+        max_bytes: u64,
+        options: VolumeOptions,
+    ) -> Result<Self> {
         validate_options(max_bytes)?;
         let root = path.into();
         fs::create_dir_all(&root)?;
@@ -69,7 +83,7 @@ impl Volume {
 
         let now = now_ms();
         let meta = VolumeMeta {
-            volume_id,
+            volume_id: 0,
             format_version: VOLUME_FORMAT_VERSION,
             max_bytes,
             active_volume_offset: 0,
@@ -78,23 +92,19 @@ impl Volume {
         };
         let db = VolumeDb::create(&root, &meta)?;
         info!(
-            volume_id,
             max_bytes,
             root = %root.display(),
             "initialized volume"
         );
 
-        Ok(Self {
-            root,
-            state: Arc::new(Mutex::new(VolumeState {
-                db,
-                meta: meta.clone(),
-            })),
-            meta_cache: Arc::new(RwLock::new(meta)),
-        })
+        Self::from_parts(root, db, options)
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_options(path, VolumeOptions::default())
+    }
+
+    pub fn open_with_options(path: impl Into<PathBuf>, options: VolumeOptions) -> Result<Self> {
         let root = path.into();
         let db_path = root.join(VOLUME_DB_FILE);
         if !db_path.exists() {
@@ -104,7 +114,7 @@ impl Volume {
         }
 
         let db = VolumeDb::open(&root)?;
-        let meta = db.load_meta()?;
+        let meta = db.meta();
         info!(
             volume_id = meta.volume_id,
             max_bytes = meta.max_bytes,
@@ -113,14 +123,7 @@ impl Volume {
             "opened volume"
         );
 
-        Ok(Self {
-            root,
-            state: Arc::new(Mutex::new(VolumeState {
-                db,
-                meta: meta.clone(),
-            })),
-            meta_cache: Arc::new(RwLock::new(meta)),
-        })
+        Self::from_parts(root, db, options)
     }
 
     #[must_use]
@@ -130,10 +133,19 @@ impl Volume {
 
     #[must_use]
     pub fn meta(&self) -> VolumeMeta {
-        self.meta_cache
-            .read()
-            .expect("volume meta cache lock poisoned")
-            .clone()
+        self.acquire_db_lock().meta()
+    }
+
+    pub fn assign_volume_id(&self, volume_id: u64) -> Result<VolumeMeta> {
+        let meta = self
+            .acquire_db_lock()
+            .assign_volume_id(volume_id, now_ms())?;
+        info!(
+            volume_id,
+            root = %self.root.display(),
+            "assigned volume id"
+        );
+        Ok(meta)
     }
 
     pub async fn put_chunk(
@@ -146,8 +158,8 @@ impl Volume {
 
         let compressed_len = compressed_bytes.len() as u64;
         let (insert, next_active_offset) = {
-            let mut state = self.state.lock().await;
-            match state.db.load_chunk(chunk_id)? {
+            let mut db = self.acquire_db_lock();
+            match db.load_chunk(chunk_id)? {
                 Some(existing)
                     if existing.raw_len == raw_len && existing.compressed_len == compressed_len =>
                 {
@@ -163,10 +175,11 @@ impl Volume {
                 _ => {}
             }
 
-            let mut volume_offset = state.meta.active_volume_offset;
+            let meta = db.meta();
+            let mut volume_offset = meta.active_volume_offset;
             let offset_in_data_file = volume_offset % DATA_FILE_SIZE;
             if offset_in_data_file + compressed_len > DATA_FILE_SIZE {
-                volume_offset = next_data_file_offset(volume_offset);
+                volume_offset = ((volume_offset / DATA_FILE_SIZE) + 1) * DATA_FILE_SIZE;
             }
 
             let next_active_offset =
@@ -175,39 +188,32 @@ impl Volume {
                         message: "volume offset overflow".to_owned(),
                     }
                 })?;
-            if next_active_offset > state.meta.max_bytes {
+            if next_active_offset > meta.max_bytes {
                 warn!(
                     ?chunk_id,
                     required_end = next_active_offset,
-                    max_bytes = state.meta.max_bytes,
+                    max_bytes = meta.max_bytes,
                     "chunk write exceeds volume capacity"
                 );
                 return Err(Fs0Error::CapacityExceeded {
                     required_end: next_active_offset,
-                    max_bytes: state.meta.max_bytes,
+                    max_bytes: meta.max_bytes,
                 });
             }
 
-            state.meta.active_volume_offset = next_active_offset;
-            state.meta.updated_at_ms = now_ms();
-            *self
-                .meta_cache
-                .write()
-                .expect("volume meta cache lock poisoned") = state.meta.clone();
+            db.persist_active_volume_offset(next_active_offset, now_ms())?;
 
-            (
-                InsertChunk {
-                    chunk_id,
-                    volume_offset,
-                    raw_len,
-                    compressed_len,
-                },
-                next_active_offset,
-            )
+            let insert = InsertChunk {
+                chunk_id,
+                volume_offset,
+                raw_len,
+                compressed_len,
+            };
+            (insert, next_active_offset)
         };
 
         if let Err(err) = self
-            .write_compressed_bytes(insert.volume_offset, &compressed_bytes)
+            .write_compressed_bytes(insert.volume_offset, compressed_bytes)
             .await
         {
             warn!(
@@ -221,19 +227,11 @@ impl Volume {
             return Err(err);
         }
 
-        let mut state = self.state.lock().await;
+        let mut db = self.acquire_db_lock();
         let now = now_ms();
-        state
-            .db
-            .insert_chunk_and_update_active_offset(&insert, next_active_offset, now)?;
-        state.meta = state.db.load_meta()?;
-        *self
-            .meta_cache
-            .write()
-            .expect("volume meta cache lock poisoned") = state.meta.clone();
+        db.insert_chunk_and_update_active_offset(&insert, next_active_offset, now)?;
 
-        let chunk = state
-            .db
+        let chunk = db
             .load_chunk(chunk_id)?
             .ok_or(Fs0Error::ChunkNotFound { chunk_id })?;
         info!(
@@ -247,41 +245,30 @@ impl Volume {
     }
 
     async fn persist_reserved_offset(&self, reserved_active_offset: u64) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let meta = state
-            .db
+        self.acquire_db_lock()
             .persist_active_volume_offset(reserved_active_offset, now_ms())?;
-        state.meta = meta;
-        *self
-            .meta_cache
-            .write()
-            .expect("volume meta cache lock poisoned") = state.meta.clone();
         Ok(())
     }
 
     pub async fn read_chunk(&self, chunk_id: HashId) -> Result<Vec<u8>> {
         debug!(?chunk_id, "reading chunk");
         let chunk = {
-            let state = self.state.lock().await;
-            state
-                .db
-                .load_chunk(chunk_id)?
+            let db = self.acquire_db_lock();
+            db.load_chunk(chunk_id)?
                 .ok_or(Fs0Error::ChunkNotFound { chunk_id })?
         };
-        self.read_chunk_bytes(&chunk).await
+        self.read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
+            .await
     }
 
     pub async fn chunk_meta(&self, chunk_id: HashId) -> Result<ChunkMeta> {
-        let state = self.state.lock().await;
-        state
-            .db
-            .load_chunk(chunk_id)?
+        let db = self.acquire_db_lock();
+        db.load_chunk(chunk_id)?
             .ok_or(Fs0Error::ChunkNotFound { chunk_id })
     }
 
     pub async fn delete_chunk(&self, chunk_id: HashId) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state.db.delete_chunk(chunk_id)?;
+        self.acquire_db_lock().delete_chunk(chunk_id)?;
         info!(?chunk_id, "deleted chunk metadata");
         Ok(())
     }
@@ -295,11 +282,10 @@ impl Volume {
         validate_bundle_chunks(&chunks)?;
 
         let chunk_metas = {
-            let state = self.state.lock().await;
+            let db = self.acquire_db_lock();
             let mut metas = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
-                let meta = state
-                    .db
+                let meta = db
                     .load_chunk(chunk.chunk_id)?
                     .ok_or(Fs0Error::ChunkNotFound {
                         chunk_id: chunk.chunk_id,
@@ -317,11 +303,14 @@ impl Volume {
             metas
         };
 
-        let mut compressed_bytes = Vec::new();
+        let mut hasher = blake3::Hasher::new();
         for chunk in &chunk_metas {
-            compressed_bytes.extend(self.read_chunk_bytes(chunk).await?);
+            let bytes = self
+                .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
+                .await?;
+            hasher.update(&bytes);
         }
-        if fs0_core::blake3_hash(&compressed_bytes) != bundle_id {
+        if HashId(*hasher.finalize().as_bytes()) != bundle_id {
             warn!(
                 ?bundle_id,
                 chunk_count = chunks.len(),
@@ -332,8 +321,7 @@ impl Volume {
             });
         }
 
-        let mut state = self.state.lock().await;
-        let bundle = state.db.commit_bundle(bundle_id, &chunks)?;
+        let bundle = self.acquire_db_lock().commit_bundle(bundle_id, &chunks)?;
         info!(
             ?bundle_id,
             raw_len = bundle.raw_len,
@@ -344,105 +332,50 @@ impl Volume {
         Ok(bundle)
     }
 
-    pub async fn bundle_meta(&self, bundle_id: HashId) -> Result<BundleMeta> {
-        let state = self.state.lock().await;
-        state
-            .db
-            .load_bundle(bundle_id)?
-            .ok_or(Fs0Error::BundleNotFound { bundle_id })
-    }
-
     pub async fn list_bundle_chunks(&self, bundle_id: HashId) -> Result<Vec<BundleChunkRef>> {
-        let state = self.state.lock().await;
-        let chunks = state.db.list_bundle_chunks(bundle_id)?;
+        let chunks = self.acquire_db_lock().list_bundle_chunks(bundle_id)?;
         if chunks.is_empty() {
             return Err(Fs0Error::BundleNotFound { bundle_id });
         }
         Ok(chunks)
     }
 
-    pub async fn read_bundle(&self, bundle_id: HashId) -> Result<Vec<u8>> {
-        debug!(?bundle_id, "reading bundle");
-        let chunks = self.list_bundle_chunks(bundle_id).await?;
-        let mut bytes = Vec::new();
-        for chunk in chunks {
-            bytes.extend(self.read_chunk(chunk.chunk_id).await?);
-        }
-        if fs0_core::blake3_hash(&bytes) != bundle_id {
-            warn!(?bundle_id, "bundle hash mismatch while reading bundle");
-            return Err(Fs0Error::InvalidData {
-                message: "bundle id does not match stored chunk bytes".to_owned(),
-            });
-        }
-        Ok(bytes)
-    }
-
     pub async fn delete_bundle(&self, bundle_id: HashId) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state.db.delete_bundle(bundle_id)?;
+        self.acquire_db_lock().delete_bundle(bundle_id)?;
         info!(?bundle_id, "deleted bundle");
         Ok(())
     }
 
     pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
-        let state = self.state.lock().await;
-        state.db.pending_central_events(limit)
+        self.acquire_db_lock().pending_central_events(limit)
     }
 
-    pub async fn ack_pending_central_events(&self, event_ids: &[u64]) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state.db.ack_pending_central_events(event_ids)?;
-        debug!(
-            event_count = event_ids.len(),
-            "acked pending central events"
-        );
+    pub async fn ack_pending_central_events(&self, max_event_id: u64) -> Result<()> {
+        self.acquire_db_lock()
+            .ack_pending_central_events(max_event_id)?;
+        debug!(max_event_id, "acked pending central events");
         Ok(())
     }
 
     pub async fn mark_pending_central_events_failed(
         &self,
-        event_ids: &[u64],
+        max_event_id: u64,
         failed_at_ms: u64,
     ) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state
-            .db
-            .mark_pending_central_events_failed(event_ids, failed_at_ms)?;
+        self.acquire_db_lock()
+            .mark_pending_central_events_failed(max_event_id, failed_at_ms)?;
         warn!(
-            event_count = event_ids.len(),
+            max_event_id,
             failed_at_ms, "marked pending central events failed"
         );
         Ok(())
     }
 
-    async fn read_chunk_bytes(&self, chunk: &ChunkMeta) -> Result<Vec<u8>> {
-        let compressed_bytes = self
-            .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
-            .await?;
-        let actual_hash = fs0_core::blake3_hash(&compressed_bytes);
-        if actual_hash != chunk.chunk_id {
-            return Err(Fs0Error::HashMismatch {
-                volume_offset: chunk.volume_offset,
-            });
-        }
-
-        Ok(compressed_bytes)
-    }
-
-    async fn write_compressed_bytes(&self, volume_offset: u64, bytes: &[u8]) -> Result<()> {
+    async fn write_compressed_bytes(&self, volume_offset: u64, bytes: Vec<u8>) -> Result<()> {
         let (data_file_index, data_file_offset) = self.locate(volume_offset);
-        let path = self.data_file_path(data_file_index);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .open(path)
-            .await?;
-        file.seek(SeekFrom::Start(data_file_offset)).await?;
-        file.write_all(bytes).await?;
-        file.sync_data().await?;
-        Ok(())
+        self.files
+            .write_at(data_file_index, data_file_offset, bytes)
+            .await
     }
 
     async fn read_compressed_bytes(
@@ -451,12 +384,13 @@ impl Volume {
         compressed_len: u64,
     ) -> Result<Vec<u8>> {
         let (data_file_index, data_file_offset) = self.locate(volume_offset);
-        let path = self.data_file_path(data_file_index);
-        let mut file = File::open(path).await?;
-        file.seek(SeekFrom::Start(data_file_offset)).await?;
-        let mut bytes = vec![0; to_usize(compressed_len, "compressed len")?];
-        file.read_exact(&mut bytes).await?;
-        Ok(bytes)
+        let buffer_len =
+            usize::try_from(compressed_len).map_err(|_| Fs0Error::IntegerConversion {
+                message: format!("compressed len {compressed_len} exceeds usize"),
+            })?;
+        self.files
+            .read_at(data_file_index, data_file_offset, buffer_len)
+            .await
     }
 
     fn locate(&self, volume_offset: u64) -> (u64, u64) {
@@ -466,8 +400,27 @@ impl Volume {
         )
     }
 
-    fn data_file_path(&self, data_file_index: u64) -> PathBuf {
-        self.root.join(format!(".data.{data_file_index}"))
+    fn acquire_db_lock(&self) -> MutexGuard<'_, VolumeDb> {
+        self.db.lock()
+    }
+
+    fn from_parts(root: PathBuf, db: VolumeDb, options: VolumeOptions) -> Result<Self> {
+        let data_files =
+            usize::try_from(db.meta().max_bytes.div_ceil(DATA_FILE_SIZE)).map_err(|_| {
+                Fs0Error::IntegerConversion {
+                    message: format!("volume max_bytes {} exceeds usize", db.meta().max_bytes),
+                }
+            })?;
+        Ok(Self {
+            files: DataFileCache::with_capacity(
+                root.clone(),
+                data_files,
+                options.read_concurrency,
+                options.write_concurrency,
+            ),
+            root,
+            db: Mutex::new(db),
+        })
     }
 }
 
@@ -522,10 +475,6 @@ fn validate_bundle_chunks(chunks: &[BundleChunkRef]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn next_data_file_offset(active_offset: u64) -> u64 {
-    ((active_offset / DATA_FILE_SIZE) + 1) * DATA_FILE_SIZE
 }
 
 pub(crate) fn now_ms() -> u64 {

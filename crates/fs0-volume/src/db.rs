@@ -8,6 +8,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub(crate) struct VolumeDb {
     conn: Connection,
+    meta: VolumeMeta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +25,9 @@ trait SqliteResultExt<T> {
 
 impl<T> SqliteResultExt<T> for rusqlite::Result<T> {
     fn fs0(self) -> Result<T> {
-        self.map_err(sqlite_error)
+        self.map_err(|err| Fs0Error::Sqlite {
+            message: err.to_string(),
+        })
     }
 }
 
@@ -53,24 +56,63 @@ impl VolumeDb {
         )
         .fs0()?;
         tx.commit().fs0()?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            meta: meta.clone(),
+        })
     }
 
     pub(crate) fn open(root: &Path) -> Result<Self> {
         let db_path = root.join(VOLUME_DB_FILE);
         let conn = Connection::open(db_path).fs0()?;
         Self::configure_connection(&conn)?;
-        Ok(Self { conn })
+        let meta = Self::load_meta_from_conn(&conn)?;
+        Ok(Self { conn, meta })
     }
 
-    pub(crate) fn load_meta(&self) -> Result<VolumeMeta> {
-        let mut stmt = self
-            .conn
+    pub(crate) fn meta(&self) -> VolumeMeta {
+        self.meta.clone()
+    }
+
+    pub(crate) fn assign_volume_id(
+        &mut self,
+        volume_id: u64,
+        updated_at_ms: u64,
+    ) -> Result<VolumeMeta> {
+        if self.meta.volume_id != 0 && self.meta.volume_id != volume_id {
+            return Err(Fs0Error::InvalidData {
+                message: format!(
+                    "volume already has id {}, cannot assign {volume_id}",
+                    self.meta.volume_id
+                ),
+            });
+        }
+
+        let tx = self.conn.transaction().fs0()?;
+        tx.execute(
+            "UPDATE volume_meta
+             SET volume_id = ?1,
+                 updated_at_ms = ?2
+             WHERE id = 1",
+            params![
+                Self::to_i64(volume_id, "volume_id")?,
+                Self::to_i64(updated_at_ms, "updated_at_ms")?,
+            ],
+        )
+        .fs0()?;
+        tx.commit().fs0()?;
+        self.meta.volume_id = volume_id;
+        self.meta.updated_at_ms = updated_at_ms;
+        Ok(self.meta.clone())
+    }
+
+    fn load_meta_from_conn(conn: &Connection) -> Result<VolumeMeta> {
+        let mut stmt = conn
             .prepare_cached(
                 "SELECT volume_id, format_version, max_bytes, active_volume_offset,
-                    created_at_ms, updated_at_ms
-             FROM volume_meta
-             WHERE id = 1",
+                        created_at_ms, updated_at_ms
+                 FROM volume_meta
+                 WHERE id = 1",
             )
             .fs0()?;
         stmt.query_row([], |row| {
@@ -170,6 +212,8 @@ impl VolumeDb {
         )
         .fs0()?;
         tx.commit().fs0()?;
+        self.meta.active_volume_offset = self.meta.active_volume_offset.max(active_volume_offset);
+        self.meta.updated_at_ms = now_ms;
         Ok(())
     }
 
@@ -191,7 +235,8 @@ impl VolumeDb {
         )
         .fs0()?;
         tx.commit().fs0()?;
-        self.load_meta()
+        self.meta = Self::load_meta_from_conn(&self.conn)?;
+        Ok(self.meta.clone())
     }
 
     pub(crate) fn delete_chunk(&mut self, chunk_id: HashId) -> Result<()> {
@@ -310,7 +355,7 @@ impl VolumeDb {
              LIMIT ?1",
             )
             .fs0()?;
-        let volume_id = self.load_meta()?.volume_id;
+        let volume_id = self.meta.volume_id;
         let rows = stmt
             .query_map(params![Self::to_i64(limit as u64, "limit")?], |row| {
                 let event_type: String = row.get(1)?;
@@ -354,35 +399,31 @@ impl VolumeDb {
 
     pub(crate) fn mark_pending_central_events_failed(
         &mut self,
-        event_ids: &[u64],
+        max_event_id: u64,
         failed_at_ms: u64,
     ) -> Result<()> {
         let tx = self.conn.transaction().fs0()?;
-        for event_id in event_ids {
-            tx.execute(
-                "UPDATE pending_central_events
-                 SET last_failed_at_ms = ?2
-                 WHERE event_id = ?1",
-                params![
-                    Self::to_i64(*event_id, "event_id")?,
-                    Self::to_i64(failed_at_ms, "last_failed_at_ms")?,
-                ],
-            )
-            .fs0()?;
-        }
+        tx.execute(
+            "UPDATE pending_central_events
+             SET last_failed_at_ms = ?2
+             WHERE event_id <= ?1",
+            params![
+                Self::to_i64(max_event_id, "max_event_id")?,
+                Self::to_i64(failed_at_ms, "last_failed_at_ms")?,
+            ],
+        )
+        .fs0()?;
         tx.commit().fs0()?;
         Ok(())
     }
 
-    pub(crate) fn ack_pending_central_events(&mut self, event_ids: &[u64]) -> Result<()> {
+    pub(crate) fn ack_pending_central_events(&mut self, max_event_id: u64) -> Result<()> {
         let tx = self.conn.transaction().fs0()?;
-        for event_id in event_ids {
-            tx.execute(
-                "DELETE FROM pending_central_events WHERE event_id = ?1",
-                params![Self::to_i64(*event_id, "event_id")?],
-            )
-            .fs0()?;
-        }
+        tx.execute(
+            "DELETE FROM pending_central_events WHERE event_id <= ?1",
+            params![Self::to_i64(max_event_id, "max_event_id")?],
+        )
+        .fs0()?;
         tx.commit().fs0()?;
         Ok(())
     }
@@ -433,17 +474,5 @@ impl VolumeDb {
 
     fn to_sql_error(err: Fs0Error) -> rusqlite::Error {
         rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-    }
-}
-
-pub(crate) fn to_usize(value: u64, name: &str) -> Result<usize> {
-    usize::try_from(value).map_err(|_| Fs0Error::IntegerConversion {
-        message: format!("{name} {value} exceeds usize"),
-    })
-}
-
-fn sqlite_error(err: rusqlite::Error) -> Fs0Error {
-    Fs0Error::Sqlite {
-        message: err.to_string(),
     }
 }
