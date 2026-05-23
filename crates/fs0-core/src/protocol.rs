@@ -41,6 +41,34 @@ pub enum ControlRequest {
         limit: u32,
         cursor: Option<u64>,
     },
+    GetFileReadPlan {
+        path: String,
+    },
+    GetFileReadPlanById {
+        file_id: u64,
+    },
+    DeleteFile {
+        path: String,
+    },
+    DeleteFileById {
+        file_id: u64,
+    },
+    CopyFile {
+        source_path: String,
+        target_path: String,
+    },
+    CopyFileById {
+        source_file_id: u64,
+        target_path: String,
+    },
+    RenameFile {
+        source_path: String,
+        target_path: String,
+    },
+    RenameFileById {
+        file_id: u64,
+        target_path: String,
+    },
     GetFileChangeLogs {
         after_event_id: u64,
         limit: u32,
@@ -49,9 +77,6 @@ pub enum ControlRequest {
     CommitAppend(CommitAppendRequest),
     AbortAppend {
         lease_id: u64,
-    },
-    GetFileReadPlan {
-        path: String,
     },
     ReportBundleReplica(BundleReplicaReport),
 }
@@ -63,12 +88,19 @@ pub enum ControlResponse {
     UploadLeaseRevoked { lease_id: u64 },
     ListDirectory(DirectoryEntries),
     GetFileChangeLogs(FileChangeLogs),
-    Error(Fs0Error),
     BeginAppend(AppendLease),
     CommitAppend(FileReadPlan),
     AbortAppend,
     GetFileReadPlan(FileReadPlan),
+    GetFileReadPlanById(FileReadPlan),
+    DeleteFile,
+    DeleteFileById,
+    CopyFile(FileRecord),
+    CopyFileById(FileRecord),
+    RenameFile(FileRecord),
+    RenameFileById(FileRecord),
     ReportBundleReplica,
+    Error(Fs0Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,15 +221,15 @@ pub struct RegisterStorageRequest {
     pub storage_id: u64,
     pub name: String,
     pub volumes: Vec<StorageVolumeInfo>,
-    pub data_endpoint: Vec<u8>,
+    pub iroh_endpoint: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageVolumeInfo {
     pub volume_id: u64,
-    pub name: Option<String>,
+    pub name: String,
     pub max_bytes: u64,
-    pub active_volume_offset: u64,
+    pub max_volume_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +237,7 @@ pub struct StoragePeerInfo {
     pub storage_id: u64,
     pub name: String,
     pub volumes: Vec<StorageVolumeInfo>,
-    pub data_endpoint: Vec<u8>,
+    pub iroh_endpoint: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +301,7 @@ pub struct UploadLease {
 pub struct UploadTarget {
     pub storage_id: u64,
     pub volume_id: u64,
-    pub data_endpoint: Vec<u8>,
+    pub iroh_endpoint: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
