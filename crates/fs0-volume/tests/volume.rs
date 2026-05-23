@@ -1,9 +1,22 @@
-use fs0_core::{ChunkId, DEFAULT_ZSTD_LEVEL, blake3_hash, zstd_compress, zstd_decompress};
-use fs0_volume::{DATA_FILE_SIZE, RAW_CHUNK_SIZE, Volume, VolumeError};
+use fs0_core::{DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, blake3_hash, zstd_compress, zstd_decompress};
+use fs0_volume::{DATA_FILE_SIZE, RAW_CHUNK_SIZE, Volume};
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 
-async fn put(volume: &Volume, raw: &[u8]) -> (ChunkId, u64) {
+fn test_volume(path: &Path, max_bytes: u64) -> Volume {
+    let volume = Volume::init(path, max_bytes).unwrap();
+    create_sparse_data_file(path);
+    volume
+}
+
+fn create_sparse_data_file(path: &Path) {
+    let file = File::create(path.join(".fs0.0")).unwrap();
+    file.set_len(DATA_FILE_SIZE).unwrap();
+}
+
+async fn put(volume: &Volume, raw: &[u8]) -> (HashId, u64) {
     let compressed_bytes = zstd_compress(raw, DEFAULT_ZSTD_LEVEL).unwrap();
     let chunk_id = blake3_hash(&compressed_bytes);
     let compressed_len = compressed_bytes.len() as u64;
@@ -14,7 +27,7 @@ async fn put(volume: &Volume, raw: &[u8]) -> (ChunkId, u64) {
     (chunk_id, compressed_len)
 }
 
-async fn read_raw(volume: &Volume, chunk_id: ChunkId) -> Vec<u8> {
+async fn read_raw(volume: &Volume, chunk_id: HashId) -> Vec<u8> {
     let compressed_bytes = volume.read_chunk(chunk_id).await.unwrap();
     zstd_decompress(&compressed_bytes, RAW_CHUNK_SIZE as usize).unwrap()
 }
@@ -22,10 +35,12 @@ async fn read_raw(volume: &Volume, chunk_id: ChunkId) -> Vec<u8> {
 #[tokio::test]
 async fn init_and_open_volume() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = Volume::init(temp.path(), 1024 * 1024).unwrap();
 
-    assert_eq!(volume.meta().volume_id, 42);
+    assert_eq!(volume.meta().volume_id, 0);
     assert_eq!(volume.meta().active_volume_offset, 0);
+    volume.assign_volume_id(42).unwrap();
+    assert_eq!(volume.meta().volume_id, 42);
 
     drop(volume);
 
@@ -38,14 +53,14 @@ async fn constants_and_options_use_expected_sizes() {
     let max_bytes = 2 * DATA_FILE_SIZE;
 
     assert_eq!(RAW_CHUNK_SIZE, 512 * 1024);
-    assert_eq!(DATA_FILE_SIZE, 512 * 1024 * 1024);
+    assert_eq!(DATA_FILE_SIZE, 4 * 1024 * 1024 * 1024);
     assert_eq!(max_bytes, 2 * DATA_FILE_SIZE);
 }
 
 #[tokio::test]
 async fn put_chunk_and_read_it_back() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
     let raw = b"abcdefghijklmnopqrstuvwxyz012345";
     let (chunk_id, compressed_len) = put(&volume, raw).await;
 
@@ -59,7 +74,7 @@ async fn put_chunk_and_read_it_back() {
 #[tokio::test]
 async fn chunk_meta_returns_requested_chunk_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
     let raw_a = vec![b'a'; RAW_CHUNK_SIZE as usize];
     let raw_b = vec![b'b'; RAW_CHUNK_SIZE as usize];
 
@@ -74,7 +89,7 @@ async fn chunk_meta_returns_requested_chunk_metadata() {
 #[tokio::test]
 async fn duplicate_chunk_reuses_existing_storage() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
 
     let (chunk_id, _) = put(&volume, b"hello").await;
     let offset = volume.meta().active_volume_offset;
@@ -87,49 +102,49 @@ async fn duplicate_chunk_reuses_existing_storage() {
 #[tokio::test]
 async fn capacity_limit_is_enforced_without_metadata_update() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 64).unwrap();
+    let volume = Volume::init(temp.path(), 64).unwrap();
     let bytes = vec![1; 65];
     let chunk_id = blake3_hash(&bytes);
 
     let result = volume.put_chunk(chunk_id, 1, bytes).await;
 
-    assert!(matches!(result, Err(VolumeError::CapacityExceeded { .. })));
+    assert!(matches!(result, Err(Fs0Error::CapacityExceeded { .. })));
     assert_eq!(volume.meta().active_volume_offset, 0);
     assert!(matches!(
         volume.chunk_meta(chunk_id).await,
-        Err(VolumeError::ChunkNotFound(id)) if id == chunk_id
+        Err(Fs0Error::ChunkNotFound { chunk_id: missing }) if missing == chunk_id
     ));
 }
 
 #[tokio::test]
 async fn delete_removes_chunk_metadata() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
 
     let (chunk_id, _) = put(&volume, b"delete me").await;
     volume.delete_chunk(chunk_id).await.unwrap();
 
     assert!(matches!(
         volume.chunk_meta(chunk_id).await,
-        Err(VolumeError::ChunkNotFound(id)) if id == chunk_id
+        Err(Fs0Error::ChunkNotFound { chunk_id: missing }) if missing == chunk_id
     ));
 }
 
 #[tokio::test]
-async fn hash_mismatch_is_detected() {
+async fn read_chunk_does_not_hash_check_stored_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let volume = Volume::init(temp.path(), 42, 1024 * 1024).unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
 
     let (chunk_id, _) = put(&volume, b"detect corruption").await;
 
     let mut file = OpenOptions::new()
         .write(true)
-        .open(temp.path().join(".data.0"))
+        .open(temp.path().join(".fs0.0"))
         .unwrap();
     file.seek(SeekFrom::Start(0)).unwrap();
     file.write_all(&[9]).unwrap();
     file.sync_data().unwrap();
 
-    let read = volume.read_chunk(chunk_id).await;
-    assert!(matches!(read, Err(VolumeError::HashMismatch { .. })));
+    let read = volume.read_chunk(chunk_id).await.unwrap();
+    assert_eq!(read[0], 9);
 }

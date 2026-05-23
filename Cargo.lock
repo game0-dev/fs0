@@ -1070,11 +1070,15 @@ dependencies = [
 name = "fs0-volume"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fs0-core",
+ "libc",
+ "parking_lot",
  "rusqlite",
  "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
