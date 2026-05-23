@@ -11,7 +11,10 @@ pub fn encode_frame<T: Serialize>(value: &T) -> std::result::Result<Vec<u8>, Fs0
 
 pub fn encode_frame_body(body: &[u8]) -> std::result::Result<Vec<u8>, Fs0Error> {
     if body.len() > MAX_FRAME_BODY_LEN {
-        return Err(Fs0Error::FrameTooLarge);
+        return Err(Fs0Error::FrameTooLarge {
+            actual: body.len(),
+            max: MAX_FRAME_BODY_LEN,
+        });
     }
 
     let mut out = Vec::with_capacity(FRAME_LEN_BYTES + body.len());
@@ -27,7 +30,9 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> std::result::Result<T,
 
 pub fn decode_frame_body(frame: &[u8]) -> std::result::Result<&[u8], Fs0Error> {
     if frame.len() < FRAME_LEN_BYTES {
-        return Err(Fs0Error::InvalidFrame);
+        return Err(Fs0Error::InvalidFrame {
+            message: format!("frame too short: {} bytes", frame.len()),
+        });
     }
 
     let body_len = u32::from_le_bytes(
@@ -37,15 +42,26 @@ pub fn decode_frame_body(frame: &[u8]) -> std::result::Result<&[u8], Fs0Error> {
     ) as usize;
 
     if body_len > MAX_FRAME_BODY_LEN {
-        return Err(Fs0Error::FrameTooLarge);
+        return Err(Fs0Error::FrameTooLarge {
+            actual: body_len,
+            max: MAX_FRAME_BODY_LEN,
+        });
     }
 
-    let expected_len = FRAME_LEN_BYTES
-        .checked_add(body_len)
-        .ok_or(Fs0Error::InvalidFrame)?;
+    let expected_len =
+        FRAME_LEN_BYTES
+            .checked_add(body_len)
+            .ok_or_else(|| Fs0Error::InvalidFrame {
+                message: "frame length overflow".to_owned(),
+            })?;
 
     if frame.len() != expected_len {
-        return Err(Fs0Error::InvalidFrame);
+        return Err(Fs0Error::InvalidFrame {
+            message: format!(
+                "frame length mismatch: expected {expected_len}, actual {}",
+                frame.len()
+            ),
+        });
     }
 
     Ok(&frame[FRAME_LEN_BYTES..])

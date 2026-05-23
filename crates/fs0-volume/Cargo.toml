@@ -8,8 +8,8 @@ repository.workspace = true
 [dependencies]
 fs0-core.workspace = true
 rusqlite.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

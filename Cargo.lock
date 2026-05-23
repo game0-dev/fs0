@@ -1073,8 +1073,8 @@ dependencies = [
  "fs0-core",
  "rusqlite",
  "tempfile",
- "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

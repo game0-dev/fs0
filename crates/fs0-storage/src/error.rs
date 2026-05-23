@@ -32,6 +32,6 @@ pub enum StorageError {
     #[error("transport error")]
     Transport(#[from] fs0_transport::TransportError),
 
-    #[error("volume error")]
-    Volume(#[from] fs0_volume::VolumeError),
+    #[error("volume error: {0}")]
+    Volume(#[from] fs0_core::Fs0Error),
 }

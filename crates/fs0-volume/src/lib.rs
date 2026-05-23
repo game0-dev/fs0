@@ -1,6 +1,6 @@
 mod db;
-mod error;
 mod volume;
 
-pub use error::{Result, VolumeError};
-pub use volume::{ChunkMeta, DATA_FILE_SIZE, RAW_CHUNK_SIZE, Volume, VolumeMeta};
+pub type Result<T> = std::result::Result<T, fs0_core::Fs0Error>;
+pub use fs0_core::Fs0Error;
+pub use volume::{BundleMeta, ChunkMeta, DATA_FILE_SIZE, RAW_CHUNK_SIZE, Volume, VolumeMeta};

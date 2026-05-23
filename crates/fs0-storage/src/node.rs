@@ -1,8 +1,9 @@
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use fs0_core::{
-    ChunkId, ControlRequest, ControlResponse, DataRequest, DataResponse, RegisterStorageRequest,
-    SessionMessage, StorageChunkEvent, StorageChunkEvents, StorageVolumeInfo, blake3_hash,
+    BundleReplicaEvent, BundleReplicaReport, ControlRequest, ControlResponse, DataRequest,
+    DataResponse, Fs0Error, HashId, RegisterStorageRequest, SessionMessage, StorageVolumeInfo,
+    blake3_hash,
 };
 use fs0_transport::{
     bind_endpoint, connect_control, control_rpc, encode_endpoint_addr, read_frame, write_frame,
@@ -98,7 +99,7 @@ impl StorageNode {
     pub async fn put_chunk(
         &self,
         volume_id: u64,
-        chunk_id: ChunkId,
+        chunk_id: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
@@ -107,23 +108,23 @@ impl StorageNode {
             .await
     }
 
-    pub async fn read_chunk(&self, volume_id: u64, chunk_id: ChunkId) -> Result<Vec<u8>> {
+    pub async fn read_chunk(&self, volume_id: u64, chunk_id: HashId) -> Result<Vec<u8>> {
         self.volume(volume_id)?.read_chunk(chunk_id).await
     }
 
-    pub async fn chunk_meta(&self, volume_id: u64, chunk_id: ChunkId) -> Result<ChunkMeta> {
+    pub async fn chunk_meta(&self, volume_id: u64, chunk_id: HashId) -> Result<ChunkMeta> {
         self.volume(volume_id)?.chunk_meta(chunk_id).await
     }
 
-    pub async fn has_chunk(&self, volume_id: u64, chunk_id: ChunkId) -> Result<Option<ChunkMeta>> {
+    pub async fn has_chunk(&self, volume_id: u64, chunk_id: HashId) -> Result<Option<ChunkMeta>> {
         match self.volume(volume_id)?.chunk_meta(chunk_id).await {
             Ok(meta) => Ok(Some(meta)),
-            Err(StorageError::Volume(fs0_volume::VolumeError::ChunkNotFound(_))) => Ok(None),
+            Err(StorageError::Volume(Fs0Error::ChunkNotFound { .. })) => Ok(None),
             Err(err) => Err(err),
         }
     }
 
-    pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<StorageChunkEvent>> {
+    pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
         let mut per_volume = self.volumes.iter().collect::<Vec<(&u64, &VolumeHandle)>>();
         per_volume.sort_by_key(|(volume_id, _)| **volume_id);
 
@@ -147,7 +148,7 @@ impl StorageNode {
         Ok(events)
     }
 
-    pub async fn ack_pending_central_events(&self, events: &[StorageChunkEvent]) -> Result<()> {
+    pub async fn ack_pending_central_events(&self, events: &[BundleReplicaEvent]) -> Result<()> {
         let mut by_volume: HashMap<u64, Vec<u64>> = HashMap::new();
         for event in events {
             by_volume
@@ -165,7 +166,7 @@ impl StorageNode {
 
     pub async fn mark_pending_central_events_failed(
         &self,
-        events: &[StorageChunkEvent],
+        events: &[BundleReplicaEvent],
         failed_at_ms: u64,
     ) -> Result<()> {
         let mut by_volume: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -205,7 +206,7 @@ impl StorageDaemon {
             }
             _response => {
                 return Err(StorageError::UnexpectedControlResponse(
-                    ControlResponse::Error(fs0_core::Fs0ProtocolError::InvalidRequest),
+                    ControlResponse::Error(Fs0Error::InvalidRequest),
                 ));
             }
         };
@@ -244,10 +245,9 @@ impl StorageDaemon {
     }
 
     pub async fn ping_central(&self) -> Result<()> {
-        match control_rpc(&self.control, ControlRequest::Ping).await? {
-            ControlResponse::Ping => Ok(()),
-            response => Err(StorageError::UnexpectedControlResponse(response)),
-        }
+        Err(StorageError::UnexpectedControlResponse(
+            ControlResponse::Error(Fs0Error::Unsupported),
+        ))
     }
 }
 
@@ -265,7 +265,7 @@ impl VolumeHandle {
 
     pub async fn put_chunk(
         &self,
-        chunk_id: ChunkId,
+        chunk_id: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
@@ -275,15 +275,15 @@ impl VolumeHandle {
             .await?)
     }
 
-    pub async fn read_chunk(&self, chunk_id: ChunkId) -> Result<Vec<u8>> {
+    pub async fn read_chunk(&self, chunk_id: HashId) -> Result<Vec<u8>> {
         Ok(self.volume.read_chunk(chunk_id).await?)
     }
 
-    pub async fn chunk_meta(&self, chunk_id: ChunkId) -> Result<ChunkMeta> {
+    pub async fn chunk_meta(&self, chunk_id: HashId) -> Result<ChunkMeta> {
         Ok(self.volume.chunk_meta(chunk_id).await?)
     }
 
-    pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<StorageChunkEvent>> {
+    pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
         Ok(self.volume.pending_central_events(limit).await?)
     }
 
@@ -302,7 +302,7 @@ impl VolumeHandle {
             .await?)
     }
 
-    pub async fn delete_chunk(&self, chunk_id: ChunkId) -> Result<()> {
+    pub async fn delete_chunk(&self, chunk_id: HashId) -> Result<()> {
         Ok(self.volume.delete_chunk(chunk_id).await?)
     }
 }
@@ -321,12 +321,12 @@ async fn register_storage(
                 .into_iter()
                 .map(|volume| StorageVolumeInfo {
                     volume_id: volume.volume_id,
-                    name: None,
+                    name: format!("volume-{}", volume.volume_id),
                     max_bytes: volume.max_bytes,
-                    active_volume_offset: volume.active_volume_offset,
+                    max_volume_offset: volume.active_volume_offset,
                 })
                 .collect(),
-            data_endpoint,
+            iroh_endpoint: data_endpoint,
         },
     };
     let (mut send, mut recv) = control.open_bi().await.map_err(|err| {
@@ -364,17 +364,16 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
         return;
     };
     let response = match request {
-        DataRequest::Ping => DataResponse::Pong,
         DataRequest::HasChunk {
             volume_id,
             chunk_id,
         } => match node.has_chunk(volume_id, chunk_id).await {
-            Ok(Some(meta)) => DataResponse::ChunkPresence {
+            Ok(Some(meta)) => DataResponse::HasChunk {
                 exists: true,
                 raw_len: Some(meta.raw_len),
                 compressed_len: Some(meta.compressed_len),
             },
-            Ok(None) => DataResponse::ChunkPresence {
+            Ok(None) => DataResponse::HasChunk {
                 exists: false,
                 raw_len: None,
                 compressed_len: None,
@@ -389,13 +388,13 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
         } => {
             let compressed_len = compressed_bytes.len() as u64;
             if blake3_hash(&compressed_bytes) != chunk_id {
-                DataResponse::Error(fs0_core::Fs0ProtocolError::HashMismatch)
+                DataResponse::Error(Fs0Error::HashMismatch { volume_offset: 0 })
             } else {
                 match node
                     .put_chunk(volume_id, chunk_id, raw_len, compressed_bytes)
                     .await
                 {
-                    Ok(_) => DataResponse::ChunkStored {
+                    Ok(_) => DataResponse::UploadChunk {
                         chunk_id,
                         raw_len,
                         compressed_len,
@@ -404,59 +403,36 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
                 }
             }
         }
-        DataRequest::GetChunk {
+        DataRequest::DownloadChunk {
             volume_id,
             chunk_id,
         } => match node.read_chunk(volume_id, chunk_id).await {
-            Ok(bytes) => DataResponse::Bytes(bytes),
+            Ok(bytes) => DataResponse::DownloadChunk {
+                compressed_bytes: bytes,
+            },
             Err(err) => DataResponse::Error(storage_error_to_protocol_error(&err)),
         },
-        DataRequest::GetRange {
-            volume_id,
-            chunk_id,
-            offset,
-            len,
-        } => match node.read_chunk(volume_id, chunk_id).await {
-            Ok(bytes) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX);
-                let len = usize::try_from(len).unwrap_or(usize::MAX);
-                if start >= bytes.len() {
-                    DataResponse::Bytes(Vec::new())
-                } else {
-                    let end = start.saturating_add(len).min(bytes.len());
-                    DataResponse::Bytes(bytes[start..end].to_vec())
-                }
-            }
-            Err(err) => DataResponse::Error(storage_error_to_protocol_error(&err)),
-        },
-        DataRequest::RepairCopy { .. } => DataResponse::RepairStarted,
+        DataRequest::HasBundle { .. }
+        | DataRequest::CommitBundle { .. }
+        | DataRequest::DownloadBundle { .. }
+        | DataRequest::ListBundleChunks { .. } => DataResponse::Error(Fs0Error::Unsupported),
     };
     let _ = write_frame(&mut send, &response).await;
     let _ = send.finish();
 }
 
-fn storage_error_to_protocol_error(err: &StorageError) -> fs0_core::Fs0ProtocolError {
+fn storage_error_to_protocol_error(err: &StorageError) -> Fs0Error {
     match err {
-        StorageError::UnknownVolume(_) => fs0_core::Fs0ProtocolError::UnknownVolume,
-        StorageError::Volume(fs0_volume::VolumeError::ChunkNotFound(_)) => {
-            fs0_core::Fs0ProtocolError::NotFound
-        }
-        StorageError::Volume(fs0_volume::VolumeError::CapacityExceeded { .. }) => {
-            fs0_core::Fs0ProtocolError::CapacityExceeded
-        }
-        StorageError::Volume(fs0_volume::VolumeError::HashMismatch { .. }) => {
-            fs0_core::Fs0ProtocolError::HashMismatch
-        }
-        StorageError::Volume(fs0_volume::VolumeError::InvalidChunk(_)) => {
-            fs0_core::Fs0ProtocolError::InvalidRequest
-        }
+        StorageError::UnknownVolume(_) => Fs0Error::UnknownVolume,
+        StorageError::Volume(err) => err.clone(),
         StorageError::DuplicateVolumeId(_)
         | StorageError::UnexpectedControlResponse(_)
         | StorageError::VolumeIdMismatch { .. }
         | StorageError::Io(_)
         | StorageError::TomlDecode(_)
-        | StorageError::Transport(_)
-        | StorageError::Volume(_) => fs0_core::Fs0ProtocolError::Internal,
+        | StorageError::Transport(_) => Fs0Error::Internal {
+            message: err.to_string(),
+        },
     }
 }
 
@@ -471,11 +447,11 @@ fn spawn_central_event_sync(node: StorageNode, control: Connection) -> JoinHandl
             if events.is_empty() {
                 continue;
             }
-            let request = ControlRequest::RecordChunkEvents(StorageChunkEvents {
+            let request = ControlRequest::ReportBundleReplica(BundleReplicaReport {
                 events: events.clone(),
             });
             match control_rpc(&control, request).await {
-                Ok(ControlResponse::RecordChunkEvents) => {
+                Ok(ControlResponse::ReportBundleReplica) => {
                     let _ = node.ack_pending_central_events(&events).await;
                 }
                 Ok(_) | Err(_) => {

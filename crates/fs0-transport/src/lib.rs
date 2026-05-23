@@ -1,5 +1,5 @@
 use fs0_core::{
-    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, Fs0ProtocolError,
+    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, Fs0Error, HashId,
     MAX_FRAME_BODY_LEN,
 };
 use iroh::{
@@ -26,8 +26,8 @@ pub enum TransportError {
     #[error("postcard error")]
     Postcard(#[from] postcard::Error),
 
-    #[error("protocol error: {0:?}")]
-    Protocol(#[from] Fs0ProtocolError),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] Fs0Error),
 
     #[error("iroh error: {0}")]
     Iroh(String),
@@ -171,7 +171,7 @@ pub async fn has_data_chunk(
     endpoint: &Endpoint,
     data_endpoint: &[u8],
     volume_id: u64,
-    chunk_id: fs0_core::ChunkId,
+    chunk_id: HashId,
 ) -> Result<Option<(u64, u64)>> {
     match data_rpc(
         endpoint,
@@ -183,12 +183,12 @@ pub async fn has_data_chunk(
     )
     .await?
     {
-        DataResponse::ChunkPresence {
+        DataResponse::HasChunk {
             exists: true,
             raw_len: Some(raw_len),
             compressed_len: Some(compressed_len),
         } => Ok(Some((raw_len, compressed_len))),
-        DataResponse::ChunkPresence { exists: false, .. } => Ok(None),
+        DataResponse::HasChunk { exists: false, .. } => Ok(None),
         DataResponse::Error(err) => Err(err.into()),
         response => Err(TransportError::InvalidFrame(format!(
             "expected chunk presence, got {response:?}"
@@ -197,13 +197,8 @@ pub async fn has_data_chunk(
 }
 
 pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {
-    match data_rpc(endpoint, data_endpoint, DataRequest::Ping).await? {
-        DataResponse::Pong => Ok(()),
-        DataResponse::Error(err) => Err(err.into()),
-        response => Err(TransportError::InvalidFrame(format!(
-            "expected data pong, got {response:?}"
-        ))),
-    }
+    let _ = (endpoint, data_endpoint);
+    Err(Fs0Error::Unsupported.into())
 }
 
 fn relay_mode(relay_url: &str, relay_quic_port: u16) -> Result<RelayMode> {
