@@ -115,32 +115,67 @@ pub enum DataRequest {
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     },
-    GetChunk {
+    DownloadChunk {
         volume_id: u64,
         chunk_id: HashId,
     },
-    GetRange {
+    HasBundle {
         volume_id: u64,
-        chunk_id: HashId,
-        offset: u64,
-        len: u64,
+        bundle_id: HashId,
+    },
+    CommitBundle {
+        volume_id: u64,
+        bundle_id: HashId,
+        chunks: Vec<BundleChunkRef>,
+    },
+    DownloadBundle {
+        volume_id: u64,
+        bundle_id: HashId,
+    },
+    ListBundleChunks {
+        volume_id: u64,
+        bundle_id: HashId,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataResponse {
-    Error(Fs0Error),
-    ChunkPresence {
+    HasChunk {
         exists: bool,
         raw_len: Option<u64>,
         compressed_len: Option<u64>,
     },
-    ChunkStored {
+    UploadChunk {
         chunk_id: HashId,
         raw_len: u64,
         compressed_len: u64,
     },
-    Bytes(Vec<u8>),
+    DownloadChunk {
+        compressed_bytes: Vec<u8>,
+    },
+    HasBundle {
+        exists: bool,
+        raw_len: Option<u64>,
+        compressed_len: Option<u64>,
+    },
+    CommitBundle {
+        bundle_id: HashId,
+        raw_len: u64,
+        compressed_len: u64,
+    },
+    DownloadBundle {
+        compressed_bytes: Vec<u8>,
+    },
+    ListBundleChunks {
+        chunks: Vec<BundleChunkRef>,
+    },
+    Error(Fs0Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleChunkRef {
+    pub chunk_index: u64,
+    pub chunk_id: HashId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
