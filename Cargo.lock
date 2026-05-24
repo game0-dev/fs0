@@ -985,7 +985,6 @@ dependencies = [
 name = "fs0-central"
 version = "0.1.0"
 dependencies = [
- "clap",
  "fs0-config",
  "fs0-core",
  "fs0-transport",

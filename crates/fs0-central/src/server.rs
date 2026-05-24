@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     Arc, Weak,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 pub struct CentralServer {
@@ -23,6 +24,9 @@ pub struct CentralServer {
     online_volumes: RwLock<HashMap<u64, u64>>,
     db: Mutex<CentralDb>,
     control_endpoint: Vec<u8>,
+    endpoint: Endpoint,
+    exit: AtomicBool,
+    shutdown_notify: Arc<Notify>,
     accept_task: Mutex<Option<JoinHandle<()>>>,
     relay: iroh_relay::server::Server,
 }
@@ -58,12 +62,16 @@ impl CentralServer {
             online_volumes: RwLock::new(HashMap::new()),
             db: Mutex::new(db),
             control_endpoint,
+            endpoint: endpoint.clone(),
+            exit: AtomicBool::new(false),
+            shutdown_notify: Arc::new(Notify::new()),
             accept_task: Mutex::new(None),
             relay,
         });
         let accept_server = Arc::downgrade(&server);
+        let shutdown_notify = server.shutdown_notify.clone();
         let accept_task = tokio::spawn(async move {
-            accept_loop(endpoint, accept_server).await;
+            accept_loop(endpoint, accept_server, shutdown_notify).await;
         });
         *server.accept_task.lock() = Some(accept_task);
         Ok(server)
@@ -81,6 +89,22 @@ impl CentralServer {
 
     pub async fn storage_peers(&self) -> Vec<StoragePeerInfo> {
         self.storage_peers_snapshot()
+    }
+
+    pub async fn shutdown(&self) {
+        if self.exit.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.shutdown_notify.notify_waiters();
+        self.endpoint.close().await;
+        let accept_task = self.accept_task.lock().take();
+        if let Some(task) = accept_task {
+            let _ = task.await;
+        }
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.exit.load(Ordering::Acquire)
     }
 
     fn alloc_client_id(&self) -> u64 {
@@ -209,44 +233,65 @@ impl CentralServer {
 
 impl Drop for CentralServer {
     fn drop(&mut self) {
-        if let Some(task) = self.accept_task.get_mut().take() {
-            task.abort();
-        }
+        self.exit.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
         let _ = &self.relay;
     }
 }
 
-async fn accept_loop(endpoint: Endpoint, server: Weak<CentralServer>) {
-    while let Some(incoming) = endpoint.accept().await {
-        let Some(server) = server.upgrade() else {
-            break;
-        };
-        tokio::spawn(async move {
-            let Ok(connection) = incoming.await else {
-                return;
-            };
-            let _ = handle_control_connection(server, connection).await;
-        });
+async fn accept_loop(
+    endpoint: Endpoint,
+    server: Weak<CentralServer>,
+    shutdown_notify: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => break,
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let Some(server) = server.upgrade() else {
+                    break;
+                };
+                if server.is_exiting() {
+                    break;
+                }
+                let shutdown_notify = shutdown_notify.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    let _ = handle_control_connection(server, connection, shutdown_notify).await;
+                });
+            }
+        }
     }
 }
 
 async fn handle_control_connection(
     server: Arc<CentralServer>,
     connection: Connection,
+    shutdown_notify: Arc<Notify>,
 ) -> Result<()> {
     let mut storage_id = None;
-    let (mut session_send, mut session_recv) =
-        connection
-            .accept_bi()
-            .await
-            .map_err(|err| Fs0Error::Internal {
+    let (mut session_send, mut session_recv) = tokio::select! {
+        _ = shutdown_notify.notified() => return Ok(()),
+        stream = connection.accept_bi() => {
+            stream.map_err(|err| Fs0Error::Internal {
                 message: err.to_string(),
-            })?;
-    match read_frame::<SessionMessage, _>(&mut session_recv)
-        .await
-        .map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })? {
+            })?
+        }
+    };
+    let session_message = tokio::select! {
+        _ = shutdown_notify.notified() => return Ok(()),
+        message = read_frame::<SessionMessage, _>(&mut session_recv) => {
+            message.map_err(|err| Fs0Error::Internal {
+                message: err.to_string(),
+            })?
+        }
+    };
+    match session_message {
         SessionMessage::RegisterClient { .. } => {
             let storages = server.storage_peers_snapshot();
             write_frame(
@@ -310,6 +355,7 @@ async fn handle_control_connection(
 
     loop {
         tokio::select! {
+            _ = shutdown_notify.notified() => break,
             request = read_frame::<SessionMessage, _>(&mut session_recv) => {
                 match request {
                     Ok(SessionMessage::Ping) => {
@@ -327,6 +373,9 @@ async fn handle_control_connection(
                 let Ok((mut send, mut recv)) = stream else {
                     break;
                 };
+                if server.is_exiting() {
+                    break;
+                }
                 let server = server.clone();
                 tokio::spawn(async move {
                     let Ok(request) = read_frame::<ControlRequest, _>(&mut recv).await else {
