@@ -1010,6 +1010,7 @@ dependencies = [
 name = "fs0-client"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fs0-central",
  "fs0-config",
  "fs0-core",

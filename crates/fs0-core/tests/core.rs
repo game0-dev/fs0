@@ -1,11 +1,12 @@
 use fs0_core::{
     AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
-    BundleReplicaReport, CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse,
-    DEFAULT_ZSTD_LEVEL, DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog,
-    FileChangeLogKind, FileChangeLogs, FileReadPlan, Fs0Error, HashId, MAX_FRAME_BODY_LEN,
-    RegisterStorageRequest, ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo,
-    UploadLease, blake3_hash, decode_frame, decode_frame_body, encode_frame, encode_frame_body,
-    zstd_compress, zstd_decompress,
+    BundleReplicaReport, CentralStatus, CentralStorageStatus, CentralVolumeStatus,
+    CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DEFAULT_ZSTD_LEVEL,
+    DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
+    FileChangeLogs, FileReadPlan, Fs0Error, HashId, MAX_FRAME_BODY_LEN, RegisterStorageRequest,
+    ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo, UploadLease, blake3_hash,
+    decode_frame, decode_frame_body, encode_frame, encode_frame_body, zstd_compress,
+    zstd_decompress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +177,7 @@ fn control_requests_roundtrip() {
     });
     assert_postcard_roundtrip(&ControlRequest::GrantUploadLease(upload_lease()));
     assert_postcard_roundtrip(&ControlRequest::RevokeUploadLease { lease_id: 9 });
+    assert_postcard_roundtrip(&ControlRequest::CentralStatus);
     assert_postcard_roundtrip(&ControlRequest::ListDirectory {
         dir: "/trades".to_owned(),
         limit: 100,
@@ -233,6 +235,7 @@ fn control_responses_roundtrip() {
     assert_postcard_roundtrip(&ControlResponse::CreateVolume(2));
     assert_postcard_roundtrip(&ControlResponse::UploadLeaseGranted { lease_id: 9 });
     assert_postcard_roundtrip(&ControlResponse::UploadLeaseRevoked { lease_id: 9 });
+    assert_postcard_roundtrip(&ControlResponse::CentralStatus(central_status()));
     assert_postcard_roundtrip(&ControlResponse::ListDirectory(DirectoryEntries {
         entries: Vec::new(),
         next_cursor: None,
@@ -433,5 +436,22 @@ fn file_record(path: &str) -> fs0_core::FileRecord {
         compressed_size_bytes: 3,
         created_at_ms: 1000,
         updated_at_ms: 2000,
+    }
+}
+
+fn central_status() -> CentralStatus {
+    CentralStatus {
+        storages: vec![CentralStorageStatus {
+            storage_id: 7,
+            name: "storage-a".to_owned(),
+            volumes: vec![CentralVolumeStatus {
+                volume_id: 4,
+                name: "hot".to_owned(),
+                max_bytes: 1024,
+                used_bytes: 512,
+                raw_bytes: 900,
+                compressed_bytes: 300,
+            }],
+        }],
     }
 }

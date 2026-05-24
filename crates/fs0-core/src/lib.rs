@@ -14,6 +14,7 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 pub const CONTROL_ALPN: &[u8] = b"/fs0/control/1";
 pub const DATA_ALPN: &[u8] = b"/fs0/data/1";
 pub const RAW_CHUNK_SIZE: u64 = 1024 * 1024; // 1M
+pub const BUNDLE_TARGET_RAW_BYTES: u64 = 64 * 1024 * 1024; // 64M
 pub const DATA_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4G
 pub const VOLUME_DB_FILE: &str = ".f0.volume.sqlite";
 pub const VOLUME_FORMAT_VERSION: u64 = 1;

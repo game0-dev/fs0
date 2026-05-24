@@ -59,6 +59,29 @@ impl CentralDb {
             .map_err(Fs0Error::from)
     }
 
+    pub(crate) fn volume_replica_usage(&self, volume_id: u64) -> Result<(u64, u64)> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(b.raw_len), 0),
+                    COALESCE(SUM(b.compressed_len), 0)
+             FROM bundle_replicas br
+             JOIN bundles b ON b.bundle_id = br.bundle_id
+             WHERE br.volume_id = ?1",
+                params![u64_to_i64(volume_id, "volume_id")?],
+                |row| {
+                    Ok((
+                        i64_to_u64(row.get(0)?, "raw_bytes").map_err(|err| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                        })?,
+                        i64_to_u64(row.get(1)?, "compressed_bytes").map_err(|err| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                        })?,
+                    ))
+                },
+            )
+            .map_err(Fs0Error::from)
+    }
+
     pub(crate) fn begin_append(
         &mut self,
         request: BeginAppendRequest,

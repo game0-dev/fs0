@@ -6,12 +6,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blake3.workspace = true
 fs0-config.workspace = true
 fs0-core.workspace = true
 fs0-transport.workspace = true
 iroh.workspace = true
 parking_lot.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync"] }
 
 [dev-dependencies]
 fs0-central.workspace = true

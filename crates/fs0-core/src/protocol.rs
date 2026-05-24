@@ -36,6 +36,7 @@ pub enum ControlRequest {
     RevokeUploadLease {
         lease_id: u64,
     },
+    CentralStatus,
     ListDirectory {
         dir: String,
         limit: u32,
@@ -86,6 +87,7 @@ pub enum ControlResponse {
     CreateVolume(u64),
     UploadLeaseGranted { lease_id: u64 },
     UploadLeaseRevoked { lease_id: u64 },
+    CentralStatus(CentralStatus),
     ListDirectory(DirectoryEntries),
     GetFileChangeLogs(FileChangeLogs),
     BeginAppend(AppendLease),
@@ -176,6 +178,28 @@ pub enum DataResponse {
 pub struct BundleChunkRef {
     pub chunk_index: u64,
     pub chunk_id: HashId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralStatus {
+    pub storages: Vec<CentralStorageStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralStorageStatus {
+    pub storage_id: u64,
+    pub name: String,
+    pub volumes: Vec<CentralVolumeStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralVolumeStatus {
+    pub volume_id: u64,
+    pub name: String,
+    pub max_bytes: u64,
+    pub used_bytes: u64,
+    pub raw_bytes: u64,
+    pub compressed_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]

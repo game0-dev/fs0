@@ -1,8 +1,9 @@
 use crate::db::CentralDb;
 use crate::{CentralConfig, Fs0Error, Result};
 use fs0_core::{
-    BundleReplicaReport, ControlRequest, ControlResponse, FileReadPlan, RegisterStorageRequest,
-    ReplicaLocation, SessionMessage, StoragePeerInfo,
+    BundleReplicaReport, CentralStatus, CentralStorageStatus, CentralVolumeStatus, ControlRequest,
+    ControlResponse, FileReadPlan, RegisterStorageRequest, ReplicaLocation, SessionMessage,
+    StoragePeerInfo,
 };
 use fs0_transport::{bind_endpoint, encode_endpoint_addr, read_frame, write_frame};
 use iroh::Endpoint;
@@ -115,6 +116,40 @@ impl CentralServer {
         let mut peers = self.storages.read().values().cloned().collect::<Vec<_>>();
         peers.sort_by_key(|peer| peer.storage_id);
         peers
+    }
+
+    fn central_status(&self) -> Result<CentralStatus> {
+        let mut storages = self.storage_peers_snapshot();
+        storages.sort_by_key(|peer| peer.storage_id);
+        let db = self.db.lock();
+        let storages = storages
+            .into_iter()
+            .map(|peer| {
+                let mut volumes = peer
+                    .volumes
+                    .into_iter()
+                    .map(|volume| {
+                        let (raw_bytes, compressed_bytes) =
+                            db.volume_replica_usage(volume.volume_id)?;
+                        Ok(CentralVolumeStatus {
+                            volume_id: volume.volume_id,
+                            name: volume.name,
+                            max_bytes: volume.max_bytes,
+                            used_bytes: volume.max_volume_offset,
+                            raw_bytes,
+                            compressed_bytes,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                volumes.sort_by_key(|volume| volume.volume_id);
+                Ok(CentralStorageStatus {
+                    storage_id: peer.storage_id,
+                    name: peer.name,
+                    volumes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CentralStatus { storages })
     }
 
     fn select_append_volume(&self, prefer_volume_name: Option<&str>) -> Result<u64> {
@@ -413,6 +448,10 @@ async fn handle_control_request(
         ControlRequest::RevokeUploadLease { lease_id } => {
             ControlResponse::UploadLeaseRevoked { lease_id }
         }
+        ControlRequest::CentralStatus => match server.central_status() {
+            Ok(status) => ControlResponse::CentralStatus(status),
+            Err(err) => ControlResponse::Error(err),
+        },
         ControlRequest::ListDirectory { dir, limit, cursor } => {
             match server.db.lock().list_directory(&dir, limit, cursor) {
                 Ok(entries) => ControlResponse::ListDirectory(entries),
