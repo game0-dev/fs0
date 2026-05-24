@@ -1,10 +1,10 @@
-mod config;
-mod node;
+mod data_server;
+mod server;
 
-pub use config::{
+pub use fs0_config::{
     StorageConfig, StorageP2pRelayConfig, StorageVolumeConfig, StorageVolumeIoConfig,
 };
 pub use fs0_core::Fs0Error;
-pub use node::{StorageDaemon, StorageNode, VolumeHandle};
+pub use server::StorageServer;
 
 pub type Result<T> = std::result::Result<T, Fs0Error>;

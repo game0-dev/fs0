@@ -273,6 +273,10 @@ impl Volume {
         Ok(())
     }
 
+    pub fn reap_idle_data_files(&self) {
+        self.files.reap_idle(now_ms());
+    }
+
     pub async fn commit_bundle(
         &self,
         bundle_id: HashId,

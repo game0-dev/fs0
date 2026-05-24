@@ -1059,7 +1059,6 @@ dependencies = [
  "fs0-volume",
  "iroh",
  "parking_lot",
- "serde",
  "tempfile",
  "tokio",
 ]
