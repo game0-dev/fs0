@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-clap.workspace = true
 fs0-config.workspace = true
 fs0-core.workspace = true
 fs0-transport.workspace = true
