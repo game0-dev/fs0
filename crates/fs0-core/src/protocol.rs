@@ -246,6 +246,22 @@ impl From<postcard::Error> for Fs0Error {
     }
 }
 
+impl From<rusqlite::Error> for Fs0Error {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<toml::de::Error> for Fs0Error {
+    fn from(err: toml::de::Error) -> Self {
+        Self::InvalidConfig {
+            message: err.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileReadPlan {
     pub file_id: u64,

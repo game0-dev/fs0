@@ -2,7 +2,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE volumes (
   volume_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT,
+  name TEXT NOT NULL,
   max_bytes INTEGER NOT NULL,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL

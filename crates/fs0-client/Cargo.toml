@@ -6,10 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fs0-config.workspace = true
 fs0-core.workspace = true
 fs0-transport.workspace = true
 iroh.workspace = true
-thiserror.workspace = true
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]

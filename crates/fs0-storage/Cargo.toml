@@ -7,13 +7,13 @@ repository.workspace = true
 
 [dependencies]
 fs0-core.workspace = true
+fs0-config.workspace = true
 fs0-transport.workspace = true
 fs0-volume.workspace = true
 iroh.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
-toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

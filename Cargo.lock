@@ -986,18 +986,18 @@ name = "fs0-central"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fs0-config",
  "fs0-core",
  "fs0-transport",
  "iroh",
  "iroh-relay",
+ "parking_lot",
  "rcgen",
  "rusqlite",
  "rustls",
  "serde",
  "tempfile",
- "thiserror",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -1012,14 +1012,24 @@ name = "fs0-client"
 version = "0.1.0"
 dependencies = [
  "fs0-central",
+ "fs0-config",
  "fs0-core",
  "fs0-storage",
  "fs0-transport",
  "fs0-volume",
  "iroh",
+ "parking_lot",
  "tempfile",
- "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "fs0-config"
+version = "0.1.0"
+dependencies = [
+ "fs0-core",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -1028,9 +1038,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "postcard",
+ "rusqlite",
  "serde",
  "tempfile",
  "thiserror",
+ "toml 0.9.12+spec-1.1.0",
  "zstd",
 ]
 
@@ -1042,15 +1054,15 @@ version = "0.1.0"
 name = "fs0-storage"
 version = "0.1.0"
 dependencies = [
+ "fs0-config",
  "fs0-core",
  "fs0-transport",
  "fs0-volume",
  "iroh",
+ "parking_lot",
  "serde",
  "tempfile",
- "thiserror",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]

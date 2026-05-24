@@ -1,8 +1,9 @@
-use crate::{CentralError, Result};
+use crate::Result;
+use fs0_core::Fs0Error;
 use fs0_core::{
-    AppendLease, BeginAppendRequest, ChunkId, CommittedChunk, DirectoryEntries, DirectoryEntry,
-    FileChunkRef, FileEvent, FileEventKind, FileEvents, FileManifest, FileRecord,
-    StorageChunkEventKind, StorageChunkEvents,
+    AppendLease, BeginAppendRequest, BundleReplicaEventKind, BundleReplicaReport, CommittedBundle,
+    DirectoryEntries, DirectoryEntry, FileBundleRef, FileChangeLog, FileChangeLogKind,
+    FileChangeLogs, FileReadPlan, FileRecord, HashId,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -18,7 +19,7 @@ pub(crate) struct CentralDb {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeRecord {
     pub volume_id: u64,
-    pub name: Option<String>,
+    pub name: String,
     pub max_bytes: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -44,11 +45,7 @@ impl CentralDb {
             ],
         )?;
         let volume_id = from_i64(self.conn.last_insert_rowid(), "volume_id")?;
-        self.get_volume(volume_id)?.ok_or_else(|| {
-            CentralError::not_found(format!(
-                "volume {volume_id} was not found in central metadata"
-            ))
-        })
+        self.get_volume(volume_id)?.ok_or(Fs0Error::NotFound)
     }
 
     pub(crate) fn get_volume(&self, volume_id: u64) -> Result<Option<VolumeRecord>> {
@@ -61,7 +58,7 @@ impl CentralDb {
                 row_to_volume_record,
             )
             .optional()
-            .map_err(CentralError::from)
+            .map_err(Fs0Error::from)
     }
 
     pub(crate) fn begin_append(
@@ -76,19 +73,16 @@ impl CentralDb {
         let file_id = match load_file_identity_tx(&tx, &dir, &name)? {
             Some(file) => {
                 if file.size_bytes != request.expected_size {
-                    return Err(CentralError::version_conflict());
+                    return Err(Fs0Error::VersionConflict);
                 }
                 file.file_id
             }
             None => {
                 if !request.create {
-                    return Err(CentralError::not_found(format!(
-                        "file was not found in central metadata: {}",
-                        request.path
-                    )));
+                    return Err(Fs0Error::NotFound);
                 }
                 if request.expected_size != 0 {
-                    return Err(CentralError::version_conflict());
+                    return Err(Fs0Error::VersionConflict);
                 }
                 create_file(&tx, &dir, &name, now)?
             }
@@ -113,10 +107,7 @@ impl CentralDb {
             )
             .optional()?;
         if active_lease.is_some() {
-            return Err(CentralError::control(
-                fs0_core::Fs0ProtocolError::AlreadyExists,
-                format!("append lease already exists for {}", request.path),
-            ));
+            return Err(Fs0Error::AlreadyExists { path: request.path });
         }
 
         tx.execute(
@@ -150,58 +141,48 @@ impl CentralDb {
     pub(crate) fn commit_append(
         &mut self,
         request: fs0_core::CommitAppendRequest,
-    ) -> Result<FileManifest> {
+    ) -> Result<FileReadPlan> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let lease = load_active_lease(&tx, request.lease_id)?;
         if lease.base_size_bytes != request.base_size {
-            return Err(CentralError::version_conflict());
+            return Err(Fs0Error::VersionConflict);
         }
         if request.new_size < request.base_size {
-            return Err(CentralError::invalid_request(
-                "new_size is smaller than base_size",
-            ));
+            return Err(Fs0Error::InvalidRequest);
         }
-        validate_committed_chunks(&request.chunks, request.new_size)?;
+        validate_committed_bundles(&request.bundles, request.new_size)?;
 
-        let file = load_file_by_id_tx(&tx, lease.file_id)?.ok_or_else(|| {
-            CentralError::not_found(format!("file {} was not found", lease.file_id))
-        })?;
+        let file = load_file_by_id_tx(&tx, lease.file_id)?.ok_or(Fs0Error::NotFound)?;
         if file.size_bytes != request.base_size {
-            return Err(CentralError::version_conflict());
+            return Err(Fs0Error::VersionConflict);
         }
         let compressed_size_bytes = request
-            .chunks
+            .bundles
             .iter()
-            .map(|chunk| chunk.compressed_len)
+            .map(|bundle| bundle.compressed_len)
             .try_fold(0u64, |sum, len| sum.checked_add(len))
-            .ok_or_else(|| {
-                CentralError::IntegerConversion("compressed size overflow".to_owned())
+            .ok_or_else(|| Fs0Error::IntegerConversion {
+                message: "compressed size overflow".to_owned(),
             })?;
 
         tx.execute(
             "DELETE FROM file_bundles WHERE file_id = ?1",
             params![to_i64(lease.file_id, "file_id")?],
         )?;
-        for chunk in &request.chunks {
+        for bundle in &request.bundles {
             let replica_count = tx.query_row(
                 "SELECT COUNT(*)
                  FROM bundle_replicas
                  WHERE bundle_id = ?1 AND volume_id = ?2",
                 params![
-                    chunk.chunk_id.as_bytes().as_slice(),
+                    bundle.bundle_id.as_bytes().as_slice(),
                     to_i64(lease.volume_id, "volume_id")?,
                 ],
                 |row| row.get::<_, i64>(0),
             )?;
             if replica_count == 0 {
-                return Err(CentralError::control(
-                    fs0_core::Fs0ProtocolError::ChunkNotReady,
-                    format!(
-                        "chunk {:?} has not been reported by volume {}",
-                        chunk.chunk_id, lease.volume_id
-                    ),
-                ));
+                return Err(Fs0Error::ChunkNotReady);
             }
             tx.execute(
                 "INSERT INTO file_bundles (
@@ -209,8 +190,8 @@ impl CentralDb {
                  ) VALUES (?1, ?2, ?3)",
                 params![
                     to_i64(lease.file_id, "file_id")?,
-                    to_i64(chunk.chunk_index, "chunk_index")?,
-                    chunk.chunk_id.as_bytes().as_slice(),
+                    to_i64(bundle.bundle_index, "bundle_index")?,
+                    bundle.bundle_id.as_bytes().as_slice(),
                 ],
             )?;
         }
@@ -233,12 +214,12 @@ impl CentralDb {
              WHERE lease_id = ?1",
             params![to_i64(request.lease_id, "lease_id")?],
         )?;
-        insert_file_event(
+        insert_file_change_log(
             &tx,
             if request.base_size == 0 {
-                FileEventKind::Created
+                FileChangeLogKind::Created
             } else {
-                FileEventKind::Updated
+                FileChangeLogKind::Updated
             },
             None,
             Some((&file.dir, &file.name)),
@@ -247,7 +228,7 @@ impl CentralDb {
         )?;
         tx.commit()?;
 
-        self.get_file_manifest_by_id(lease.file_id)
+        self.get_file_read_plan_by_id(lease.file_id)
     }
 
     pub(crate) fn abort_append(&mut self, lease_id: u64) -> Result<()> {
@@ -260,21 +241,6 @@ impl CentralDb {
         )?;
         tx.commit()?;
         Ok(())
-    }
-
-    pub(crate) fn lease_prefer_volume_name(&self, lease_id: u64) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT prefer_volume_name
-                 FROM append_leases
-                 WHERE lease_id = ?1",
-                params![to_i64(lease_id, "lease_id")?],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                CentralError::not_found(format!("append lease {lease_id} was not found"))
-            })
     }
 
     pub(crate) fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
@@ -317,7 +283,8 @@ impl CentralDb {
         let limit = limit.clamp(1, 1024) as usize;
         let offset = cursor.unwrap_or(0);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT file_id, dir, name, size_bytes
+            "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
+                    created_at_ms, updated_at_ms
              FROM files
              WHERE dir = ?1
              ORDER BY name
@@ -337,6 +304,10 @@ impl CentralDb {
                     name: name.clone(),
                     path: join_path(&dir, &name).map_err(to_sql_error)?,
                     size_bytes: from_i64(row.get(3)?, "size_bytes").map_err(to_sql_error)?,
+                    compressed_size_bytes: from_i64(row.get(4)?, "compressed_size_bytes")
+                        .map_err(to_sql_error)?,
+                    created_at_ms: from_i64(row.get(5)?, "created_at_ms").map_err(to_sql_error)?,
+                    updated_at_ms: from_i64(row.get(6)?, "updated_at_ms").map_err(to_sql_error)?,
                 })
             },
         )?;
@@ -356,7 +327,11 @@ impl CentralDb {
         })
     }
 
-    pub(crate) fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
+    pub(crate) fn get_file_change_logs(
+        &self,
+        after_event_id: u64,
+        limit: u32,
+    ) -> Result<FileChangeLogs> {
         let limit = limit.clamp(1, 1024) as usize;
         let mut stmt = self.conn.prepare_cached(
             "SELECT event_id, event_type, file_id,
@@ -371,7 +346,7 @@ impl CentralDb {
                 to_i64(after_event_id, "after_event_id")?,
                 to_i64(limit as u64 + 1, "limit")?,
             ],
-            row_to_file_event,
+            row_to_file_change_log,
         )?;
         let mut events = Vec::new();
         for row in rows {
@@ -383,20 +358,20 @@ impl CentralDb {
         } else {
             None
         };
-        Ok(FileEvents {
-            events,
+        Ok(FileChangeLogs {
+            operations: events,
             next_event_id,
         })
     }
 
-    pub(crate) fn chunk_replica_volumes(&self, chunk_id: ChunkId) -> Result<Vec<u64>> {
+    pub(crate) fn bundle_replica_volumes(&self, bundle_id: HashId) -> Result<Vec<u64>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT volume_id
              FROM bundle_replicas
              WHERE bundle_id = ?1
              ORDER BY volume_id",
         )?;
-        let rows = stmt.query_map(params![chunk_id.as_bytes().as_slice()], |row| {
+        let rows = stmt.query_map(params![bundle_id.as_bytes().as_slice()], |row| {
             from_i64(row.get(0)?, "volume_id").map_err(to_sql_error)
         })?;
         let mut replicas = Vec::new();
@@ -406,17 +381,13 @@ impl CentralDb {
         Ok(replicas)
     }
 
-    pub(crate) fn record_chunk_events(&mut self, events: StorageChunkEvents) -> Result<()> {
+    pub(crate) fn record_bundle_events(&mut self, events: BundleReplicaReport) -> Result<()> {
         let tx = self.conn.transaction()?;
         for event in events.events {
             match event.kind {
-                StorageChunkEventKind::Stored => {
-                    let raw_len = event.raw_len.ok_or_else(|| {
-                        CentralError::invalid_request("chunk stored event missing raw_len")
-                    })?;
-                    let compressed_len = event.compressed_len.ok_or_else(|| {
-                        CentralError::invalid_request("chunk stored event missing compressed_len")
-                    })?;
+                BundleReplicaEventKind::Stored => {
+                    let raw_len = event.raw_len.ok_or(Fs0Error::InvalidRequest)?;
+                    let compressed_len = event.compressed_len.ok_or(Fs0Error::InvalidRequest)?;
                     tx.execute(
                         "INSERT INTO bundles (
                             bundle_id, raw_len, compressed_len
@@ -425,7 +396,7 @@ impl CentralDb {
                             raw_len = excluded.raw_len,
                             compressed_len = excluded.compressed_len",
                         params![
-                            event.chunk_id.as_bytes().as_slice(),
+                            event.bundle_id.as_bytes().as_slice(),
                             to_i64(raw_len, "raw_len")?,
                             to_i64(compressed_len, "compressed_len")?,
                         ],
@@ -436,17 +407,17 @@ impl CentralDb {
                          ) VALUES (?1, ?2)
                          ON CONFLICT(bundle_id, volume_id) DO NOTHING",
                         params![
-                            event.chunk_id.as_bytes().as_slice(),
+                            event.bundle_id.as_bytes().as_slice(),
                             to_i64(event.volume_id, "volume_id")?,
                         ],
                     )?;
                 }
-                StorageChunkEventKind::Deleted => {
+                BundleReplicaEventKind::Deleted => {
                     tx.execute(
                         "DELETE FROM bundle_replicas
                          WHERE bundle_id = ?1 AND volume_id = ?2",
                         params![
-                            event.chunk_id.as_bytes().as_slice(),
+                            event.bundle_id.as_bytes().as_slice(),
                             to_i64(event.volume_id, "volume_id")?,
                         ],
                     )?;
@@ -457,17 +428,13 @@ impl CentralDb {
         Ok(())
     }
 
-    pub(crate) fn get_file_manifest(&self, path: &str) -> Result<FileManifest> {
-        let file = self
-            .get_file_by_path(path)?
-            .ok_or_else(|| CentralError::not_found(format!("file was not found: {path}")))?;
-        self.get_file_manifest_by_id(file.file_id)
+    pub(crate) fn get_file_read_plan(&self, path: &str) -> Result<FileReadPlan> {
+        let file = self.get_file_by_path(path)?.ok_or(Fs0Error::NotFound)?;
+        self.get_file_read_plan_by_id(file.file_id)
     }
 
-    fn get_file_manifest_by_id(&self, file_id: u64) -> Result<FileManifest> {
-        let file = load_file_by_id(&self.conn, file_id)?.ok_or_else(|| {
-            CentralError::not_found(format!("file {file_id} was not found in central metadata"))
-        })?;
+    pub(crate) fn get_file_read_plan_by_id(&self, file_id: u64) -> Result<FileReadPlan> {
+        let file = load_file_by_id(&self.conn, file_id)?.ok_or(Fs0Error::NotFound)?;
         let mut stmt = self.conn.prepare_cached(
             "SELECT fb.bundle_index, fb.bundle_id, b.raw_len, b.compressed_len
              FROM file_bundles fb
@@ -476,31 +443,173 @@ impl CentralDb {
              ORDER BY bundle_index",
         )?;
         let rows = stmt.query_map(params![to_i64(file.file_id, "file_id")?], |row| {
-            let chunk_id = blob_to_chunk_id(row.get(1)?, "chunk_id").map_err(to_sql_error)?;
+            let bundle_id = blob_to_hash_id(row.get(1)?, "bundle_id").map_err(to_sql_error)?;
             Ok((
-                from_i64(row.get(0)?, "chunk_index").map_err(to_sql_error)?,
-                chunk_id,
+                from_i64(row.get(0)?, "bundle_index").map_err(to_sql_error)?,
+                bundle_id,
                 from_i64(row.get(2)?, "raw_len").map_err(to_sql_error)?,
                 from_i64(row.get(3)?, "compressed_len").map_err(to_sql_error)?,
             ))
         })?;
-        let mut chunks = Vec::new();
+        let mut bundles = Vec::new();
         for row in rows {
-            let (chunk_index, chunk_id, raw_len, compressed_len) = row?;
-            chunks.push(FileChunkRef {
-                chunk_index,
+            let (bundle_index, bundle_id, raw_len, compressed_len) = row?;
+            bundles.push(FileBundleRef {
+                bundle_index,
                 raw_len,
                 compressed_len,
-                chunk_id,
+                bundle_id,
                 replicas: Vec::new(),
             });
         }
-        Ok(FileManifest {
+        Ok(FileReadPlan {
             file_id: file.file_id,
             path: join_path(&file.dir, &file.name)?,
             size: file.size_bytes,
-            chunks,
+            bundles,
         })
+    }
+
+    pub(crate) fn delete_file(&mut self, path: &str) -> Result<()> {
+        let (dir, name) = split_path(path)?;
+        let tx = self.conn.transaction()?;
+        let file = load_file_identity_tx(&tx, &dir, &name)?.ok_or(Fs0Error::NotFound)?;
+        delete_file_tx(&tx, file, now_ms())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_file_by_id(&mut self, file_id: u64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let file = load_file_by_id_tx(&tx, file_id)?.ok_or(Fs0Error::NotFound)?;
+        delete_file_tx(&tx, file, now_ms())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn copy_file(&mut self, source_path: &str, target_path: &str) -> Result<FileRecord> {
+        let (source_dir, source_name) = split_path(source_path)?;
+        let source = self
+            .conn
+            .query_row(
+                "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
+                        created_at_ms, updated_at_ms
+                 FROM files
+                 WHERE dir = ?1 AND name = ?2",
+                params![source_dir, source_name],
+                row_to_file_identity,
+            )
+            .optional()?
+            .ok_or(Fs0Error::NotFound)?;
+        self.copy_file_by_id(source.file_id, target_path)
+    }
+
+    pub(crate) fn copy_file_by_id(
+        &mut self,
+        source_file_id: u64,
+        target_path: &str,
+    ) -> Result<FileRecord> {
+        let (target_dir, target_name) = split_path(target_path)?;
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let source = load_file_by_id_tx(&tx, source_file_id)?.ok_or(Fs0Error::NotFound)?;
+        tx.execute(
+            "INSERT INTO files (
+                dir, name, size_bytes, compressed_size_bytes,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![
+                target_dir,
+                target_name,
+                to_i64(source.size_bytes, "size_bytes")?,
+                to_i64(source.compressed_size_bytes, "compressed_size_bytes")?,
+                to_i64(now, "created_at_ms")?,
+            ],
+        )?;
+        let target_file_id = from_i64(tx.last_insert_rowid(), "file_id")?;
+        tx.execute(
+            "INSERT INTO file_bundles (file_id, bundle_index, bundle_id)
+             SELECT ?1, bundle_index, bundle_id
+             FROM file_bundles
+             WHERE file_id = ?2",
+            params![
+                to_i64(target_file_id, "target_file_id")?,
+                to_i64(source_file_id, "source_file_id")?,
+            ],
+        )?;
+        insert_file_change_log(
+            &tx,
+            FileChangeLogKind::Created,
+            None,
+            Some((&target_dir, &target_name)),
+            Some(target_file_id),
+            now,
+        )?;
+        tx.commit()?;
+        load_file_by_id(&self.conn, target_file_id)?
+            .map(file_to_record)
+            .transpose()?
+            .ok_or(Fs0Error::NotFound)
+    }
+
+    pub(crate) fn rename_file(
+        &mut self,
+        source_path: &str,
+        target_path: &str,
+    ) -> Result<FileRecord> {
+        let (source_dir, source_name) = split_path(source_path)?;
+        let source = self
+            .get_file_by_path(source_path)?
+            .ok_or(Fs0Error::NotFound)?;
+        self.rename_file_by_id_with_old_path(source.file_id, &source_dir, &source_name, target_path)
+    }
+
+    pub(crate) fn rename_file_by_id(
+        &mut self,
+        file_id: u64,
+        target_path: &str,
+    ) -> Result<FileRecord> {
+        let file = load_file_by_id(&self.conn, file_id)?.ok_or(Fs0Error::NotFound)?;
+        self.rename_file_by_id_with_old_path(file_id, &file.dir, &file.name, target_path)
+    }
+
+    fn rename_file_by_id_with_old_path(
+        &mut self,
+        file_id: u64,
+        old_dir: &str,
+        old_name: &str,
+        target_path: &str,
+    ) -> Result<FileRecord> {
+        let (target_dir, target_name) = split_path(target_path)?;
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE files
+             SET dir = ?2, name = ?3, updated_at_ms = ?4
+             WHERE file_id = ?1",
+            params![
+                to_i64(file_id, "file_id")?,
+                target_dir,
+                target_name,
+                to_i64(now, "updated_at_ms")?,
+            ],
+        )?;
+        if tx.changes() == 0 {
+            return Err(Fs0Error::NotFound);
+        }
+        insert_file_change_log(
+            &tx,
+            FileChangeLogKind::Moved,
+            Some((old_dir, old_name)),
+            Some((&target_dir, &target_name)),
+            Some(file_id),
+            now,
+        )?;
+        tx.commit()?;
+        load_file_by_id(&self.conn, file_id)?
+            .map(file_to_record)
+            .transpose()?
+            .ok_or(Fs0Error::NotFound)
     }
 }
 
@@ -545,6 +654,22 @@ fn create_file(tx: &rusqlite::Transaction<'_>, dir: &str, name: &str, now: u64) 
     from_i64(tx.last_insert_rowid(), "file_id")
 }
 
+fn delete_file_tx(tx: &rusqlite::Transaction<'_>, file: FileIdentity, now: u64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM files
+         WHERE file_id = ?1",
+        params![to_i64(file.file_id, "file_id")?],
+    )?;
+    insert_file_change_log(
+        tx,
+        FileChangeLogKind::Deleted,
+        Some((&file.dir, &file.name)),
+        None,
+        Some(file.file_id),
+        now,
+    )
+}
+
 fn select_append_volume(
     tx: &rusqlite::Transaction<'_>,
     prefer_volume_name: Option<&str>,
@@ -575,7 +700,7 @@ fn select_append_volume(
             |row| row.get::<_, i64>(0),
         )
         .optional()?
-        .ok_or_else(|| CentralError::not_found("no volume is registered in central metadata"))?;
+        .ok_or(Fs0Error::NotFound)?;
     from_i64(volume_id, "volume_id")
 }
 
@@ -593,7 +718,7 @@ fn load_file_identity_tx(
         row_to_file_identity,
     )
     .optional()
-    .map_err(CentralError::from)
+    .map_err(Fs0Error::from)
 }
 
 fn load_file_by_id(conn: &Connection, file_id: u64) -> Result<Option<FileIdentity>> {
@@ -606,7 +731,7 @@ fn load_file_by_id(conn: &Connection, file_id: u64) -> Result<Option<FileIdentit
         row_to_file_identity,
     )
     .optional()
-    .map_err(CentralError::from)
+    .map_err(Fs0Error::from)
 }
 
 fn load_file_by_id_tx(
@@ -622,7 +747,7 @@ fn load_file_by_id_tx(
         row_to_file_identity,
     )
     .optional()
-    .map_err(CentralError::from)
+    .map_err(Fs0Error::from)
 }
 
 fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Result<LeaseRecord> {
@@ -641,37 +766,34 @@ fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Result<Le
         },
     )
     .optional()?
-    .ok_or_else(|| CentralError::not_found(format!("append lease {lease_id} was not found")))
+    .ok_or(Fs0Error::NotFound)
 }
 
-fn validate_committed_chunks(chunks: &[CommittedChunk], new_size: u64) -> Result<()> {
+fn validate_committed_bundles(bundles: &[CommittedBundle], new_size: u64) -> Result<()> {
     let mut total_size = 0u64;
-    for (expected_index, chunk) in chunks.iter().enumerate() {
-        if chunk.chunk_index != expected_index as u64 {
-            return Err(CentralError::invalid_request(
-                "chunk indexes must be contiguous",
-            ));
+    for (expected_index, bundle) in bundles.iter().enumerate() {
+        if bundle.bundle_index != expected_index as u64 {
+            return Err(Fs0Error::InvalidRequest);
         }
-        if chunk.raw_len == 0 || chunk.compressed_len == 0 {
-            return Err(CentralError::invalid_request(
-                "chunk lengths must be non-zero",
-            ));
+        if bundle.raw_len == 0 || bundle.compressed_len == 0 {
+            return Err(Fs0Error::InvalidRequest);
         }
-        total_size = total_size
-            .checked_add(chunk.raw_len)
-            .ok_or_else(|| CentralError::IntegerConversion("file size overflow".to_owned()))?;
+        total_size =
+            total_size
+                .checked_add(bundle.raw_len)
+                .ok_or_else(|| Fs0Error::IntegerConversion {
+                    message: "file size overflow".to_owned(),
+                })?;
     }
     if total_size != new_size {
-        return Err(CentralError::invalid_request(
-            "committed chunk sizes do not match new_size",
-        ));
+        return Err(Fs0Error::InvalidRequest);
     }
     Ok(())
 }
 
-fn insert_file_event(
+fn insert_file_change_log(
     tx: &rusqlite::Transaction<'_>,
-    kind: FileEventKind,
+    kind: FileChangeLogKind,
     old_target: Option<(&str, &str)>,
     new_target: Option<(&str, &str)>,
     file_id: Option<u64>,
@@ -683,7 +805,7 @@ fn insert_file_event(
             file_id, created_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            file_event_kind(kind),
+            file_change_log_kind(kind),
             old_target.map(|target| target.0),
             old_target.map(|target| target.1),
             new_target.map(|target| target.0),
@@ -718,14 +840,15 @@ fn row_to_file_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileIdentit
     })
 }
 
-fn row_to_file_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEvent> {
+fn row_to_file_change_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileChangeLog> {
     let old_dir: Option<String> = row.get(3)?;
     let old_name: Option<String> = row.get(4)?;
     let new_dir: Option<String> = row.get(5)?;
     let new_name: Option<String> = row.get(6)?;
-    Ok(FileEvent {
+    Ok(FileChangeLog {
         event_id: from_i64(row.get(0)?, "event_id").map_err(to_sql_error)?,
-        kind: parse_file_event_kind(row.get::<_, String>(1)?.as_str()).map_err(to_sql_error)?,
+        kind: parse_file_change_log_kind(row.get::<_, String>(1)?.as_str())
+            .map_err(to_sql_error)?,
         file_id: row
             .get::<_, Option<i64>>(2)?
             .map(|value| from_i64(value, "file_id"))
@@ -752,27 +875,17 @@ fn file_to_record(file: FileIdentity) -> Result<FileRecord> {
 
 fn split_path(path: &str) -> Result<(String, String)> {
     if !path.starts_with('/') {
-        return Err(CentralError::invalid_request(format!(
-            "path must be absolute: {path}"
-        )));
+        return Err(Fs0Error::InvalidRequest);
     }
     if path.split('/').any(|component| component == "..") {
-        return Err(CentralError::invalid_request(format!(
-            "path cannot contain '..': {path}"
-        )));
+        return Err(Fs0Error::InvalidRequest);
     }
     if path == "/" {
-        return Err(CentralError::invalid_request(
-            "root path cannot be a file".to_owned(),
-        ));
+        return Err(Fs0Error::InvalidRequest);
     }
-    let (parent, name) = path.rsplit_once('/').ok_or_else(|| {
-        CentralError::invalid_request(format!("path must be absolute with a file name: {path}"))
-    })?;
+    let (parent, name) = path.rsplit_once('/').ok_or(Fs0Error::InvalidRequest)?;
     if name.is_empty() {
-        return Err(CentralError::invalid_request(format!(
-            "path must include a file name: {path}"
-        )));
+        return Err(Fs0Error::InvalidRequest);
     }
     let parent = if parent.is_empty() { "/" } else { parent };
     Ok((parent.to_owned(), name.to_owned()))
@@ -793,46 +906,45 @@ fn join_optional_path(dir: Option<&str>, name: Option<&str>) -> Result<Option<St
     }
 }
 
-fn blob_to_chunk_id(value: Vec<u8>, name: &str) -> Result<ChunkId> {
-    let bytes = value.try_into().map_err(|value: Vec<u8>| {
-        CentralError::invalid_request(format!("{name} must be 32 bytes, got {}", value.len()))
-    })?;
-    Ok(ChunkId(bytes))
+fn blob_to_hash_id(value: Vec<u8>, _name: &str) -> Result<HashId> {
+    let bytes = value
+        .try_into()
+        .map_err(|_value: Vec<u8>| Fs0Error::InvalidRequest)?;
+    Ok(HashId(bytes))
 }
 
-fn file_event_kind(kind: FileEventKind) -> &'static str {
+fn file_change_log_kind(kind: FileChangeLogKind) -> &'static str {
     match kind {
-        FileEventKind::Created => "created",
-        FileEventKind::Updated => "updated",
-        FileEventKind::Moved => "moved",
-        FileEventKind::Deleted => "deleted",
+        FileChangeLogKind::Created => "created",
+        FileChangeLogKind::Updated => "updated",
+        FileChangeLogKind::Moved => "moved",
+        FileChangeLogKind::Deleted => "deleted",
     }
 }
 
-fn parse_file_event_kind(value: &str) -> Result<FileEventKind> {
+fn parse_file_change_log_kind(value: &str) -> Result<FileChangeLogKind> {
     match value {
-        "created" => Ok(FileEventKind::Created),
-        "updated" => Ok(FileEventKind::Updated),
-        "moved" => Ok(FileEventKind::Moved),
-        "deleted" => Ok(FileEventKind::Deleted),
-        _ => Err(CentralError::invalid_request(format!(
-            "unknown file event type: {value}"
-        ))),
+        "created" => Ok(FileChangeLogKind::Created),
+        "updated" => Ok(FileChangeLogKind::Updated),
+        "moved" => Ok(FileChangeLogKind::Moved),
+        "deleted" => Ok(FileChangeLogKind::Deleted),
+        _ => Err(Fs0Error::InvalidRequest),
     }
 }
 
 fn to_i64(value: u64, name: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| {
-        CentralError::IntegerConversion(format!("{name} value {value} does not fit in i64"))
+    i64::try_from(value).map_err(|_| Fs0Error::IntegerConversion {
+        message: format!("{name} value {value} does not fit in i64"),
     })
 }
 
 fn from_i64(value: i64, name: &str) -> Result<u64> {
-    u64::try_from(value)
-        .map_err(|_| CentralError::IntegerConversion(format!("{name} value {value} is negative")))
+    u64::try_from(value).map_err(|_| Fs0Error::IntegerConversion {
+        message: format!("{name} value {value} is negative"),
+    })
 }
 
-fn to_sql_error(err: CentralError) -> rusqlite::Error {
+fn to_sql_error(err: Fs0Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(err))
 }
 

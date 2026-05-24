@@ -1,28 +1,28 @@
 mod config;
 mod db;
-mod error;
 
 pub use config::{CentralConfig, CentralP2pRelayConfig};
 pub use db::VolumeRecord;
-pub use error::{CentralError, Result};
+pub use fs0_core::Fs0Error;
+
+pub type Result<T> = std::result::Result<T, Fs0Error>;
 
 use db::CentralDb;
 use fs0_core::{
-    AppendLease, BeginAppendRequest, ChunkPlan, ChunkPlanAction, ChunkPlanInput, ChunkPlans,
-    CommitAppendRequest, ControlRequest, ControlResponse, DirectoryEntries, FileEvents,
-    FileManifest, FileRecord, RegisterStorageRequest, ReplicaLocation, SessionMessage,
-    StorageChunkEvents, StoragePeerInfo, UploadTarget,
+    AppendLease, BeginAppendRequest, BundleReplicaReport, CommitAppendRequest, ControlRequest,
+    ControlResponse, DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord,
+    RegisterStorageRequest, ReplicaLocation, SessionMessage, StoragePeerInfo,
 };
 use fs0_transport::{bind_endpoint, encode_endpoint_addr, read_frame, write_frame};
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 #[derive(Clone)]
@@ -37,7 +37,7 @@ struct CentralState {
     online_volumes: RwLock<HashMap<u64, u64>>,
     db: Mutex<CentralDb>,
     control_endpoint: Vec<u8>,
-    accept_task: StdMutex<Option<JoinHandle<()>>>,
+    accept_task: Mutex<Option<JoinHandle<()>>>,
     relay: iroh_relay::server::Server,
 }
 
@@ -50,8 +50,9 @@ impl CentralServer {
             config.p2p_relay.quic_port,
             vec![fs0_core::CONTROL_ALPN.to_vec()],
         )
-        .await?;
-        let control_endpoint = encode_endpoint_addr(&endpoint)?;
+        .await
+        .map_err(internal_error)?;
+        let control_endpoint = encode_endpoint_addr(&endpoint).map_err(internal_error)?;
         let db = CentralDb::open(&config.db_path)?;
 
         let server = Self {
@@ -62,7 +63,7 @@ impl CentralServer {
                 online_volumes: RwLock::new(HashMap::new()),
                 db: Mutex::new(db),
                 control_endpoint,
-                accept_task: StdMutex::new(None),
+                accept_task: Mutex::new(None),
                 relay,
             }),
         };
@@ -70,11 +71,7 @@ impl CentralServer {
         let accept_task = tokio::spawn(async move {
             accept_loop(endpoint, accept_server).await;
         });
-        *server
-            .state
-            .accept_task
-            .lock()
-            .expect("central accept task lock poisoned") = Some(accept_task);
+        *server.state.accept_task.lock() = Some(accept_task);
         Ok(server)
     }
 
@@ -93,7 +90,7 @@ impl CentralServer {
     }
 
     pub async fn create_volume(&self, name: String, max_bytes: u64) -> Result<VolumeRecord> {
-        self.state.db.lock().await.create_volume(name, max_bytes)
+        self.state.db.lock().create_volume(name, max_bytes)
     }
 
     pub async fn register_storage(
@@ -101,40 +98,29 @@ impl CentralServer {
         mut request: RegisterStorageRequest,
     ) -> Result<StoragePeerInfo> {
         {
-            let db = self.state.db.lock().await;
+            let db = self.state.db.lock();
             for volume in &mut request.volumes {
-                let registered = db.get_volume(volume.volume_id)?.ok_or_else(|| {
-                    CentralError::not_found(format!(
-                        "volume {} was not found in central metadata",
-                        volume.volume_id
-                    ))
-                })?;
-                volume.name = registered.name.clone();
+                let registered = db.get_volume(volume.volume_id)?.ok_or(Fs0Error::NotFound)?;
+                volume.name = registered.name;
                 if registered.max_bytes != volume.max_bytes {
-                    return Err(CentralError::invalid_request(format!(
-                        "volume {} max_bytes mismatch: central={}, storage={}",
-                        volume.volume_id, registered.max_bytes, volume.max_bytes
-                    )));
+                    return Err(Fs0Error::InvalidRequest);
                 }
             }
         }
 
-        let mut storages = self.state.storages.write().await;
+        let mut storages = self.state.storages.write();
         if storages.contains_key(&request.storage_id) {
-            return Err(CentralError::invalid_request(format!(
-                "storage {} is already registered",
-                request.storage_id
-            )));
+            return Err(Fs0Error::AlreadyExists {
+                path: format!("storage:{}", request.storage_id),
+            });
         }
-        let mut online_volumes = self.state.online_volumes.write().await;
+
+        let mut online_volumes = self.state.online_volumes.write();
         for volume in &request.volumes {
             if let Some(existing_storage_id) = online_volumes.get(&volume.volume_id)
                 && *existing_storage_id != request.storage_id
             {
-                return Err(CentralError::volume_already_mounted(
-                    volume.volume_id,
-                    existing_storage_id,
-                ));
+                return Err(Fs0Error::VolumeAlreadyMounted);
             }
         }
 
@@ -142,7 +128,7 @@ impl CentralServer {
             storage_id: request.storage_id,
             name: request.name,
             volumes: request.volumes,
-            data_endpoint: request.data_endpoint,
+            iroh_endpoint: request.iroh_endpoint,
         };
         for volume in &peer.volumes {
             online_volumes.insert(volume.volume_id, peer.storage_id);
@@ -152,11 +138,10 @@ impl CentralServer {
     }
 
     pub async fn unregister_storage(&self, storage_id: u64) -> Result<()> {
-        self.state.storages.write().await.remove(&storage_id);
+        self.state.storages.write().remove(&storage_id);
         self.state
             .online_volumes
             .write()
-            .await
             .retain(|_, mounted_storage_id| *mounted_storage_id != storage_id);
         Ok(())
     }
@@ -166,7 +151,6 @@ impl CentralServer {
             .state
             .storages
             .read()
-            .await
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -175,11 +159,11 @@ impl CentralServer {
     }
 
     pub async fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
-        self.state.db.lock().await.get_file_by_path(path)
+        self.state.db.lock().get_file_by_path(path)
     }
 
     pub async fn list_files(&self) -> Result<Vec<FileRecord>> {
-        self.state.db.lock().await.list_files()
+        self.state.db.lock().list_files()
     }
 
     pub async fn list_directory(
@@ -188,58 +172,113 @@ impl CentralServer {
         limit: u32,
         cursor: Option<u64>,
     ) -> Result<DirectoryEntries> {
-        self.state
-            .db
-            .lock()
-            .await
-            .list_directory(dir, limit, cursor)
+        self.state.db.lock().list_directory(dir, limit, cursor)
+    }
+
+    pub async fn get_file_read_plan(&self, path: &str) -> Result<FileReadPlan> {
+        let plan = self.state.db.lock().get_file_read_plan(path)?;
+        self.hydrate_read_plan_replicas(plan).await
+    }
+
+    pub async fn get_file_read_plan_by_id(&self, file_id: u64) -> Result<FileReadPlan> {
+        let plan = self.state.db.lock().get_file_read_plan_by_id(file_id)?;
+        self.hydrate_read_plan_replicas(plan).await
     }
 
     pub async fn begin_append(&self, request: BeginAppendRequest) -> Result<AppendLease> {
-        self.state.db.lock().await.begin_append(request, 0)
+        self.state.db.lock().begin_append(request, 0)
     }
 
-    pub async fn plan_chunks(
+    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileReadPlan> {
+        let plan = self.state.db.lock().commit_append(request)?;
+        self.hydrate_read_plan_replicas(plan).await
+    }
+
+    pub async fn abort_append(&self, lease_id: u64) -> Result<()> {
+        self.state.db.lock().abort_append(lease_id)
+    }
+
+    pub async fn get_file_change_logs(
         &self,
-        lease_id: u64,
-        chunks: Vec<ChunkPlanInput>,
-    ) -> Result<ChunkPlans> {
-        let peers = self.storage_peers().await;
-        let mut plans = Vec::with_capacity(chunks.len());
-        let prefer_volume_name = self.preferred_volume_name(lease_id).await?;
-        let chunks = {
-            let db = self.state.db.lock().await;
-            chunks
-                .into_iter()
-                .map(|chunk| {
-                    let volume_ids = db.chunk_replica_volumes(chunk.chunk_id)?;
-                    Ok((chunk, volume_ids))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        for (chunk, volume_ids) in chunks {
-            let replicas = self.hydrate_replica_volumes(volume_ids).await;
-            let targets = upload_targets(&peers, &replicas, prefer_volume_name.as_deref());
-            let action = if replicas.is_empty() {
-                ChunkPlanAction::Upload { targets }
-            } else if targets.is_empty() {
-                ChunkPlanAction::Reuse { replicas }
-            } else {
-                ChunkPlanAction::AddReplica {
-                    existing_replicas: replicas,
-                    targets,
+        after_event_id: u64,
+        limit: u32,
+    ) -> Result<FileChangeLogs> {
+        self.state
+            .db
+            .lock()
+            .get_file_change_logs(after_event_id, limit)
+    }
+
+    pub async fn delete_file(&self, path: &str) -> Result<()> {
+        self.state.db.lock().delete_file(path)
+    }
+
+    pub async fn delete_file_by_id(&self, file_id: u64) -> Result<()> {
+        self.state.db.lock().delete_file_by_id(file_id)
+    }
+
+    pub async fn copy_file(&self, source_path: &str, target_path: &str) -> Result<FileRecord> {
+        self.state.db.lock().copy_file(source_path, target_path)
+    }
+
+    pub async fn copy_file_by_id(
+        &self,
+        source_file_id: u64,
+        target_path: &str,
+    ) -> Result<FileRecord> {
+        self.state
+            .db
+            .lock()
+            .copy_file_by_id(source_file_id, target_path)
+    }
+
+    pub async fn rename_file(&self, source_path: &str, target_path: &str) -> Result<FileRecord> {
+        self.state.db.lock().rename_file(source_path, target_path)
+    }
+
+    pub async fn rename_file_by_id(&self, file_id: u64, target_path: &str) -> Result<FileRecord> {
+        self.state.db.lock().rename_file_by_id(file_id, target_path)
+    }
+
+    pub async fn report_bundle_replica(
+        &self,
+        storage_id: u64,
+        report: BundleReplicaReport,
+    ) -> Result<()> {
+        {
+            let online_volumes = self.state.online_volumes.read();
+            for event in &report.events {
+                if online_volumes.get(&event.volume_id) != Some(&storage_id) {
+                    return Err(Fs0Error::InvalidRequest);
                 }
-            };
-            plans.push(ChunkPlan {
-                chunk_id: chunk.chunk_id,
-                action,
-            });
+            }
         }
-        Ok(ChunkPlans { chunks: plans })
+        self.state.db.lock().record_bundle_events(report)
+    }
+
+    async fn hydrate_read_plan_replicas(&self, mut plan: FileReadPlan) -> Result<FileReadPlan> {
+        let bundle_replica_volumes = {
+            let db = self.state.db.lock();
+            plan.bundles
+                .iter()
+                .map(|bundle| {
+                    let volume_ids = db.bundle_replica_volumes(bundle.bundle_id)?;
+                    Ok((bundle.bundle_id, volume_ids))
+                })
+                .collect::<Result<HashMap<_, _>>>()?
+        };
+        for bundle in &mut plan.bundles {
+            let volume_ids = bundle_replica_volumes
+                .get(&bundle.bundle_id)
+                .cloned()
+                .unwrap_or_default();
+            bundle.replicas = self.hydrate_replica_volumes(volume_ids).await;
+        }
+        Ok(plan)
     }
 
     async fn hydrate_replica_volumes(&self, volume_ids: Vec<u64>) -> Vec<ReplicaLocation> {
-        let online_volumes = self.state.online_volumes.read().await;
+        let online_volumes = self.state.online_volumes.read();
         volume_ids
             .into_iter()
             .filter_map(|volume_id| {
@@ -253,83 +292,19 @@ impl CentralServer {
             .collect()
     }
 
-    async fn preferred_volume_name(&self, lease_id: u64) -> Result<Option<String>> {
-        self.state
-            .db
-            .lock()
-            .await
-            .lease_prefer_volume_name(lease_id)
-    }
-
-    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileManifest> {
-        let manifest = self.state.db.lock().await.commit_append(request)?;
-        self.hydrate_manifest_replicas(manifest).await
-    }
-
-    pub async fn abort_append(&self, lease_id: u64) -> Result<()> {
-        self.state.db.lock().await.abort_append(lease_id)
-    }
-
-    pub async fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
-        self.state
-            .db
-            .lock()
-            .await
-            .list_file_events(after_event_id, limit)
-    }
-
-    pub async fn record_chunk_events(
-        &self,
-        storage_id: u64,
-        events: StorageChunkEvents,
-    ) -> Result<()> {
-        {
-            let online_volumes = self.state.online_volumes.read().await;
-            for event in &events.events {
-                if online_volumes.get(&event.volume_id) != Some(&storage_id) {
-                    return Err(CentralError::invalid_request(format!(
-                        "volume {} is not mounted by storage {}",
-                        event.volume_id, storage_id
-                    )));
-                }
-            }
-        }
-        self.state.db.lock().await.record_chunk_events(events)
-    }
-
-    pub async fn get_file_manifest(&self, path: &str) -> Result<FileManifest> {
-        let manifest = self.state.db.lock().await.get_file_manifest(path)?;
-        self.hydrate_manifest_replicas(manifest).await
-    }
-
-    async fn hydrate_manifest_replicas(&self, mut manifest: FileManifest) -> Result<FileManifest> {
-        let chunk_replica_volumes = {
-            let db = self.state.db.lock().await;
-            manifest
-                .chunks
-                .iter()
-                .map(|chunk| {
-                    let volume_ids = db.chunk_replica_volumes(chunk.chunk_id)?;
-                    Ok((chunk.chunk_id, volume_ids))
-                })
-                .collect::<Result<HashMap<_, _>>>()?
-        };
-        for chunk in &mut manifest.chunks {
-            let volume_ids = chunk_replica_volumes
-                .get(&chunk.chunk_id)
-                .cloned()
-                .unwrap_or_default();
-            chunk.replicas = self.hydrate_replica_volumes(volume_ids).await;
-        }
-        Ok(manifest)
-    }
-
     async fn handle_control_connection(&self, connection: Connection) -> Result<()> {
         let mut storage_id = None;
-        let (mut session_send, mut session_recv) = connection.accept_bi().await.map_err(|err| {
-            CentralError::Transport(fs0_transport::TransportError::Iroh(err.to_string()))
-        })?;
-        match read_frame::<SessionMessage, _>(&mut session_recv).await? {
+        let (mut session_send, mut session_recv) =
+            connection
+                .accept_bi()
+                .await
+                .map_err(|err| Fs0Error::Internal {
+                    message: err.to_string(),
+                })?;
+        match read_frame::<SessionMessage, _>(&mut session_recv)
+            .await
+            .map_err(internal_error)?
+        {
             SessionMessage::RegisterClient { .. } => {
                 let storages = self.storage_peers().await;
                 write_frame(
@@ -339,7 +314,8 @@ impl CentralServer {
                         storages,
                     },
                 )
-                .await?;
+                .await
+                .map_err(internal_error)?;
             }
             SessionMessage::RegisterStorage { request } => {
                 let id = request.storage_id;
@@ -354,31 +330,28 @@ impl CentralServer {
                                 storages,
                             },
                         )
-                        .await?;
+                        .await
+                        .map_err(internal_error)?;
                     }
                     Err(err) => {
-                        write_frame(
-                            &mut session_send,
-                            &SessionMessage::Error(err.to_protocol_error()),
-                        )
-                        .await?;
+                        write_frame(&mut session_send, &SessionMessage::Error(err))
+                            .await
+                            .map_err(internal_error)?;
                     }
                 }
             }
             SessionMessage::Ping => {
-                write_frame(&mut session_send, &SessionMessage::Pong).await?;
+                write_frame(&mut session_send, &SessionMessage::Pong)
+                    .await
+                    .map_err(internal_error)?;
             }
             _ => {
                 write_frame(
                     &mut session_send,
-                    &SessionMessage::Error(
-                        CentralError::invalid_request(
-                            "first session message must register a client or storage",
-                        )
-                        .to_protocol_error(),
-                    ),
+                    &SessionMessage::Error(fs0_core::Fs0Error::InvalidRequest),
                 )
-                .await?;
+                .await
+                .map_err(internal_error)?;
                 return Ok(());
             }
         }
@@ -388,7 +361,9 @@ impl CentralServer {
                 request = read_frame::<SessionMessage, _>(&mut session_recv) => {
                     match request {
                         Ok(SessionMessage::Ping) => {
-                            write_frame(&mut session_send, &SessionMessage::Pong).await?;
+                            write_frame(&mut session_send, &SessionMessage::Pong)
+                                .await
+                                .map_err(internal_error)?;
                         }
                         Ok(_) => {}
                         Err(_) => break,
@@ -403,7 +378,7 @@ impl CentralServer {
                         let Ok(request) = read_frame::<ControlRequest, _>(&mut recv).await else {
                             return;
                         };
-                        let (response, _) = server.handle_control_request(request, storage_id).await;
+                        let response = server.handle_control_request(request, storage_id).await;
                         let _ = write_frame(&mut send, &response).await;
                         let _ = send.finish();
                     });
@@ -421,91 +396,102 @@ impl CentralServer {
         &self,
         request: ControlRequest,
         actor_storage_id: Option<u64>,
-    ) -> (ControlResponse, Option<u64>) {
+    ) -> ControlResponse {
         match request {
-            ControlRequest::Ping => (ControlResponse::Ping, None),
             ControlRequest::CreateVolume { name, max_bytes } => {
                 match self.create_volume(name, max_bytes).await {
-                    Ok(volume) => (ControlResponse::CreateVolume(volume.volume_id), None),
-                    Err(err) => (ControlResponse::Error(err.into()), None),
+                    Ok(volume) => ControlResponse::CreateVolume(volume.volume_id),
+                    Err(err) => ControlResponse::Error(err),
                 }
             }
-            ControlRequest::RegisterStorage(request) => {
-                let storage_id = request.storage_id;
-                match self.register_storage(request).await {
-                    Ok(_) => (
-                        ControlResponse::RegisterStorage(storage_id),
-                        Some(storage_id),
-                    ),
-                    Err(err) => (ControlResponse::Error(err.into()), None),
-                }
-            }
-            ControlRequest::ListStoragePeers => (
-                ControlResponse::ListStoragePeers(self.storage_peers().await),
-                None,
-            ),
-            ControlRequest::ListFiles => match self.list_files().await {
-                Ok(files) => (ControlResponse::ListFiles(files), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+            ControlRequest::GrantUploadLease(lease) => ControlResponse::UploadLeaseGranted {
+                lease_id: lease.lease_id,
             },
+            ControlRequest::RevokeUploadLease { lease_id } => {
+                ControlResponse::UploadLeaseRevoked { lease_id }
+            }
             ControlRequest::ListDirectory { dir, limit, cursor } => {
                 match self.list_directory(&dir, limit, cursor).await {
-                    Ok(entries) => (ControlResponse::ListDirectory(entries), None),
-                    Err(err) => (ControlResponse::Error(err.into()), None),
+                    Ok(entries) => ControlResponse::ListDirectory(entries),
+                    Err(err) => ControlResponse::Error(err),
                 }
             }
-            ControlRequest::LookupPath { path } => match self.get_file_by_path(&path).await {
-                Ok(file) => (ControlResponse::LookupPath(file), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+            ControlRequest::GetFileReadPlan { path } => {
+                match self.get_file_read_plan(&path).await {
+                    Ok(plan) => ControlResponse::GetFileReadPlan(plan),
+                    Err(err) => ControlResponse::Error(err),
+                }
+            }
+            ControlRequest::GetFileReadPlanById { file_id } => {
+                match self.get_file_read_plan_by_id(file_id).await {
+                    Ok(plan) => ControlResponse::GetFileReadPlanById(plan),
+                    Err(err) => ControlResponse::Error(err),
+                }
+            }
+            ControlRequest::DeleteFile { path } => match self.delete_file(&path).await {
+                Ok(()) => ControlResponse::DeleteFile,
+                Err(err) => ControlResponse::Error(err),
             },
-            ControlRequest::GetFileRecord { path } => match self.get_file_by_path(&path).await {
-                Ok(file) => (ControlResponse::GetFileRecord(file), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+            ControlRequest::DeleteFileById { file_id } => {
+                match self.delete_file_by_id(file_id).await {
+                    Ok(()) => ControlResponse::DeleteFileById,
+                    Err(err) => ControlResponse::Error(err),
+                }
+            }
+            ControlRequest::CopyFile {
+                source_path,
+                target_path,
+            } => match self.copy_file(&source_path, &target_path).await {
+                Ok(file) => ControlResponse::CopyFile(file),
+                Err(err) => ControlResponse::Error(err),
             },
-            ControlRequest::ListFileEvents {
+            ControlRequest::CopyFileById {
+                source_file_id,
+                target_path,
+            } => match self.copy_file_by_id(source_file_id, &target_path).await {
+                Ok(file) => ControlResponse::CopyFileById(file),
+                Err(err) => ControlResponse::Error(err),
+            },
+            ControlRequest::RenameFile {
+                source_path,
+                target_path,
+            } => match self.rename_file(&source_path, &target_path).await {
+                Ok(file) => ControlResponse::RenameFile(file),
+                Err(err) => ControlResponse::Error(err),
+            },
+            ControlRequest::RenameFileById {
+                file_id,
+                target_path,
+            } => match self.rename_file_by_id(file_id, &target_path).await {
+                Ok(file) => ControlResponse::RenameFileById(file),
+                Err(err) => ControlResponse::Error(err),
+            },
+            ControlRequest::GetFileChangeLogs {
                 after_event_id,
                 limit,
-            } => match self.list_file_events(after_event_id, limit).await {
-                Ok(events) => (ControlResponse::ListFileEvents(events), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+            } => match self.get_file_change_logs(after_event_id, limit).await {
+                Ok(logs) => ControlResponse::GetFileChangeLogs(logs),
+                Err(err) => ControlResponse::Error(err),
             },
             ControlRequest::BeginAppend(request) => match self.begin_append(request).await {
-                Ok(lease) => (ControlResponse::BeginAppend(lease), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+                Ok(lease) => ControlResponse::BeginAppend(lease),
+                Err(err) => ControlResponse::Error(err),
             },
-            ControlRequest::PlanChunks { lease_id, chunks } => {
-                match self.plan_chunks(lease_id, chunks).await {
-                    Ok(plans) => (ControlResponse::PlanChunks(plans), None),
-                    Err(err) => (ControlResponse::Error(err.into()), None),
-                }
-            }
             ControlRequest::CommitAppend(request) => match self.commit_append(request).await {
-                Ok(file_manifest) => (ControlResponse::CommitAppend(file_manifest), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+                Ok(plan) => ControlResponse::CommitAppend(plan),
+                Err(err) => ControlResponse::Error(err),
             },
             ControlRequest::AbortAppend { lease_id } => match self.abort_append(lease_id).await {
-                Ok(()) => (ControlResponse::AbortAppend, None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
+                Ok(()) => ControlResponse::AbortAppend,
+                Err(err) => ControlResponse::Error(err),
             },
-            ControlRequest::GetFileManifest { path } => match self.get_file_manifest(&path).await {
-                Ok(manifest) => (ControlResponse::GetFileManifest(manifest), None),
-                Err(err) => (ControlResponse::Error(err.into()), None),
-            },
-            ControlRequest::RecordChunkEvents(events) => {
+            ControlRequest::ReportBundleReplica(report) => {
                 let Some(storage_id) = actor_storage_id else {
-                    return (
-                        ControlResponse::Error(
-                            CentralError::invalid_request(
-                                "only a registered storage session can record chunk events",
-                            )
-                            .into(),
-                        ),
-                        None,
-                    );
+                    return ControlResponse::Error(fs0_core::Fs0Error::Unauthorized);
                 };
-                match self.record_chunk_events(storage_id, events).await {
-                    Ok(()) => (ControlResponse::RecordChunkEvents, None),
-                    Err(err) => (ControlResponse::Error(err.into()), None),
+                match self.report_bundle_replica(storage_id, report).await {
+                    Ok(()) => ControlResponse::ReportBundleReplica,
+                    Err(err) => ControlResponse::Error(err),
                 }
             }
         }
@@ -514,12 +500,7 @@ impl CentralServer {
 
 impl Drop for CentralState {
     fn drop(&mut self) {
-        if let Some(task) = self
-            .accept_task
-            .get_mut()
-            .expect("central accept task lock poisoned")
-            .take()
-        {
+        if let Some(task) = self.accept_task.get_mut().take() {
             task.abort();
         }
         let _ = &self.relay;
@@ -550,15 +531,15 @@ async fn start_relay(config: &CentralConfig) -> Result<iroh_relay::server::Serve
     server_config.quic = Some(quic_config);
     let relay = iroh_relay::server::Server::spawn(server_config)
         .await
-        .map_err(|err| CentralError::Relay(err.to_string()))?;
+        .map_err(internal_error)?;
     Ok(relay)
 }
 
 fn validate_config(config: &CentralConfig) -> Result<()> {
     if config.p2p_relay.public_url.trim().is_empty() {
-        return Err(CentralError::Config(
-            "p2p_relay.public_url must not be empty".to_owned(),
-        ));
+        return Err(Fs0Error::InvalidConfig {
+            message: "p2p_relay.public_url must not be empty".to_owned(),
+        });
     }
     Ok(())
 }
@@ -567,68 +548,26 @@ fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn upload_targets(
-    peers: &[StoragePeerInfo],
-    existing_replicas: &[ReplicaLocation],
-    prefer_volume_name: Option<&str>,
-) -> Vec<UploadTarget> {
-    let target_count = 2usize.saturating_sub(existing_replicas.len());
-    if target_count == 0 {
-        return Vec::new();
-    }
-    let mut targets = Vec::new();
-    for (peer, volume) in preferred_peer_volumes(peers, prefer_volume_name) {
-        if existing_replicas
-            .iter()
-            .any(|replica| replica.storage_id == peer.storage_id)
-        {
-            continue;
-        }
-        targets.push(UploadTarget {
-            storage_id: peer.storage_id,
-            volume_id: volume.volume_id,
-            data_endpoint: peer.data_endpoint.clone(),
-        });
-        if targets.len() >= target_count {
-            break;
-        }
-    }
-    targets
-}
-
-fn preferred_peer_volumes<'a>(
-    peers: &'a [StoragePeerInfo],
-    prefer_volume_name: Option<&str>,
-) -> Vec<(&'a StoragePeerInfo, &'a fs0_core::StorageVolumeInfo)> {
-    let mut preferred = Vec::new();
-    let mut fallback = Vec::new();
-    for peer in peers {
-        for volume in &peer.volumes {
-            if prefer_volume_name.is_some_and(|name| volume.name.as_deref() == Some(name)) {
-                preferred.push((peer, volume));
-            } else {
-                fallback.push((peer, volume));
-            }
-        }
-    }
-    preferred.extend(fallback);
-    preferred
-}
-
 fn self_signed_quic_server_config() -> Result<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![
         "localhost".to_owned(),
         "127.0.0.1".to_owned(),
         "::1".to_owned(),
     ])
-    .map_err(|err| CentralError::Relay(err.to_string()))?;
+    .map_err(internal_error)?;
     let rustls_cert = cert.cert.der().clone();
     let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let private_key = rustls::pki_types::PrivateKeyDer::from(private_key);
     rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
-        .map_err(|err| CentralError::Relay(err.to_string()))?
+        .map_err(internal_error)?
         .with_no_client_auth()
         .with_single_cert(vec![rustls_cert], private_key)
-        .map_err(|err| CentralError::Relay(err.to_string()))
+        .map_err(internal_error)
+}
+
+fn internal_error(err: impl std::fmt::Display) -> Fs0Error {
+    Fs0Error::Internal {
+        message: err.to_string(),
+    }
 }

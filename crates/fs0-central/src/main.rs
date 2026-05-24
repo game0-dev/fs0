@@ -1,5 +1,6 @@
 use clap::Parser;
-use fs0_central::{CentralConfig, CentralServer};
+use fs0_central::CentralServer;
+use fs0_config::Fs0Config;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -16,7 +17,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let config = CentralConfig::load_from(args.config)?;
+    let config = Fs0Config::load_from(args.config)?.central()?;
     eprintln!(
         "starting central: relay={}, relay_quic=127.0.0.1:{}",
         config.p2p_relay.public_url, config.p2p_relay.quic_port

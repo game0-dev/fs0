@@ -1,57 +1,34 @@
+pub use fs0_config::{ClientConfig, ClientP2pRelayConfig};
 use fs0_core::{
-    AppendLease, BeginAppendRequest, ChunkId, ChunkPlanInput, ChunkPlans, CommitAppendRequest,
-    ControlRequest, ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileEvents,
-    FileManifest, FileRecord, Fs0ProtocolError, SessionMessage, StoragePeerInfo, UploadTarget,
+    AppendLease, BeginAppendRequest, CommitAppendRequest, ControlRequest, ControlResponse,
+    DataRequest, DataResponse, DirectoryEntries, FileChangeLogs, FileReadPlan, Fs0Error, HashId,
+    SessionMessage, StoragePeerInfo, UploadTarget,
 };
 use fs0_transport::{
-    TransportError, bind_endpoint, connect_control, connect_data, control_rpc, data_rpc,
-    data_rpc_on_connection, ping_data_peer, read_frame, write_frame,
+    bind_endpoint, connect_control, connect_data, control_rpc, data_rpc, data_rpc_on_connection,
+    ping_data_peer, read_frame, write_frame,
 };
 use iroh::{
     Endpoint,
     endpoint::{Connection, SendStream},
 };
+use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
-pub type Result<T> = std::result::Result<T, ClientError>;
+pub type Result<T> = std::result::Result<T, Fs0Error>;
 
 pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 32;
 
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    #[error("no storage peers are registered with central")]
-    NoStoragePeers,
-
-    #[error("unexpected control response: {0:?}")]
-    UnexpectedControlResponse(ControlResponse),
-
-    #[error("unexpected data response: {0:?}")]
-    UnexpectedDataResponse(DataResponse),
-
-    #[error("protocol error: {0:?}")]
-    Protocol(Fs0ProtocolError),
-
-    #[error("upload task failed: {0}")]
-    UploadTask(String),
-
-    #[error("io error")]
-    Io(#[from] std::io::Error),
-
-    #[error("transport error")]
-    Transport(#[from] TransportError),
-}
-
 #[derive(Debug, Clone)]
 pub struct ChunkUpload {
-    pub chunk_id: ChunkId,
+    pub chunk_id: HashId,
     pub raw_len: u64,
     pub compressed_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkUploadResult {
-    pub chunk_id: ChunkId,
+    pub chunk_id: HashId,
     pub uploaded: bool,
 }
 
@@ -61,6 +38,7 @@ pub struct Fs0Client {
     control: Connection,
     _session: Arc<Mutex<SendStream>>,
     endpoint: Endpoint,
+    storages: Vec<StoragePeerInfo>,
 }
 
 impl Fs0Client {
@@ -70,21 +48,32 @@ impl Fs0Client {
         relay_url: &str,
         relay_quic_port: u16,
     ) -> Result<Self> {
-        let endpoint = bind_endpoint(relay_url, relay_quic_port, Vec::new()).await?;
-        let control = connect_control(&endpoint, central_endpoint).await?;
+        let endpoint = bind_endpoint(relay_url, relay_quic_port, Vec::new())
+            .await
+            .map_err(transport_error)?;
+        let control = connect_control(&endpoint, central_endpoint)
+            .await
+            .map_err(transport_error)?;
         let (mut session_send, mut session_recv) = control
             .open_bi()
             .await
-            .map_err(|err| TransportError::Iroh(err.to_string()))?;
-        write_frame(&mut session_send, &SessionMessage::RegisterClient { name }).await?;
-        let response = read_frame(&mut session_recv).await?;
-        let client_id = match response {
-            SessionMessage::ClientRegistered { client_id, .. } => client_id,
-            SessionMessage::Error(err) => return Err(ClientError::Protocol(err)),
+            .map_err(|err| internal_error(err.to_string()))?;
+        write_frame(&mut session_send, &SessionMessage::RegisterClient { name })
+            .await
+            .map_err(transport_error)?;
+        let response = read_frame(&mut session_recv)
+            .await
+            .map_err(transport_error)?;
+        let (client_id, storages) = match response {
+            SessionMessage::ClientRegistered {
+                client_id,
+                storages,
+            } => (client_id, storages),
+            SessionMessage::Error(err) => return Err(err),
             response => {
-                return Err(ClientError::Transport(TransportError::InvalidFrame(
-                    format!("unexpected session response: {response:?}"),
-                )));
+                return Err(Fs0Error::InvalidFrame {
+                    message: format!("unexpected session response: {response:?}"),
+                });
             }
         };
 
@@ -93,6 +82,7 @@ impl Fs0Client {
             control,
             _session: Arc::new(Mutex::new(session_send)),
             endpoint,
+            storages,
         })
     }
 
@@ -101,28 +91,8 @@ impl Fs0Client {
         self.client_id
     }
 
-    pub async fn storage_peers(&self) -> Result<Vec<StoragePeerInfo>> {
-        match self.request(ControlRequest::ListStoragePeers).await? {
-            ControlResponse::ListStoragePeers(peers) => Ok(peers),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
-        }
-    }
-
-    pub async fn list_files(&self) -> Result<Vec<FileRecord>> {
-        match self.request(ControlRequest::ListFiles).await? {
-            ControlResponse::ListFiles(files) => Ok(files),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
-        }
-    }
-
-    pub async fn get_file_record(&self, path: String) -> Result<Option<FileRecord>> {
-        match self.request(ControlRequest::GetFileRecord { path }).await? {
-            ControlResponse::GetFileRecord(file) => Ok(file),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
-        }
+    pub fn storage_peers(&self) -> Vec<StoragePeerInfo> {
+        self.storages.clone()
     }
 
     pub async fn list_directory(
@@ -136,39 +106,46 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::ListDirectory(entries) => Ok(entries),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn get_file_read_plan(&self, path: String) -> Result<FileReadPlan> {
+        match self
+            .request(ControlRequest::GetFileReadPlan { path })
+            .await?
+        {
+            ControlResponse::GetFileReadPlan(plan) => Ok(plan),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn get_file_read_plan_by_id(&self, file_id: u64) -> Result<FileReadPlan> {
+        match self
+            .request(ControlRequest::GetFileReadPlanById { file_id })
+            .await?
+        {
+            ControlResponse::GetFileReadPlanById(plan) => Ok(plan),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
         }
     }
 
     pub async fn begin_append(&self, request: BeginAppendRequest) -> Result<AppendLease> {
         match self.request(ControlRequest::BeginAppend(request)).await? {
             ControlResponse::BeginAppend(lease) => Ok(lease),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
         }
     }
 
-    pub async fn plan_chunks(
-        &self,
-        lease_id: u64,
-        chunks: Vec<ChunkPlanInput>,
-    ) -> Result<ChunkPlans> {
-        match self
-            .request(ControlRequest::PlanChunks { lease_id, chunks })
-            .await?
-        {
-            ControlResponse::PlanChunks(plans) => Ok(plans),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
-        }
-    }
-
-    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileManifest> {
+    pub async fn commit_append(&self, request: CommitAppendRequest) -> Result<FileReadPlan> {
         match self.request(ControlRequest::CommitAppend(request)).await? {
-            ControlResponse::CommitAppend(file_manifest) => Ok(file_manifest),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
+            ControlResponse::CommitAppend(plan) => Ok(plan),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
         }
     }
 
@@ -178,70 +155,66 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::AbortAppend => Ok(()),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
         }
     }
 
-    pub async fn list_file_events(&self, after_event_id: u64, limit: u32) -> Result<FileEvents> {
+    pub async fn get_file_change_logs(
+        &self,
+        after_event_id: u64,
+        limit: u32,
+    ) -> Result<FileChangeLogs> {
         match self
-            .request(ControlRequest::ListFileEvents {
+            .request(ControlRequest::GetFileChangeLogs {
                 after_event_id,
                 limit,
             })
             .await?
         {
-            ControlResponse::ListFileEvents(events) => Ok(events),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
-        }
-    }
-
-    pub async fn get_file_manifest(&self, path: String) -> Result<FileManifest> {
-        match self
-            .request(ControlRequest::GetFileManifest { path })
-            .await?
-        {
-            ControlResponse::GetFileManifest(manifest) => Ok(manifest),
-            ControlResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedControlResponse(response)),
+            ControlResponse::GetFileChangeLogs(logs) => Ok(logs),
+            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
         }
     }
 
     pub async fn ping_storage_peer(&self, peer: &StoragePeerInfo) -> Result<()> {
-        Ok(ping_data_peer(&self.endpoint, &peer.data_endpoint).await?)
+        ping_data_peer(&self.endpoint, &peer.iroh_endpoint)
+            .await
+            .map_err(transport_error)
     }
 
     pub async fn storage_has_chunk(
         &self,
         target: &UploadTarget,
-        chunk_id: ChunkId,
+        chunk_id: HashId,
     ) -> Result<Option<(u64, u64)>> {
         match data_rpc(
             &self.endpoint,
-            &target.data_endpoint,
+            &target.iroh_endpoint,
             DataRequest::HasChunk {
                 volume_id: target.volume_id,
                 chunk_id,
             },
         )
-        .await?
+        .await
+        .map_err(transport_error)?
         {
-            DataResponse::ChunkPresence {
+            DataResponse::HasChunk {
                 exists: true,
                 raw_len: Some(raw_len),
                 compressed_len: Some(compressed_len),
             } => Ok(Some((raw_len, compressed_len))),
-            DataResponse::ChunkPresence { exists: false, .. } => Ok(None),
-            DataResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedDataResponse(response)),
+            DataResponse::HasChunk { exists: false, .. } => Ok(None),
+            DataResponse::Error(err) => Err(err),
+            response => unexpected_data_response(response),
         }
     }
 
     pub async fn upload_chunk_if_missing(
         &self,
         target: &UploadTarget,
-        chunk_id: ChunkId,
+        chunk_id: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<bool> {
@@ -251,7 +224,7 @@ impl Fs0Client {
 
         match data_rpc(
             &self.endpoint,
-            &target.data_endpoint,
+            &target.iroh_endpoint,
             DataRequest::UploadChunk {
                 volume_id: target.volume_id,
                 chunk_id,
@@ -259,11 +232,12 @@ impl Fs0Client {
                 compressed_bytes,
             },
         )
-        .await?
+        .await
+        .map_err(transport_error)?
         {
-            DataResponse::ChunkStored { .. } => Ok(true),
-            DataResponse::Error(err) => Err(ClientError::Protocol(err)),
-            response => Err(ClientError::UnexpectedDataResponse(response)),
+            DataResponse::UploadChunk { .. } => Ok(true),
+            DataResponse::Error(err) => Err(err),
+            response => unexpected_data_response(response),
         }
     }
 
@@ -287,7 +261,11 @@ impl Fs0Client {
         }
 
         let concurrency = concurrency.max(1);
-        let connection = Arc::new(connect_data(&self.endpoint, &target.data_endpoint).await?);
+        let connection = Arc::new(
+            connect_data(&self.endpoint, &target.iroh_endpoint)
+                .await
+                .map_err(transport_error)?,
+        );
         let mut chunk_iter = chunks.into_iter().enumerate();
         let mut upload_tasks = tokio::task::JoinSet::new();
         let mut results = Vec::new();
@@ -318,7 +296,7 @@ impl Fs0Client {
                 Some(Err(err)) => {
                     upload_tasks.abort_all();
                     connection.close(0u32.into(), b"fs0 upload task failed");
-                    return Err(ClientError::UploadTask(err.to_string()));
+                    return Err(internal_error(err.to_string()));
                 }
                 None => break,
             }
@@ -333,9 +311,9 @@ impl Fs0Client {
     }
 
     pub async fn ping_first_storage_peer(&self) -> Result<StoragePeerInfo> {
-        let mut peers = self.storage_peers().await?;
+        let mut peers = self.storage_peers();
         if peers.is_empty() {
-            return Err(ClientError::NoStoragePeers);
+            return Err(Fs0Error::NotFound);
         }
         let peer = peers.remove(0);
         self.ping_storage_peer(&peer).await?;
@@ -343,7 +321,9 @@ impl Fs0Client {
     }
 
     async fn request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        Ok(control_rpc(&self.control, request).await?)
+        control_rpc(&self.control, request)
+            .await
+            .map_err(transport_error)
     }
 }
 
@@ -360,9 +340,10 @@ async fn upload_chunk_if_missing_on_connection(
             chunk_id: chunk.chunk_id,
         },
     )
-    .await?
+    .await
+    .map_err(transport_error)?
     {
-        DataResponse::ChunkPresence { exists: true, .. } => {
+        DataResponse::HasChunk { exists: true, .. } => {
             return Ok((
                 index,
                 ChunkUploadResult {
@@ -371,9 +352,9 @@ async fn upload_chunk_if_missing_on_connection(
                 },
             ));
         }
-        DataResponse::ChunkPresence { exists: false, .. } => {}
-        DataResponse::Error(err) => return Err(ClientError::Protocol(err)),
-        response => return Err(ClientError::UnexpectedDataResponse(response)),
+        DataResponse::HasChunk { exists: false, .. } => {}
+        DataResponse::Error(err) => return Err(err),
+        response => return unexpected_data_response(response),
     }
 
     match data_rpc_on_connection(
@@ -385,16 +366,37 @@ async fn upload_chunk_if_missing_on_connection(
             compressed_bytes: chunk.compressed_bytes,
         },
     )
-    .await?
+    .await
+    .map_err(transport_error)?
     {
-        DataResponse::ChunkStored { .. } => Ok((
+        DataResponse::UploadChunk { .. } => Ok((
             index,
             ChunkUploadResult {
                 chunk_id: chunk.chunk_id,
                 uploaded: true,
             },
         )),
-        DataResponse::Error(err) => Err(ClientError::Protocol(err)),
-        response => Err(ClientError::UnexpectedDataResponse(response)),
+        DataResponse::Error(err) => Err(err),
+        response => unexpected_data_response(response),
     }
+}
+
+fn unexpected_control_response<T>(response: ControlResponse) -> Result<T> {
+    Err(Fs0Error::InvalidFrame {
+        message: format!("unexpected control response: {response:?}"),
+    })
+}
+
+fn unexpected_data_response<T>(response: DataResponse) -> Result<T> {
+    Err(Fs0Error::InvalidFrame {
+        message: format!("unexpected data response: {response:?}"),
+    })
+}
+
+fn transport_error(err: fs0_transport::TransportError) -> Fs0Error {
+    internal_error(err.to_string())
+}
+
+fn internal_error(message: String) -> Fs0Error {
+    Fs0Error::Internal { message }
 }

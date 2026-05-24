@@ -2,6 +2,7 @@
 members = [
     "crates/fs0-central",
     "crates/fs0-cli",
+    "crates/fs0-config",
     "crates/fs0-client",
     "crates/fs0-core",
     "crates/fs0-fuse",
@@ -22,6 +23,7 @@ blake3 = "1.8.2"
 bytes = "1.11.0"
 clap = { version = "4.5.53", features = ["derive"] }
 fs0-central = { version = "0.1.0", path = "crates/fs0-central" }
+fs0-config = { version = "0.1.0", path = "crates/fs0-config" }
 fs0-core = { version = "0.1.0", path = "crates/fs0-core" }
 fs0-storage = { version = "0.1.0", path = "crates/fs0-storage" }
 fs0-transport = { version = "0.1.0", path = "crates/fs0-transport" }

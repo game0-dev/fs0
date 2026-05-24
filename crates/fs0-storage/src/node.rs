@@ -1,22 +1,22 @@
+use crate::Result;
 use crate::config::StorageConfig;
-use crate::error::{Result, StorageError};
 use fs0_core::{
-    BundleReplicaEvent, BundleReplicaReport, ControlRequest, ControlResponse, DataRequest,
-    DataResponse, Fs0Error, HashId, RegisterStorageRequest, SessionMessage, StorageVolumeInfo,
-    blake3_hash,
+    BundleChunkRef, BundleReplicaEvent, BundleReplicaReport, ControlRequest, ControlResponse,
+    DataRequest, DataResponse, Fs0Error, HashId, RegisterStorageRequest, SessionMessage,
+    StorageVolumeInfo, blake3_hash,
 };
 use fs0_transport::{
     bind_endpoint, connect_control, control_rpc, encode_endpoint_addr, read_frame, write_frame,
 };
-use fs0_volume::{ChunkMeta, Volume, VolumeMeta};
+use fs0_volume::{BundleMeta, ChunkMeta, Volume, VolumeMeta, VolumeOptions};
 use iroh::{
     Endpoint,
     endpoint::{Connection, RecvStream, SendStream},
 };
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct StorageNode {
 
 #[derive(Debug, Clone)]
 pub struct VolumeHandle {
-    volume: Volume,
+    volume: Arc<Volume>,
 }
 
 #[derive(Debug)]
@@ -48,20 +48,36 @@ impl StorageNode {
 
         for volume_config in &config.volumes {
             if !seen.insert(volume_config.volume_id) {
-                return Err(StorageError::DuplicateVolumeId(volume_config.volume_id));
-            }
-
-            let volume = Volume::open(&volume_config.path)?;
-            let meta = volume.meta();
-            if meta.volume_id != volume_config.volume_id {
-                return Err(StorageError::VolumeIdMismatch {
-                    path: volume_config.path.clone(),
-                    configured: volume_config.volume_id,
-                    actual: meta.volume_id,
+                return Err(Fs0Error::InvalidConfig {
+                    message: format!("duplicate volume id {}", volume_config.volume_id),
                 });
             }
 
-            volumes.insert(volume_config.volume_id, VolumeHandle { volume });
+            let volume = Volume::open_with_options(
+                &volume_config.path,
+                VolumeOptions {
+                    read_concurrency: config.volume_io.read_concurrency,
+                    write_concurrency: config.volume_io.write_concurrency,
+                },
+            )?;
+            let meta = volume.meta();
+            if meta.volume_id != volume_config.volume_id {
+                return Err(Fs0Error::InvalidConfig {
+                    message: format!(
+                        "configured volume id {} does not match volume metadata id {}: {}",
+                        volume_config.volume_id,
+                        meta.volume_id,
+                        volume_config.path.display()
+                    ),
+                });
+            }
+
+            volumes.insert(
+                volume_config.volume_id,
+                VolumeHandle {
+                    volume: Arc::new(volume),
+                },
+            );
         }
 
         Ok(Self {
@@ -71,7 +87,7 @@ impl StorageNode {
     }
 
     pub fn open_config(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(StorageConfig::load_from(path)?)
+        Self::open(fs0_config::Fs0Config::load_from(path)?.storage()?)
     }
 
     #[must_use]
@@ -93,7 +109,7 @@ impl StorageNode {
         self.volumes
             .get(&volume_id)
             .cloned()
-            .ok_or(StorageError::UnknownVolume(volume_id))
+            .ok_or(Fs0Error::UnknownVolume)
     }
 
     pub async fn put_chunk(
@@ -119,9 +135,68 @@ impl StorageNode {
     pub async fn has_chunk(&self, volume_id: u64, chunk_id: HashId) -> Result<Option<ChunkMeta>> {
         match self.volume(volume_id)?.chunk_meta(chunk_id).await {
             Ok(meta) => Ok(Some(meta)),
-            Err(StorageError::Volume(Fs0Error::ChunkNotFound { .. })) => Ok(None),
+            Err(Fs0Error::ChunkNotFound { .. }) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    pub async fn commit_bundle(
+        &self,
+        volume_id: u64,
+        bundle_id: HashId,
+        chunks: Vec<BundleChunkRef>,
+    ) -> Result<BundleMeta> {
+        self.volume(volume_id)?
+            .commit_bundle(bundle_id, chunks)
+            .await
+    }
+
+    pub async fn list_bundle_chunks(
+        &self,
+        volume_id: u64,
+        bundle_id: HashId,
+    ) -> Result<Vec<BundleChunkRef>> {
+        self.volume(volume_id)?.list_bundle_chunks(bundle_id).await
+    }
+
+    pub async fn bundle_meta(
+        &self,
+        volume_id: u64,
+        bundle_id: HashId,
+    ) -> Result<Option<(u64, u64)>> {
+        let chunks = match self.list_bundle_chunks(volume_id, bundle_id).await {
+            Ok(chunks) => chunks,
+            Err(Fs0Error::BundleNotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let mut raw_len = 0u64;
+        let mut compressed_len = 0u64;
+        for chunk in chunks {
+            let meta = self.chunk_meta(volume_id, chunk.chunk_id).await?;
+            raw_len =
+                raw_len
+                    .checked_add(meta.raw_len)
+                    .ok_or_else(|| Fs0Error::IntegerConversion {
+                        message: "bundle raw_len overflow".to_owned(),
+                    })?;
+            compressed_len = compressed_len
+                .checked_add(meta.compressed_len)
+                .ok_or_else(|| Fs0Error::IntegerConversion {
+                    message: "bundle compressed_len overflow".to_owned(),
+                })?;
+        }
+
+        Ok(Some((raw_len, compressed_len)))
+    }
+
+    pub async fn read_bundle(&self, volume_id: u64, bundle_id: HashId) -> Result<Vec<u8>> {
+        let chunks = self.list_bundle_chunks(volume_id, bundle_id).await?;
+        let mut bytes = Vec::new();
+        for chunk in chunks {
+            bytes.extend(self.read_chunk(volume_id, chunk.chunk_id).await?);
+        }
+        Ok(bytes)
     }
 
     pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
@@ -149,16 +224,16 @@ impl StorageNode {
     }
 
     pub async fn ack_pending_central_events(&self, events: &[BundleReplicaEvent]) -> Result<()> {
-        let mut by_volume: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut by_volume: HashMap<u64, u64> = HashMap::new();
         for event in events {
             by_volume
                 .entry(event.volume_id)
-                .or_default()
-                .push(event.event_id);
+                .and_modify(|max_event_id| *max_event_id = (*max_event_id).max(event.event_id))
+                .or_insert(event.event_id);
         }
-        for (volume_id, event_ids) in by_volume {
+        for (volume_id, max_event_id) in by_volume {
             self.volume(volume_id)?
-                .ack_pending_central_events(&event_ids)
+                .ack_pending_central_events(max_event_id)
                 .await?;
         }
         Ok(())
@@ -169,16 +244,16 @@ impl StorageNode {
         events: &[BundleReplicaEvent],
         failed_at_ms: u64,
     ) -> Result<()> {
-        let mut by_volume: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut by_volume: HashMap<u64, u64> = HashMap::new();
         for event in events {
             by_volume
                 .entry(event.volume_id)
-                .or_default()
-                .push(event.event_id);
+                .and_modify(|max_event_id| *max_event_id = (*max_event_id).max(event.event_id))
+                .or_insert(event.event_id);
         }
-        for (volume_id, event_ids) in by_volume {
+        for (volume_id, max_event_id) in by_volume {
             self.volume(volume_id)?
-                .mark_pending_central_events_failed(&event_ids, failed_at_ms)
+                .mark_pending_central_events_failed(max_event_id, failed_at_ms)
                 .await?;
         }
         Ok(())
@@ -193,21 +268,20 @@ impl StorageDaemon {
             node.config.p2p_relay.quic_port,
             vec![fs0_core::DATA_ALPN.to_vec()],
         )
-        .await?;
-        let data_endpoint = encode_endpoint_addr(&endpoint)?;
-        let control = connect_control(&endpoint, &node.config.central_endpoint).await?;
+        .await
+        .map_err(transport_error)?;
+        let data_endpoint = encode_endpoint_addr(&endpoint).map_err(transport_error)?;
+        let control = connect_control(&endpoint, &node.config.central_endpoint)
+            .await
+            .map_err(transport_error)?;
         let (session_send, response) = register_storage(&control, &node, data_endpoint).await?;
         let storage_id = match response {
             SessionMessage::StorageRegistered { storage_id, .. } => storage_id,
-            SessionMessage::Error(err) => {
-                return Err(StorageError::UnexpectedControlResponse(
-                    ControlResponse::Error(err),
-                ));
-            }
-            _response => {
-                return Err(StorageError::UnexpectedControlResponse(
-                    ControlResponse::Error(Fs0Error::InvalidRequest),
-                ));
+            SessionMessage::Error(err) => return Err(err),
+            response => {
+                return Err(Fs0Error::InvalidFrame {
+                    message: format!("unexpected storage registration response: {response:?}"),
+                });
             }
         };
 
@@ -226,7 +300,7 @@ impl StorageDaemon {
     }
 
     pub async fn start_config(path: impl AsRef<Path>) -> Result<Self> {
-        Self::start(StorageConfig::load_from(path)?).await
+        Self::start(fs0_config::Fs0Config::load_from(path)?.storage()?).await
     }
 
     #[must_use]
@@ -244,10 +318,13 @@ impl StorageDaemon {
         &self.endpoint
     }
 
+    #[must_use]
+    pub fn control_connection(&self) -> &Connection {
+        &self.control
+    }
+
     pub async fn ping_central(&self) -> Result<()> {
-        Err(StorageError::UnexpectedControlResponse(
-            ControlResponse::Error(Fs0Error::Unsupported),
-        ))
+        Err(Fs0Error::Unsupported)
     }
 }
 
@@ -269,41 +346,47 @@ impl VolumeHandle {
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Result<ChunkMeta> {
-        Ok(self
-            .volume
+        self.volume
             .put_chunk(chunk_id, raw_len, compressed_bytes)
-            .await?)
+            .await
     }
 
     pub async fn read_chunk(&self, chunk_id: HashId) -> Result<Vec<u8>> {
-        Ok(self.volume.read_chunk(chunk_id).await?)
+        self.volume.read_chunk(chunk_id).await
     }
 
     pub async fn chunk_meta(&self, chunk_id: HashId) -> Result<ChunkMeta> {
-        Ok(self.volume.chunk_meta(chunk_id).await?)
+        self.volume.chunk_meta(chunk_id).await
+    }
+
+    pub async fn commit_bundle(
+        &self,
+        bundle_id: HashId,
+        chunks: Vec<BundleChunkRef>,
+    ) -> Result<BundleMeta> {
+        self.volume.commit_bundle(bundle_id, chunks).await
+    }
+
+    pub async fn list_bundle_chunks(&self, bundle_id: HashId) -> Result<Vec<BundleChunkRef>> {
+        self.volume.list_bundle_chunks(bundle_id).await
     }
 
     pub async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
-        Ok(self.volume.pending_central_events(limit).await?)
+        self.volume.pending_central_events(limit).await
     }
 
-    pub async fn ack_pending_central_events(&self, event_ids: &[u64]) -> Result<()> {
-        Ok(self.volume.ack_pending_central_events(event_ids).await?)
+    pub async fn ack_pending_central_events(&self, max_event_id: u64) -> Result<()> {
+        self.volume.ack_pending_central_events(max_event_id).await
     }
 
     pub async fn mark_pending_central_events_failed(
         &self,
-        event_ids: &[u64],
+        max_event_id: u64,
         failed_at_ms: u64,
     ) -> Result<()> {
-        Ok(self
-            .volume
-            .mark_pending_central_events_failed(event_ids, failed_at_ms)
-            .await?)
-    }
-
-    pub async fn delete_chunk(&self, chunk_id: HashId) -> Result<()> {
-        Ok(self.volume.delete_chunk(chunk_id).await?)
+        self.volume
+            .mark_pending_central_events_failed(max_event_id, failed_at_ms)
+            .await
     }
 }
 
@@ -329,11 +412,14 @@ async fn register_storage(
             iroh_endpoint: data_endpoint,
         },
     };
-    let (mut send, mut recv) = control.open_bi().await.map_err(|err| {
-        StorageError::Transport(fs0_transport::TransportError::Iroh(err.to_string()))
-    })?;
-    write_frame(&mut send, &request).await?;
-    let response = read_frame(&mut recv).await?;
+    let (mut send, mut recv) = control
+        .open_bi()
+        .await
+        .map_err(|err| transport_error(fs0_transport::TransportError::Iroh(err.to_string())))?;
+    write_frame(&mut send, &request)
+        .await
+        .map_err(transport_error)?;
+    let response = read_frame(&mut recv).await.map_err(transport_error)?;
     Ok((send, response))
 }
 
@@ -378,7 +464,7 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
                 raw_len: None,
                 compressed_len: None,
             },
-            Err(err) => DataResponse::Error(storage_error_to_protocol_error(&err)),
+            Err(err) => DataResponse::Error(err),
         },
         DataRequest::UploadChunk {
             volume_id,
@@ -399,7 +485,7 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
                         raw_len,
                         compressed_len,
                     },
-                    Err(err) => DataResponse::Error(storage_error_to_protocol_error(&err)),
+                    Err(err) => DataResponse::Error(err),
                 }
             }
         }
@@ -410,30 +496,55 @@ async fn handle_data_stream(node: StorageNode, mut send: SendStream, mut recv: R
             Ok(bytes) => DataResponse::DownloadChunk {
                 compressed_bytes: bytes,
             },
-            Err(err) => DataResponse::Error(storage_error_to_protocol_error(&err)),
+            Err(err) => DataResponse::Error(err),
         },
-        DataRequest::HasBundle { .. }
-        | DataRequest::CommitBundle { .. }
-        | DataRequest::DownloadBundle { .. }
-        | DataRequest::ListBundleChunks { .. } => DataResponse::Error(Fs0Error::Unsupported),
+        DataRequest::HasBundle {
+            volume_id,
+            bundle_id,
+        } => match node.bundle_meta(volume_id, bundle_id).await {
+            Ok(Some((raw_len, compressed_len))) => DataResponse::HasBundle {
+                exists: true,
+                raw_len: Some(raw_len),
+                compressed_len: Some(compressed_len),
+            },
+            Ok(None) => DataResponse::HasBundle {
+                exists: false,
+                raw_len: None,
+                compressed_len: None,
+            },
+            Err(err) => DataResponse::Error(err),
+        },
+        DataRequest::CommitBundle {
+            volume_id,
+            bundle_id,
+            chunks,
+        } => match node.commit_bundle(volume_id, bundle_id, chunks).await {
+            Ok(bundle) => DataResponse::CommitBundle {
+                bundle_id,
+                raw_len: bundle.raw_len,
+                compressed_len: bundle.compressed_len,
+            },
+            Err(err) => DataResponse::Error(err),
+        },
+        DataRequest::DownloadBundle {
+            volume_id,
+            bundle_id,
+        } => match node.read_bundle(volume_id, bundle_id).await {
+            Ok(bytes) => DataResponse::DownloadBundle {
+                compressed_bytes: bytes,
+            },
+            Err(err) => DataResponse::Error(err),
+        },
+        DataRequest::ListBundleChunks {
+            volume_id,
+            bundle_id,
+        } => match node.list_bundle_chunks(volume_id, bundle_id).await {
+            Ok(chunks) => DataResponse::ListBundleChunks { chunks },
+            Err(err) => DataResponse::Error(err),
+        },
     };
     let _ = write_frame(&mut send, &response).await;
     let _ = send.finish();
-}
-
-fn storage_error_to_protocol_error(err: &StorageError) -> Fs0Error {
-    match err {
-        StorageError::UnknownVolume(_) => Fs0Error::UnknownVolume,
-        StorageError::Volume(err) => err.clone(),
-        StorageError::DuplicateVolumeId(_)
-        | StorageError::UnexpectedControlResponse(_)
-        | StorageError::VolumeIdMismatch { .. }
-        | StorageError::Io(_)
-        | StorageError::TomlDecode(_)
-        | StorageError::Transport(_) => Fs0Error::Internal {
-            message: err.to_string(),
-        },
-    }
 }
 
 fn spawn_central_event_sync(node: StorageNode, control: Connection) -> JoinHandle<()> {
@@ -462,6 +573,12 @@ fn spawn_central_event_sync(node: StorageNode, control: Connection) -> JoinHandl
             }
         }
     })
+}
+
+fn transport_error(err: fs0_transport::TransportError) -> Fs0Error {
+    Fs0Error::Internal {
+        message: err.to_string(),
+    }
 }
 
 fn now_ms() -> u64 {
