@@ -121,12 +121,8 @@ impl Fs0Client {
         relay_url: &str,
         relay_quic_port: u16,
     ) -> Result<Self> {
-        let endpoint = bind_endpoint(relay_url, relay_quic_port, Vec::new())
-            .await
-            .map_err(transport_error)?;
-        let control = connect_control(&endpoint, central_endpoint)
-            .await
-            .map_err(transport_error)?;
+        let endpoint = bind_endpoint(relay_url, relay_quic_port, Vec::new()).await?;
+        let control = connect_control(&endpoint, central_endpoint).await?;
         let (mut session_send, mut session_recv) = control
             .open_bi()
             .await
@@ -137,11 +133,8 @@ impl Fs0Client {
                 name: options.name.clone(),
             },
         )
-        .await
-        .map_err(transport_error)?;
-        let response = read_frame(&mut session_recv)
-            .await
-            .map_err(transport_error)?;
+        .await?;
+        let response = read_frame(&mut session_recv).await?;
         let (client_id, storages) = match response {
             SessionMessage::ClientRegistered {
                 client_id,
@@ -439,9 +432,7 @@ impl Fs0Client {
     }
 
     pub async fn ping_storage_peer(&self, peer: &StoragePeerInfo) -> Result<()> {
-        ping_data_peer(&self.endpoint, &peer.iroh_endpoint)
-            .await
-            .map_err(transport_error)
+        ping_data_peer(&self.endpoint, &peer.iroh_endpoint).await
     }
 
     pub async fn storage_has_chunk(
@@ -457,8 +448,7 @@ impl Fs0Client {
                 chunk_id,
             },
         )
-        .await
-        .map_err(transport_error)?
+        .await?
         {
             DataResponse::HasChunk {
                 exists: true,
@@ -492,8 +482,7 @@ impl Fs0Client {
                 compressed_bytes,
             },
         )
-        .await
-        .map_err(transport_error)?
+        .await?
         {
             DataResponse::UploadChunk { .. } => Ok(true),
             DataResponse::Error(err) => Err(err),
@@ -525,11 +514,7 @@ impl Fs0Client {
         }
 
         let concurrency = concurrency.max(1);
-        let connection = Arc::new(
-            connect_data(&self.endpoint, &target.iroh_endpoint)
-                .await
-                .map_err(transport_error)?,
-        );
+        let connection = Arc::new(connect_data(&self.endpoint, &target.iroh_endpoint).await?);
         let mut chunk_iter = chunks.into_iter().enumerate();
         let mut upload_tasks = tokio::task::JoinSet::new();
         let mut results = Vec::new();
@@ -718,8 +703,7 @@ impl Fs0Client {
                 chunks,
             },
         )
-        .await
-        .map_err(transport_error)?
+        .await?
         {
             DataResponse::CommitBundle {
                 raw_len,
@@ -749,8 +733,7 @@ impl Fs0Client {
                 bundle_id,
             },
         )
-        .await
-        .map_err(transport_error)?
+        .await?
         {
             DataResponse::ListBundleChunks { chunks } => Ok(chunks),
             DataResponse::Error(err) => Err(err),
@@ -767,8 +750,7 @@ impl Fs0Client {
                 chunk_id,
             },
         )
-        .await
-        .map_err(transport_error)?
+        .await?
         {
             DataResponse::DownloadChunk { compressed_bytes } => Ok(compressed_bytes),
             DataResponse::Error(err) => Err(err),
@@ -810,9 +792,7 @@ impl Fs0Client {
     }
 
     async fn request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        control_rpc(&self.control, request)
-            .await
-            .map_err(transport_error)
+        control_rpc(&self.control, request).await
     }
 }
 
@@ -829,8 +809,7 @@ async fn upload_chunk_if_missing_on_connection(
             chunk_id: chunk.chunk_id,
         },
     )
-    .await
-    .map_err(transport_error)?
+    .await?
     {
         DataResponse::HasChunk { exists: true, .. } => {
             return Ok((
@@ -855,8 +834,7 @@ async fn upload_chunk_if_missing_on_connection(
             compressed_bytes: chunk.compressed_bytes,
         },
     )
-    .await
-    .map_err(transport_error)?
+    .await?
     {
         DataResponse::UploadChunk { .. } => Ok((
             index,
@@ -880,10 +858,6 @@ fn unexpected_data_response<T>(response: DataResponse) -> Result<T> {
     Err(Fs0Error::InvalidFrame {
         message: format!("unexpected data response: {response:?}"),
     })
-}
-
-fn transport_error(err: fs0_transport::TransportError) -> Fs0Error {
-    internal_error(err.to_string())
 }
 
 fn internal_error(message: String) -> Fs0Error {

@@ -1081,7 +1081,6 @@ dependencies = [
  "iroh-relay",
  "postcard",
  "serde",
- "thiserror",
  "tokio",
 ]
 

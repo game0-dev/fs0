@@ -47,18 +47,9 @@ impl StorageServer {
             config.p2p_relay.quic_port,
             vec![fs0_core::DATA_ALPN.to_vec()],
         )
-        .await
-        .map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
-        let data_endpoint = encode_endpoint_addr(&endpoint).map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
-        let control = connect_control(&endpoint, &config.central_endpoint)
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?;
+        .await?;
+        let data_endpoint = encode_endpoint_addr(&endpoint)?;
+        let control = connect_control(&endpoint, &config.central_endpoint).await?;
         let (session_send, response) =
             register_storage(&control, &config, &volumes, data_endpoint).await?;
         let storage_id = match response {
@@ -395,16 +386,8 @@ async fn register_storage(
     let (mut send, mut recv) = control.open_bi().await.map_err(|err| Fs0Error::Internal {
         message: err.to_string(),
     })?;
-    write_frame(&mut send, &request)
-        .await
-        .map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
-    let response = read_frame(&mut recv)
-        .await
-        .map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
+    write_frame(&mut send, &request).await?;
+    let response = read_frame(&mut recv).await?;
     Ok((send, response))
 }
 

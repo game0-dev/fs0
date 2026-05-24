@@ -46,14 +46,8 @@ impl CentralServer {
             config.p2p_relay.quic_port,
             vec![fs0_core::CONTROL_ALPN.to_vec()],
         )
-        .await
-        .map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
-        let control_endpoint =
-            encode_endpoint_addr(&endpoint).map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?;
+        .await?;
+        let control_endpoint = encode_endpoint_addr(&endpoint)?;
         let db = CentralDb::open(&config.db_path)?;
 
         let server = Arc::new(Self {
@@ -321,9 +315,7 @@ async fn handle_control_connection(
     let session_message = tokio::select! {
         _ = shutdown_notify.notified() => return Ok(()),
         message = read_frame::<SessionMessage, _>(&mut session_recv) => {
-            message.map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?
+            message?
         }
     };
     match session_message {
@@ -336,10 +328,7 @@ async fn handle_control_connection(
                     storages,
                 },
             )
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?;
+            .await?;
         }
         SessionMessage::RegisterStorage { request } => {
             let id = request.storage_id;
@@ -354,36 +343,22 @@ async fn handle_control_connection(
                             storages,
                         },
                     )
-                    .await
-                    .map_err(|err| Fs0Error::Internal {
-                        message: err.to_string(),
-                    })?;
+                    .await?;
                 }
                 Err(err) => {
-                    write_frame(&mut session_send, &SessionMessage::Error(err))
-                        .await
-                        .map_err(|err| Fs0Error::Internal {
-                            message: err.to_string(),
-                        })?;
+                    write_frame(&mut session_send, &SessionMessage::Error(err)).await?;
                 }
             }
         }
         SessionMessage::Ping => {
-            write_frame(&mut session_send, &SessionMessage::Pong)
-                .await
-                .map_err(|err| Fs0Error::Internal {
-                    message: err.to_string(),
-                })?;
+            write_frame(&mut session_send, &SessionMessage::Pong).await?;
         }
         _ => {
             write_frame(
                 &mut session_send,
                 &SessionMessage::Error(fs0_core::Fs0Error::InvalidRequest),
             )
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?;
+            .await?;
             return Ok(());
         }
     }
@@ -394,11 +369,7 @@ async fn handle_control_connection(
             request = read_frame::<SessionMessage, _>(&mut session_recv) => {
                 match request {
                     Ok(SessionMessage::Ping) => {
-                        write_frame(&mut session_send, &SessionMessage::Pong)
-                            .await
-                            .map_err(|err| Fs0Error::Internal {
-                                message: err.to_string(),
-                            })?;
+                        write_frame(&mut session_send, &SessionMessage::Pong).await?;
                     }
                     Ok(_) => {}
                     Err(_) => break,

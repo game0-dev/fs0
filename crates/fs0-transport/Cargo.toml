@@ -11,5 +11,4 @@ iroh.workspace = true
 iroh-relay.workspace = true
 postcard.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

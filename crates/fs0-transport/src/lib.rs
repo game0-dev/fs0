@@ -1,5 +1,5 @@
 use fs0_core::{
-    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, Fs0Error, HashId,
+    ControlRequest, ControlResponse, DataRequest, DataResponse, FRAME_LEN_BYTES, Fs0Error,
     MAX_FRAME_BODY_LEN,
 };
 use iroh::{
@@ -10,31 +10,7 @@ use iroh_relay::RelayQuicConfig;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub type Result<T> = std::result::Result<T, TransportError>;
-
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    #[error("frame body length {actual} exceeds maximum {max}")]
-    FrameTooLarge { actual: usize, max: usize },
-
-    #[error("invalid frame: {0}")]
-    InvalidFrame(String),
-
-    #[error("io error")]
-    Io(#[from] std::io::Error),
-
-    #[error("postcard error")]
-    Postcard(#[from] postcard::Error),
-
-    #[error("protocol error: {0}")]
-    Protocol(#[from] Fs0Error),
-
-    #[error("iroh error: {0}")]
-    Iroh(String),
-
-    #[error("invalid relay url {url}: {message}")]
-    InvalidRelayUrl { url: String, message: String },
-}
+pub type Result<T> = std::result::Result<T, Fs0Error>;
 
 pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
 where
@@ -45,7 +21,7 @@ where
     reader.read_exact(&mut len).await?;
     let body_len = u32::from_le_bytes(len) as usize;
     if body_len > MAX_FRAME_BODY_LEN {
-        return Err(TransportError::FrameTooLarge {
+        return Err(Fs0Error::FrameTooLarge {
             actual: body_len,
             max: MAX_FRAME_BODY_LEN,
         });
@@ -63,7 +39,7 @@ where
 {
     let body = postcard::to_allocvec(value)?;
     if body.len() > MAX_FRAME_BODY_LEN {
-        return Err(TransportError::FrameTooLarge {
+        return Err(Fs0Error::FrameTooLarge {
             actual: body.len(),
             max: MAX_FRAME_BODY_LEN,
         });
@@ -73,22 +49,6 @@ where
     writer.write_all(&body).await?;
     writer.flush().await?;
     Ok(())
-}
-
-pub async fn bind_data_endpoint_accepting(
-    relay_url: &str,
-    relay_quic_port: u16,
-) -> Result<Endpoint> {
-    bind_endpoint(
-        relay_url,
-        relay_quic_port,
-        vec![fs0_core::DATA_ALPN.to_vec()],
-    )
-    .await
-}
-
-pub async fn bind_data_endpoint(relay_url: &str, relay_quic_port: u16) -> Result<Endpoint> {
-    bind_endpoint(relay_url, relay_quic_port, Vec::new()).await
 }
 
 pub async fn bind_endpoint(
@@ -101,7 +61,9 @@ pub async fn bind_endpoint(
         .alpns(alpns)
         .bind()
         .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))
+        .map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })
 }
 
 pub fn encode_endpoint_addr(endpoint: &Endpoint) -> Result<Vec<u8>> {
@@ -117,7 +79,9 @@ pub async fn connect_control(endpoint: &Endpoint, control_endpoint: &[u8]) -> Re
     endpoint
         .connect(addr, fs0_core::CONTROL_ALPN)
         .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))
+        .map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })
 }
 
 pub async fn connect_data(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<Connection> {
@@ -125,7 +89,9 @@ pub async fn connect_data(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<C
     endpoint
         .connect(addr, fs0_core::DATA_ALPN)
         .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))
+        .map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })
 }
 
 pub async fn control_rpc(
@@ -135,10 +101,13 @@ pub async fn control_rpc(
     let (mut send, mut recv) = connection
         .open_bi()
         .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+        .map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })?;
     write_frame(&mut send, &request).await?;
-    send.finish()
-        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    send.finish().map_err(|err| Fs0Error::Internal {
+        message: err.to_string(),
+    })?;
     read_frame(&mut recv).await
 }
 
@@ -160,56 +129,28 @@ pub async fn data_rpc_on_connection(
     let (mut send, mut recv) = connection
         .open_bi()
         .await
-        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+        .map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })?;
     write_frame(&mut send, &request).await?;
-    send.finish()
-        .map_err(|err| TransportError::Iroh(err.to_string()))?;
+    send.finish().map_err(|err| Fs0Error::Internal {
+        message: err.to_string(),
+    })?;
     read_frame(&mut recv).await
 }
 
-pub async fn has_data_chunk(
-    endpoint: &Endpoint,
-    data_endpoint: &[u8],
-    volume_id: u64,
-    chunk_id: HashId,
-) -> Result<Option<(u64, u64)>> {
-    match data_rpc(
-        endpoint,
-        data_endpoint,
-        DataRequest::HasChunk {
-            volume_id,
-            chunk_id,
-        },
-    )
-    .await?
-    {
-        DataResponse::HasChunk {
-            exists: true,
-            raw_len: Some(raw_len),
-            compressed_len: Some(compressed_len),
-        } => Ok(Some((raw_len, compressed_len))),
-        DataResponse::HasChunk { exists: false, .. } => Ok(None),
-        DataResponse::Error(err) => Err(err.into()),
-        response => Err(TransportError::InvalidFrame(format!(
-            "expected chunk presence, got {response:?}"
-        ))),
-    }
-}
-
 pub async fn ping_data_peer(endpoint: &Endpoint, data_endpoint: &[u8]) -> Result<()> {
-    let _ = (endpoint, data_endpoint);
-    Err(Fs0Error::Unsupported.into())
+    let conn = connect_data(endpoint, data_endpoint).await?;
+    conn.close(0u32.into(), b"fs0 data ping complete");
+    Ok(())
 }
 
 fn relay_mode(relay_url: &str, relay_quic_port: u16) -> Result<RelayMode> {
     let relay_url = relay_url
         .parse::<RelayUrl>()
-        .map_err(
-            |err: iroh::RelayUrlParseError| TransportError::InvalidRelayUrl {
-                url: relay_url.to_owned(),
-                message: err.to_string(),
-            },
-        )?;
+        .map_err(|err: iroh::RelayUrlParseError| Fs0Error::InvalidConfig {
+            message: format!("invalid relay url {relay_url}: {err}"),
+        })?;
     let relay = RelayConfig::new(relay_url, Some(RelayQuicConfig::new(relay_quic_port)));
     Ok(RelayMode::Custom(RelayMap::from(relay)))
 }
