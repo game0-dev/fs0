@@ -1004,6 +1004,14 @@ name = "fs0-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fs0-central",
+ "fs0-client",
+ "fs0-config",
+ "fs0-core",
+ "fs0-storage",
+ "fs0-volume",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
