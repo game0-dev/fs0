@@ -18,7 +18,7 @@ fn create_sparse_data_file(path: &Path) {
 
 async fn put(volume: &Volume, raw: &[u8]) -> (HashId, u64) {
     let compressed_bytes = zstd_compress(raw, DEFAULT_ZSTD_LEVEL).unwrap();
-    let chunk_id = blake3_hash(&compressed_bytes);
+    let chunk_id = blake3_hash(raw);
     let compressed_len = compressed_bytes.len() as u64;
     volume
         .put_chunk(chunk_id, raw.len() as u64, compressed_bytes)
@@ -52,7 +52,7 @@ async fn init_and_open_volume() {
 async fn constants_and_options_use_expected_sizes() {
     let max_bytes = 2 * DATA_FILE_SIZE;
 
-    assert_eq!(RAW_CHUNK_SIZE, 512 * 1024);
+    assert_eq!(RAW_CHUNK_SIZE, 1024 * 1024);
     assert_eq!(DATA_FILE_SIZE, 4 * 1024 * 1024 * 1024);
     assert_eq!(max_bytes, 2 * DATA_FILE_SIZE);
 }
@@ -104,7 +104,7 @@ async fn capacity_limit_is_enforced_without_metadata_update() {
     let temp = tempfile::tempdir().unwrap();
     let volume = Volume::init(temp.path(), 64).unwrap();
     let bytes = vec![1; 65];
-    let chunk_id = blake3_hash(&bytes);
+    let chunk_id = blake3_hash(&[1]);
 
     let result = volume.put_chunk(chunk_id, 1, bytes).await;
 
@@ -114,6 +114,29 @@ async fn capacity_limit_is_enforced_without_metadata_update() {
         volume.chunk_meta(chunk_id).await,
         Err(Fs0Error::ChunkNotFound { chunk_id: missing }) if missing == chunk_id
     ));
+}
+
+#[tokio::test]
+async fn same_raw_chunk_reuses_storage_across_compression_levels() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), 1024 * 1024);
+    let raw = b"same raw chunk across compression levels".repeat(4096);
+    let chunk_id = blake3_hash(&raw);
+    let fast = zstd_compress(&raw, 1).unwrap();
+    let dense = zstd_compress(&raw, 9).unwrap();
+
+    let first = volume
+        .put_chunk(chunk_id, raw.len() as u64, fast)
+        .await
+        .unwrap();
+    let offset = volume.meta().active_volume_offset;
+    let second = volume
+        .put_chunk(chunk_id, raw.len() as u64, dense)
+        .await
+        .unwrap();
+
+    assert_eq!(first.volume_offset, second.volume_offset);
+    assert_eq!(volume.meta().active_volume_offset, offset);
 }
 
 #[tokio::test]

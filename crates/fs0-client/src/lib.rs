@@ -5,7 +5,8 @@ use fs0_core::{
     CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse,
     DEFAULT_UPLOAD_CONCURRENCY, DEFAULT_ZSTD_LEVEL, DataRequest, DataResponse, DirectoryEntries,
     FileChangeLogs, FileReadPlan, Fs0Error, HashId, RAW_CHUNK_SIZE, SessionMessage,
-    StoragePeerInfo, UploadTarget, blake3_hash, zstd_compress, zstd_decompress,
+    StoragePeerInfo, UploadTarget, blake3_hash, bundle_hash_from_chunks, zstd_compress,
+    zstd_decompress,
 };
 use fs0_transport::{
     bind_endpoint, connect_control, connect_data, control_rpc, data_rpc, data_rpc_on_connection,
@@ -626,7 +627,6 @@ impl Fs0Client {
         let mut current_bundle_raw = 0u64;
         let mut current_chunks = Vec::new();
         let mut current_uploads = Vec::new();
-        let mut current_hasher = blake3::Hasher::new();
         let mut committed = Vec::new();
 
         loop {
@@ -636,9 +636,8 @@ impl Fs0Client {
             }
             let raw = &buffer[..read];
             let compressed = zstd_compress(raw, DEFAULT_ZSTD_LEVEL)?;
-            let chunk_id = blake3_hash(&compressed);
+            let chunk_id = blake3_hash(raw);
             let chunk_index = current_chunks.len() as u64;
-            current_hasher.update(&compressed);
             current_chunks.push(BundleChunkRef {
                 chunk_index,
                 chunk_id,
@@ -652,7 +651,7 @@ impl Fs0Client {
             });
 
             if current_bundle_raw >= BUNDLE_TARGET_RAW_BYTES {
-                let bundle_id = HashId(*current_hasher.finalize().as_bytes());
+                let bundle_id = bundle_hash_from_chunks(&current_chunks);
                 self.upload_chunks_if_missing(&target, std::mem::take(&mut current_uploads))
                     .await?;
                 let bundle = self
@@ -666,12 +665,11 @@ impl Fs0Client {
                 });
                 bundle_index += 1;
                 current_bundle_raw = 0;
-                current_hasher = blake3::Hasher::new();
             }
         }
 
         if !current_chunks.is_empty() {
-            let bundle_id = HashId(*current_hasher.finalize().as_bytes());
+            let bundle_id = bundle_hash_from_chunks(&current_chunks);
             self.upload_chunks_if_missing(&target, current_uploads)
                 .await?;
             let bundle = self

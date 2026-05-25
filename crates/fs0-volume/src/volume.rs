@@ -3,7 +3,7 @@ use crate::data_file_cache::DataFileCache;
 use crate::db::{InsertChunk, VolumeDb};
 use fs0_core::{
     BundleChunkRef, BundleReplicaEvent, DATA_FILE_SIZE, Fs0Error, HashId, VOLUME_FORMAT_VERSION,
-    VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY,
+    VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY, bundle_hash_from_chunks,
 };
 use parking_lot::{Mutex, MutexGuard};
 use std::fs;
@@ -160,9 +160,18 @@ impl Volume {
         let (insert, next_active_offset) = {
             let mut db = self.acquire_db_lock();
             match db.load_chunk(chunk_id)? {
-                Some(existing)
-                    if existing.raw_len == raw_len && existing.compressed_len == compressed_len =>
-                {
+                Some(existing) => {
+                    if existing.raw_len != raw_len {
+                        warn!(
+                            ?chunk_id,
+                            existing_raw_len = existing.raw_len,
+                            raw_len,
+                            "chunk id already exists with different raw length"
+                        );
+                        return Err(Fs0Error::HashMismatch {
+                            volume_offset: existing.volume_offset,
+                        });
+                    }
                     debug!(
                         ?chunk_id,
                         volume_offset = existing.volume_offset,
@@ -172,7 +181,7 @@ impl Volume {
                     );
                     return Ok(existing);
                 }
-                _ => {}
+                None => {}
             }
 
             let meta = db.meta();
@@ -285,9 +294,8 @@ impl Volume {
         info!(?bundle_id, chunk_count = chunks.len(), "committing bundle");
         validate_bundle_chunks(&chunks)?;
 
-        let chunk_metas = {
+        {
             let db = self.acquire_db_lock();
-            let mut metas = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
                 let meta = db
                     .load_chunk(chunk.chunk_id)?
@@ -302,26 +310,17 @@ impl Volume {
                     compressed_len = meta.compressed_len,
                     "bundle references chunk"
                 );
-                metas.push(meta);
             }
-            metas
         };
 
-        let mut hasher = blake3::Hasher::new();
-        for chunk in &chunk_metas {
-            let bytes = self
-                .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
-                .await?;
-            hasher.update(&bytes);
-        }
-        if HashId(*hasher.finalize().as_bytes()) != bundle_id {
+        if bundle_hash_from_chunks(&chunks) != bundle_id {
             warn!(
                 ?bundle_id,
                 chunk_count = chunks.len(),
                 "bundle hash mismatch while committing bundle"
             );
             return Err(Fs0Error::InvalidData {
-                message: "bundle id does not match committed chunk bytes".to_owned(),
+                message: "bundle id does not match committed chunk ids".to_owned(),
             });
         }
 
@@ -437,7 +436,7 @@ fn validate_options(max_bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_chunk(chunk_id: HashId, raw_len: u64, compressed_bytes: &[u8]) -> Result<()> {
+fn validate_chunk(_chunk_id: HashId, raw_len: u64, compressed_bytes: &[u8]) -> Result<()> {
     if raw_len == 0 {
         return Err(Fs0Error::InvalidData {
             message: "raw_len must be greater than zero".to_owned(),
@@ -454,12 +453,6 @@ fn validate_chunk(chunk_id: HashId, raw_len: u64, compressed_bytes: &[u8]) -> Re
             message: format!(
                 "compressed chunk length {compressed_len} exceeds data file size {DATA_FILE_SIZE}"
             ),
-        });
-    }
-    let actual_hash = fs0_core::blake3_hash(compressed_bytes);
-    if actual_hash != chunk_id {
-        return Err(Fs0Error::InvalidData {
-            message: "chunk id does not match compressed bytes".to_owned(),
         });
     }
     Ok(())

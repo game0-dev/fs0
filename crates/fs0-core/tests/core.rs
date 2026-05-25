@@ -5,8 +5,8 @@ use fs0_core::{
     DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
     FileChangeLogs, FileReadPlan, Fs0Error, HashId, MAX_FRAME_BODY_LEN, RegisterStorageRequest,
     ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo, UploadLease, blake3_hash,
-    decode_frame, decode_frame_body, encode_frame, encode_frame_body, zstd_compress,
-    zstd_decompress,
+    bundle_hash_from_chunks, decode_frame, decode_frame_body, encode_frame, encode_frame_body,
+    zstd_compress, zstd_decompress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,43 @@ fn blake3_hash_returns_hash_id() {
     let expected = *blake3::hash(b"hello fs0").as_bytes();
 
     assert_eq!(hash_id, HashId(expected));
+}
+
+#[test]
+fn bundle_hash_uses_ordered_chunk_ids() {
+    let chunks = vec![
+        BundleChunkRef {
+            chunk_index: 0,
+            chunk_id: blake3_hash(b"chunk-a"),
+        },
+        BundleChunkRef {
+            chunk_index: 1,
+            chunk_id: blake3_hash(b"chunk-b"),
+        },
+    ];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(chunks[0].chunk_id.as_bytes());
+    hasher.update(chunks[1].chunk_id.as_bytes());
+
+    assert_eq!(
+        bundle_hash_from_chunks(&chunks),
+        HashId(*hasher.finalize().as_bytes())
+    );
+
+    let reversed = vec![
+        BundleChunkRef {
+            chunk_index: 0,
+            chunk_id: chunks[1].chunk_id,
+        },
+        BundleChunkRef {
+            chunk_index: 1,
+            chunk_id: chunks[0].chunk_id,
+        },
+    ];
+    assert_ne!(
+        bundle_hash_from_chunks(&chunks),
+        bundle_hash_from_chunks(&reversed)
+    );
 }
 
 #[test]
