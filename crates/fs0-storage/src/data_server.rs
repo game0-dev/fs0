@@ -157,15 +157,6 @@ async fn handle_data_request(server: Arc<StorageServer>, request: DataRequest) -
             },
             Err(err) => DataResponse::Error(err),
         },
-        DataRequest::DownloadBundle {
-            volume_id,
-            bundle_id,
-        } => match server.read_bundle(volume_id, bundle_id).await {
-            Ok(bytes) => DataResponse::DownloadBundle {
-                compressed_bytes: bytes,
-            },
-            Err(err) => DataResponse::Error(err),
-        },
         DataRequest::ListBundleChunks {
             volume_id,
             bundle_id,

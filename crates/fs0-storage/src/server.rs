@@ -198,9 +198,13 @@ impl StorageServer {
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
     ) -> Result<BundleMeta> {
-        self.volume(volume_id)?
+        let bundle = self
+            .volume(volume_id)?
             .commit_bundle(bundle_id, chunks)
-            .await
+            .await?;
+        self.sync_pending_central_events_for_volume(volume_id)
+            .await?;
+        Ok(bundle)
     }
 
     pub(crate) async fn list_bundle_chunks(
@@ -240,15 +244,6 @@ impl StorageServer {
         }
 
         Ok(Some((raw_len, compressed_len)))
-    }
-
-    pub(crate) async fn read_bundle(&self, volume_id: u64, bundle_id: HashId) -> Result<Vec<u8>> {
-        let chunks = self.list_bundle_chunks(volume_id, bundle_id).await?;
-        let mut bytes = Vec::new();
-        for chunk in chunks {
-            bytes.extend(self.read_chunk(volume_id, chunk.chunk_id).await?);
-        }
-        Ok(bytes)
     }
 
     async fn pending_central_events(&self, limit: usize) -> Result<Vec<BundleReplicaEvent>> {
@@ -309,6 +304,49 @@ impl StorageServer {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn sync_pending_central_events_for_volume(&self, volume_id: u64) -> Result<()> {
+        loop {
+            let mut events = self.volume(volume_id)?.pending_central_events(128).await?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            events.sort_by_key(|event| event.event_id);
+            self.report_pending_central_events(events).await?;
+        }
+    }
+
+    async fn sync_next_pending_central_event_batch(&self) -> Result<()> {
+        let events = self.pending_central_events(128).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.report_pending_central_events(events).await
+    }
+
+    async fn report_pending_central_events(&self, events: Vec<BundleReplicaEvent>) -> Result<()> {
+        let request = ControlRequest::ReportBundleReplica(BundleReplicaReport {
+            events: events.clone(),
+        });
+        match control_rpc(&self.central_connection, request).await {
+            Ok(ControlResponse::ReportBundleReplica) => {
+                self.ack_pending_central_events(&events).await?;
+                Ok(())
+            }
+            Ok(response) => {
+                self.mark_pending_central_events_failed(&events, now_ms())
+                    .await?;
+                Err(Fs0Error::InvalidFrame {
+                    message: format!("unexpected report bundle replica response: {response:?}"),
+                })
+            }
+            Err(err) => {
+                self.mark_pending_central_events_failed(&events, now_ms())
+                    .await?;
+                Err(err)
+            }
+        }
     }
 }
 
@@ -408,25 +446,7 @@ fn spawn_central_event_sync(
             if server.is_exiting() {
                 break;
             }
-            let Ok(events) = server.pending_central_events(128).await else {
-                continue;
-            };
-            if events.is_empty() {
-                continue;
-            }
-            let request = ControlRequest::ReportBundleReplica(BundleReplicaReport {
-                events: events.clone(),
-            });
-            match control_rpc(&server.central_connection, request).await {
-                Ok(ControlResponse::ReportBundleReplica) => {
-                    let _ = server.ack_pending_central_events(&events).await;
-                }
-                Ok(_) | Err(_) => {
-                    let _ = server
-                        .mark_pending_central_events_failed(&events, now_ms())
-                        .await;
-                }
-            }
+            let _ = server.sync_next_pending_central_event_batch().await;
         }
     })
 }

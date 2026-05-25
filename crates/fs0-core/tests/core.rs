@@ -342,10 +342,6 @@ fn data_protocol_roundtrip() {
         bundle_id,
         chunks: vec![chunk.clone()],
     });
-    assert_postcard_roundtrip(&DataRequest::DownloadBundle {
-        volume_id: 4,
-        bundle_id,
-    });
     assert_postcard_roundtrip(&DataRequest::ListBundleChunks {
         volume_id: 4,
         bundle_id,
@@ -373,9 +369,6 @@ fn data_protocol_roundtrip() {
         bundle_id,
         raw_len: 12,
         compressed_len: 3,
-    });
-    assert_postcard_roundtrip(&DataResponse::DownloadBundle {
-        compressed_bytes: vec![1, 2, 3],
     });
     assert_postcard_roundtrip(&DataResponse::ListBundleChunks {
         chunks: vec![chunk],

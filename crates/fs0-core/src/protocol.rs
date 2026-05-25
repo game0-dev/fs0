@@ -130,10 +130,6 @@ pub enum DataRequest {
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
     },
-    DownloadBundle {
-        volume_id: u64,
-        bundle_id: HashId,
-    },
     ListBundleChunks {
         volume_id: u64,
         bundle_id: HashId,
@@ -164,9 +160,6 @@ pub enum DataResponse {
         bundle_id: HashId,
         raw_len: u64,
         compressed_len: u64,
-    },
-    DownloadBundle {
-        compressed_bytes: Vec<u8>,
     },
     ListBundleChunks {
         chunks: Vec<BundleChunkRef>,

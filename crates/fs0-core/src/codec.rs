@@ -2,7 +2,7 @@ use crate::Fs0Error;
 use serde::{Serialize, de::DeserializeOwned};
 
 pub const FRAME_LEN_BYTES: usize = 4;
-pub const MAX_FRAME_BODY_LEN: usize = 1024 * 1024;
+pub const MAX_FRAME_BODY_LEN: usize = 4 * 1024 * 1024;
 
 pub fn encode_frame<T: Serialize>(value: &T) -> std::result::Result<Vec<u8>, Fs0Error> {
     let body = postcard::to_allocvec(value)?;
