@@ -15,7 +15,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/imxinlei/fs0"
+repository = "https://github.com/studio-0/fs0"
 version = "0.1.0"
 
 [workspace.dependencies]
