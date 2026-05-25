@@ -106,11 +106,6 @@ enum VolumeCommand {
         #[arg(long)]
         central: Option<PathBuf>,
     },
-    Init {
-        path: PathBuf,
-        #[arg(long)]
-        max_bytes: String,
-    },
     Meta {
         path: PathBuf,
     },
@@ -311,11 +306,6 @@ async fn run() -> fs0_client::Result<()> {
                 client.shutdown().await?;
                 let meta = volume.assign_volume_id(volume_id)?;
                 print_volume_meta(meta);
-                Ok(())
-            }
-            VolumeCommand::Init { path, max_bytes } => {
-                let volume = fs0_volume::Volume::init(path, parse_bytes(&max_bytes)?)?;
-                print_volume_meta(volume.meta());
                 Ok(())
             }
             VolumeCommand::Meta { path } => {

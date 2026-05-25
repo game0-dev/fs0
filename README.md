@@ -17,6 +17,8 @@
 
 **fs0** is an experimental distributed storage system built around append-only file writes, chunked storage, compressed data blocks, and a small command-line interface.
 
+The current MVP is an append-only distributed file/object store. It is not a full POSIX filesystem yet. Future FUSE support will need a dedicated inode, directory, and attribute model before fs0 should be treated as a mounted filesystem.
+
 It provides:
 
 - a **central server** for metadata and coordination
@@ -40,7 +42,7 @@ fs0 is currently intended for development, experimentation, and storage-system r
 - BLAKE3 content hashing
 - Central metadata server
 - Storage node process
-- Local volume initialization and inspection
+- Local volume creation and inspection
 - Iroh-based transport layer
 - JSON output for scripting
 - Rust workspace with reusable crates
@@ -93,35 +95,44 @@ fs0 --help
 
 This section shows the basic local workflow.
 
-### 1. Start a central server
+### 1. Create a local config
 
-A sample central config is available at:
+Create `.local/fs0.local.toml`:
 
-```text
-configs/central.local.toml
+```toml
+[central]
+db_path = ".local/central.sqlite"
+replication_factor = 2
+
+[central.p2p_relay]
+port = 3340
+quic_port = 7824
+public_url = "http://127.0.0.1:3340"
 ```
 
 Run the central server:
 
 ```bash
-fs0 central run --config configs/central.local.toml
+fs0 central run --config .local/fs0.local.toml
 ```
 
 Or with Cargo:
 
 ```bash
-cargo run -p fs0-cli -- central run --config configs/central.local.toml
+cargo run -p fs0-cli -- central run --config .local/fs0.local.toml
 ```
 
 The server prints a central endpoint. Use that endpoint in your client and storage configuration.
 
 ---
 
-### 2. Initialize a local volume
+### 2. Create a central-backed local volume
 
 ```bash
 mkdir -p .local/volume-1
-fs0 volume init .local/volume-1 --max-bytes 10G
+fs0 --config .local/fs0.local.toml volume create .local/volume-1 \
+  --name local-volume-1 \
+  --max-bytes 10G
 ```
 
 Inspect the volume:
@@ -132,9 +143,9 @@ fs0 volume meta .local/volume-1
 
 ---
 
-### 3. Create a local config
+### 3. Fill client and storage config
 
-Create `.local/fs0.local.toml`:
+Add the endpoint printed by `fs0 central run`:
 
 ```toml
 [client]
@@ -151,8 +162,6 @@ storage_id = 1
 name = "local-storage-1"
 central_endpoint = []
 # Fill this with the endpoint printed by `fs0 central run`.
-
-cert = ".local/storage.local.cert"
 
 [storage.p2p_relay]
 port = 3340
@@ -411,7 +420,7 @@ fs0 central run --config <PATH>
 Example:
 
 ```bash
-fs0 central run --config configs/central.local.toml
+fs0 central run --config .local/fs0.local.toml
 ```
 
 ---
@@ -449,19 +458,19 @@ fs0 storage run --config .local/fs0.local.toml
 
 ---
 
-### `volume init`
+### `volume create`
 
-Initialize a local fs0 volume.
+Create a central-backed local fs0 volume.
 
 ```bash
-fs0 volume init <PATH> --max-bytes <SIZE>
+fs0 volume create <PATH> --name <NAME> --max-bytes <SIZE>
 ```
 
 Examples:
 
 ```bash
-fs0 volume init ./data/volume-1 --max-bytes 10G
-fs0 volume init ./data/volume-2 --max-bytes 500M
+fs0 --config .local/fs0.local.toml volume create ./data/volume-1 --name local-volume-1 --max-bytes 10G
+fs0 --config .local/fs0.local.toml volume create ./data/volume-2 --name local-volume-2 --max-bytes 500M
 ```
 
 Supported size suffixes:
@@ -498,10 +507,10 @@ fs0 volume meta ./data/volume-1
 cargo build --release -p fs0-cli
 
 # Start central
-target/release/fs0 central run --config configs/central.local.toml
+target/release/fs0 central run --config .local/fs0.local.toml
 
-# In another terminal, initialize a volume
-target/release/fs0 volume init .local/volume-1 --max-bytes 10G
+# In another terminal, create a central-backed volume
+target/release/fs0 --config .local/fs0.local.toml volume create .local/volume-1 --name local-volume-1 --max-bytes 10G
 
 # Run storage node after preparing config
 target/release/fs0 storage run --config .local/fs0.local.toml
