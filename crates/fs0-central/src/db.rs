@@ -171,34 +171,73 @@ impl CentralDb {
         if lease.base_size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict);
         }
-        if request.new_size < request.base_size {
-            return Err(Fs0Error::InvalidRequest);
-        }
-        Self::validate_committed_bundles(&request.bundles)?;
+        let appended_len = request
+            .new_size
+            .checked_sub(request.base_size)
+            .ok_or(Fs0Error::InvalidRequest)?;
 
         let file = Self::load_file_by_id_tx(&tx, lease.file_id)?.ok_or(Fs0Error::NotFound)?;
         if file.size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict);
         }
+        let next_bundle_index = tx.query_row(
+            "SELECT COALESCE(MAX(bundle_index) + 1, 0)
+             FROM file_bundles
+             WHERE file_id = ?1",
+            params![u64_to_i64(lease.file_id, "file_id")?],
+            |row| {
+                i64_to_u64(row.get(0)?, "next_bundle_index")
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+            },
+        )?;
+        Self::validate_committed_bundles(&request.bundles, appended_len, next_bundle_index)?;
         for bundle in &request.bundles {
-            let replica_count = tx.query_row(
-                "SELECT COUNT(*)
-                 FROM bundle_replicas
-                 WHERE bundle_id = ?1",
-                params![bundle.bundle_id.as_bytes().as_slice()],
-                |row| row.get::<_, i64>(0),
-            )?;
+            let (stored_raw_len, stored_compressed_len, replica_count) = tx
+                .query_row(
+                    "SELECT b.raw_len, b.compressed_len, COUNT(br.volume_id)
+                     FROM bundles b
+                     LEFT JOIN bundle_replicas br
+                       ON br.bundle_id = b.bundle_id
+                     WHERE b.bundle_id = ?1
+                     GROUP BY b.bundle_id, b.raw_len, b.compressed_len",
+                    params![bundle.bundle_id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            i64_to_u64(row.get(0)?, "raw_len").map_err(|err| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                            })?,
+                            i64_to_u64(row.get(1)?, "compressed_len").map_err(|err| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                            })?,
+                            i64_to_u64(row.get(2)?, "replica_count").map_err(|err| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                            })?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(Fs0Error::ChunkNotReady)?;
             if replica_count == 0 {
                 return Err(Fs0Error::ChunkNotReady);
             }
-            tx.execute(
-                "DELETE FROM file_bundles
-                 WHERE file_id = ?1 AND bundle_index = ?2",
+            if stored_raw_len != bundle.raw_len || stored_compressed_len != bundle.compressed_len {
+                return Err(Fs0Error::InvalidRequest);
+            }
+            let file_bundle_exists = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM file_bundles
+                    WHERE file_id = ?1 AND bundle_index = ?2
+                 )",
                 params![
                     u64_to_i64(lease.file_id, "file_id")?,
                     u64_to_i64(bundle.bundle_index, "bundle_index")?,
                 ],
+                |row| row.get::<_, bool>(0),
             )?;
+            if file_bundle_exists {
+                return Err(Fs0Error::InvalidRequest);
+            }
             tx.execute(
                 "INSERT INTO file_bundles (
                     file_id, bundle_index, bundle_id
@@ -406,19 +445,41 @@ impl CentralDb {
                 BundleReplicaEventKind::Stored => {
                     let raw_len = event.raw_len.ok_or(Fs0Error::InvalidRequest)?;
                     let compressed_len = event.compressed_len.ok_or(Fs0Error::InvalidRequest)?;
+                    if raw_len == 0 || compressed_len == 0 {
+                        return Err(Fs0Error::InvalidRequest);
+                    }
                     tx.execute(
                         "INSERT INTO bundles (
                             bundle_id, raw_len, compressed_len
                          ) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(bundle_id) DO UPDATE SET
-                            raw_len = excluded.raw_len,
-                            compressed_len = excluded.compressed_len",
+                         ON CONFLICT(bundle_id) DO NOTHING",
                         params![
                             event.bundle_id.as_bytes().as_slice(),
                             u64_to_i64(raw_len, "raw_len")?,
                             u64_to_i64(compressed_len, "compressed_len")?,
                         ],
                     )?;
+                    let (stored_raw_len, stored_compressed_len) = tx.query_row(
+                        "SELECT raw_len, compressed_len
+                         FROM bundles
+                         WHERE bundle_id = ?1",
+                        params![event.bundle_id.as_bytes().as_slice()],
+                        |row| {
+                            Ok((
+                                i64_to_u64(row.get(0)?, "raw_len").map_err(|err| {
+                                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                                })?,
+                                i64_to_u64(row.get(1)?, "compressed_len").map_err(|err| {
+                                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                                })?,
+                            ))
+                        },
+                    )?;
+                    if stored_raw_len != raw_len || stored_compressed_len != compressed_len {
+                        return Err(Fs0Error::InvalidData {
+                            message: "bundle metadata conflict".to_owned(),
+                        });
+                    }
                     tx.execute(
                         "INSERT INTO bundle_replicas (
                             bundle_id, volume_id
@@ -719,16 +780,34 @@ impl CentralDb {
         .ok_or(Fs0Error::NotFound)
     }
 
-    fn validate_committed_bundles(bundles: &[CommittedBundle]) -> Result<()> {
-        let mut previous_index = None;
+    fn validate_committed_bundles(
+        bundles: &[CommittedBundle],
+        appended_len: u64,
+        expected_first_index: u64,
+    ) -> Result<()> {
+        let mut expected_index = expected_first_index;
+        let mut total_raw_len = 0u64;
         for bundle in bundles {
-            if previous_index.is_some_and(|index| bundle.bundle_index <= index) {
+            if bundle.bundle_index != expected_index {
                 return Err(Fs0Error::InvalidRequest);
             }
             if bundle.raw_len == 0 || bundle.compressed_len == 0 {
                 return Err(Fs0Error::InvalidRequest);
             }
-            previous_index = Some(bundle.bundle_index);
+            total_raw_len = total_raw_len.checked_add(bundle.raw_len).ok_or_else(|| {
+                Fs0Error::IntegerConversion {
+                    message: "committed bundle raw_len overflow".to_owned(),
+                }
+            })?;
+            expected_index =
+                expected_index
+                    .checked_add(1)
+                    .ok_or_else(|| Fs0Error::IntegerConversion {
+                        message: "bundle_index overflow".to_owned(),
+                    })?;
+        }
+        if total_raw_len != appended_len {
+            return Err(Fs0Error::InvalidRequest);
         }
         Ok(())
     }
@@ -849,5 +928,152 @@ fn parse_file_change_log_kind(value: &str) -> Result<FileChangeLogKind> {
         "moved" => Ok(FileChangeLogKind::Moved),
         "deleted" => Ok(FileChangeLogKind::Deleted),
         _ => Err(Fs0Error::InvalidRequest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs0_core::{BeginAppendRequest, BundleReplicaEvent, CommitAppendRequest};
+
+    fn test_db() -> (tempfile::TempDir, CentralDb, u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = CentralDb::open(temp.path().join("central.db")).unwrap();
+        let volume = db.create_volume("test".to_owned(), 1024 * 1024).unwrap();
+        (temp, db, volume.volume_id)
+    }
+
+    fn begin_create(db: &mut CentralDb, volume_id: u64) -> AppendLease {
+        db.begin_append(
+            BeginAppendRequest {
+                path: "/file".to_owned(),
+                expected_size: 0,
+                create: true,
+                prefer_volume_name: None,
+                idempotency_key: None,
+            },
+            1,
+            volume_id,
+        )
+        .unwrap()
+    }
+
+    fn begin_append(db: &mut CentralDb, volume_id: u64, expected_size: u64) -> AppendLease {
+        db.begin_append(
+            BeginAppendRequest {
+                path: "/file".to_owned(),
+                expected_size,
+                create: false,
+                prefer_volume_name: None,
+                idempotency_key: None,
+            },
+            1,
+            volume_id,
+        )
+        .unwrap()
+    }
+
+    fn record_bundle(db: &mut CentralDb, volume_id: u64, bundle_id: HashId, raw_len: u64) {
+        db.record_bundle_events(BundleReplicaReport {
+            events: vec![BundleReplicaEvent {
+                event_id: 1,
+                kind: BundleReplicaEventKind::Stored,
+                volume_id,
+                bundle_id,
+                raw_len: Some(raw_len),
+                compressed_len: Some(raw_len / 2 + 1),
+            }],
+        })
+        .unwrap();
+    }
+
+    fn committed_bundle(bundle_index: u64, bundle_id: HashId, raw_len: u64) -> CommittedBundle {
+        CommittedBundle {
+            bundle_index,
+            bundle_id,
+            raw_len,
+            compressed_len: raw_len / 2 + 1,
+        }
+    }
+
+    #[test]
+    fn commit_append_rejects_sparse_layout() {
+        let (_temp, mut db, volume_id) = test_db();
+        let lease = begin_create(&mut db, volume_id);
+        let bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, bundle_id, 1024);
+
+        let result = db.commit_append(CommitAppendRequest {
+            lease_id: lease.lease_id,
+            base_size: 0,
+            new_size: 64 * 1024 * 1024,
+            bundles: vec![committed_bundle(100, bundle_id, 1024)],
+        });
+
+        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
+    }
+
+    #[test]
+    fn commit_append_rejects_non_contiguous_append_index() {
+        let (_temp, mut db, volume_id) = test_db();
+        let first_lease = begin_create(&mut db, volume_id);
+        let first_bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, first_bundle_id, 12);
+        db.commit_append(CommitAppendRequest {
+            lease_id: first_lease.lease_id,
+            base_size: 0,
+            new_size: 12,
+            bundles: vec![committed_bundle(0, first_bundle_id, 12)],
+        })
+        .unwrap();
+
+        let second_lease = begin_append(&mut db, volume_id, 12);
+        let second_bundle_id = HashId([2; 32]);
+        record_bundle(&mut db, volume_id, second_bundle_id, 12);
+        let result = db.commit_append(CommitAppendRequest {
+            lease_id: second_lease.lease_id,
+            base_size: 12,
+            new_size: 24,
+            bundles: vec![committed_bundle(2, second_bundle_id, 12)],
+        });
+
+        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
+    }
+
+    #[test]
+    fn commit_append_rejects_bundle_metadata_mismatch() {
+        let (_temp, mut db, volume_id) = test_db();
+        let lease = begin_create(&mut db, volume_id);
+        let bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, bundle_id, 12);
+
+        let result = db.commit_append(CommitAppendRequest {
+            lease_id: lease.lease_id,
+            base_size: 0,
+            new_size: 13,
+            bundles: vec![committed_bundle(0, bundle_id, 13)],
+        });
+
+        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
+    }
+
+    #[test]
+    fn record_bundle_events_rejects_metadata_conflicts() {
+        let (_temp, mut db, volume_id) = test_db();
+        let bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, bundle_id, 12);
+
+        let result = db.record_bundle_events(BundleReplicaReport {
+            events: vec![BundleReplicaEvent {
+                event_id: 2,
+                kind: BundleReplicaEventKind::Stored,
+                volume_id,
+                bundle_id,
+                raw_len: Some(13),
+                compressed_len: Some(7),
+            }],
+        });
+
+        assert!(matches!(result, Err(Fs0Error::InvalidData { .. })));
     }
 }

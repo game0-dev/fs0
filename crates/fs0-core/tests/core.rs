@@ -326,6 +326,7 @@ fn data_protocol_roundtrip() {
     assert_postcard_roundtrip(&DataRequest::UploadChunk {
         volume_id: 4,
         chunk_id,
+        compressed_hash: HashId([3; 32]),
         raw_len: 12,
         compressed_bytes: vec![1, 2, 3],
     });

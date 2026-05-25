@@ -1,5 +1,5 @@
 use crate::server::StorageServer;
-use fs0_core::{DataRequest, DataResponse, Fs0Error, blake3_hash, zstd_decompress};
+use fs0_core::{DataRequest, DataResponse, Fs0Error, blake3_hash};
 use fs0_transport::{read_frame, write_frame};
 use iroh::{
     Endpoint,
@@ -91,22 +91,13 @@ async fn handle_data_request(server: Arc<StorageServer>, request: DataRequest) -
         DataRequest::UploadChunk {
             volume_id,
             chunk_id,
+            compressed_hash,
             raw_len,
             compressed_bytes,
         } => {
             let compressed_len = compressed_bytes.len() as u64;
-            let raw_len_usize = match usize::try_from(raw_len) {
-                Ok(value) => value,
-                Err(_) => {
-                    return DataResponse::Error(Fs0Error::IntegerConversion {
-                        message: format!("raw_len {raw_len} exceeds usize"),
-                    });
-                }
-            };
-            match zstd_decompress(&compressed_bytes, raw_len_usize) {
-                Ok(raw) if raw.len() as u64 == raw_len && blake3_hash(&raw) == chunk_id => {}
-                Ok(_) => return DataResponse::Error(Fs0Error::HashMismatch { volume_offset: 0 }),
-                Err(err) => return DataResponse::Error(err),
+            if blake3_hash(&compressed_bytes) != compressed_hash {
+                return DataResponse::Error(Fs0Error::HashMismatch { volume_offset: 0 });
             }
             match server
                 .put_chunk(volume_id, chunk_id, raw_len, compressed_bytes)

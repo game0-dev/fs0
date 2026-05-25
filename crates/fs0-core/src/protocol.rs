@@ -114,6 +114,7 @@ pub enum DataRequest {
     UploadChunk {
         volume_id: u64,
         chunk_id: HashId,
+        compressed_hash: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     },

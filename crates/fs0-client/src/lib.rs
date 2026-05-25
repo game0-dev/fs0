@@ -79,8 +79,17 @@ pub struct TransferStats {
 #[derive(Debug, Clone)]
 pub struct ChunkUpload {
     pub chunk_id: HashId,
+    pub compressed_hash: HashId,
     pub raw_len: u64,
     pub compressed_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct VerifiedChunk {
+    chunk_index: u64,
+    raw_len: u64,
+    compressed_len: u64,
+    raw: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,32 +359,23 @@ impl Fs0Client {
             if bundle_end <= range.offset {
                 continue;
             }
-            let target = self.read_target(bundle.replicas.as_slice())?;
-            let chunks = self.list_bundle_chunks(&target, bundle.bundle_id).await?;
+            let chunks = self.download_bundle_from_replicas(bundle).await?;
             for chunk in chunks {
                 if remaining == 0 {
                     break;
                 }
-                let (raw_len, compressed_len) = self
-                    .storage_has_chunk(&target, chunk.chunk_id)
-                    .await?
-                    .ok_or(Fs0Error::ChunkNotFound {
-                        chunk_id: chunk.chunk_id,
-                    })?;
                 let chunk_start = bundle_start + chunk.chunk_index * RAW_CHUNK_SIZE;
-                let chunk_end = chunk_start.saturating_add(raw_len);
+                let chunk_end = chunk_start.saturating_add(chunk.raw_len);
                 if chunk_end <= range.offset {
                     continue;
                 }
-                let compressed = self.download_chunk(&target, chunk.chunk_id).await?;
-                let raw = zstd_decompress(&compressed, raw_len as usize)?;
                 let start = range.offset.saturating_sub(chunk_start) as usize;
-                let available = raw.len().saturating_sub(start);
+                let available = chunk.raw.len().saturating_sub(start);
                 let take = available.min(remaining as usize);
-                writer.write_all(&raw[start..start + take]).await?;
+                writer.write_all(&chunk.raw[start..start + take]).await?;
                 remaining -= take as u64;
                 stats.raw_bytes += take as u64;
-                stats.compressed_bytes += compressed_len;
+                stats.compressed_bytes += chunk.compressed_len;
                 stats.chunks += 1;
             }
             stats.bundles += 1;
@@ -483,12 +483,14 @@ impl Fs0Client {
             return Ok(false);
         }
 
+        let compressed_hash = blake3_hash(&compressed_bytes);
         match data_rpc(
             &self.endpoint,
             &target.iroh_endpoint,
             DataRequest::UploadChunk {
                 volume_id: target.volume_id,
                 chunk_id,
+                compressed_hash,
                 raw_len,
                 compressed_bytes,
             },
@@ -647,6 +649,7 @@ impl Fs0Client {
             let raw = &buffer[..read];
             let compressed = zstd_compress(raw, DEFAULT_ZSTD_LEVEL)?;
             let chunk_id = blake3_hash(raw);
+            let compressed_hash = blake3_hash(&compressed);
             let chunk_index = current_chunks.len() as u64;
             current_chunks.push(BundleChunkRef {
                 chunk_index,
@@ -656,6 +659,7 @@ impl Fs0Client {
             next_size += read as u64;
             current_uploads.push(ChunkUpload {
                 chunk_id,
+                compressed_hash,
                 raw_len: read as u64,
                 compressed_bytes: compressed,
             });
@@ -766,6 +770,80 @@ impl Fs0Client {
         }
     }
 
+    async fn download_bundle_from_replicas(
+        &self,
+        bundle: &fs0_core::FileBundleRef,
+    ) -> Result<Vec<VerifiedChunk>> {
+        let mut last_error = None;
+        for target in self.read_targets(bundle.replicas.as_slice()) {
+            match self.download_verified_bundle(&target, bundle).await {
+                Ok(chunks) => return Ok(chunks),
+                Err(err) => last_error = Some(err),
+            }
+        }
+        Err(last_error.unwrap_or(Fs0Error::NotFound))
+    }
+
+    async fn download_verified_bundle(
+        &self,
+        target: &UploadTarget,
+        bundle: &fs0_core::FileBundleRef,
+    ) -> Result<Vec<VerifiedChunk>> {
+        let chunks = self.list_bundle_chunks(target, bundle.bundle_id).await?;
+        if bundle_hash_from_chunks(&chunks) != bundle.bundle_id {
+            return Err(Fs0Error::InvalidData {
+                message: "bundle id does not match listed chunk ids".to_owned(),
+            });
+        }
+
+        let mut verified = Vec::with_capacity(chunks.len());
+        let mut total_raw_len = 0u64;
+        let mut total_compressed_len = 0u64;
+        for chunk in chunks {
+            let (raw_len, compressed_len) = self
+                .storage_has_chunk(target, chunk.chunk_id)
+                .await?
+                .ok_or(Fs0Error::ChunkNotFound {
+                chunk_id: chunk.chunk_id,
+            })?;
+            let compressed = self.download_chunk(target, chunk.chunk_id).await?;
+            if compressed.len() as u64 != compressed_len {
+                return Err(Fs0Error::InvalidData {
+                    message: "downloaded compressed length does not match chunk metadata"
+                        .to_owned(),
+                });
+            }
+            let raw = zstd_decompress(&compressed, raw_len as usize)?;
+            if raw.len() as u64 != raw_len || blake3_hash(&raw) != chunk.chunk_id {
+                return Err(Fs0Error::HashMismatch { volume_offset: 0 });
+            }
+            total_raw_len =
+                total_raw_len
+                    .checked_add(raw_len)
+                    .ok_or_else(|| Fs0Error::IntegerConversion {
+                        message: "bundle raw_len overflow".to_owned(),
+                    })?;
+            total_compressed_len = total_compressed_len
+                .checked_add(compressed_len)
+                .ok_or_else(|| Fs0Error::IntegerConversion {
+                    message: "bundle compressed_len overflow".to_owned(),
+                })?;
+            verified.push(VerifiedChunk {
+                chunk_index: chunk.chunk_index,
+                raw_len,
+                compressed_len,
+                raw,
+            });
+        }
+
+        if total_raw_len != bundle.raw_len || total_compressed_len != bundle.compressed_len {
+            return Err(Fs0Error::InvalidData {
+                message: "downloaded bundle lengths do not match read plan".to_owned(),
+            });
+        }
+        Ok(verified)
+    }
+
     fn upload_target(&self, volume_id: u64) -> Result<UploadTarget> {
         self.storages
             .read()
@@ -783,21 +861,21 @@ impl Fs0Client {
             .ok_or(Fs0Error::NotFound)
     }
 
-    fn read_target(&self, replicas: &[fs0_core::ReplicaLocation]) -> Result<UploadTarget> {
+    fn read_targets(&self, replicas: &[fs0_core::ReplicaLocation]) -> Vec<UploadTarget> {
         let storages = self.storages.read();
-        for replica in replicas {
-            if let Some(peer) = storages
-                .iter()
-                .find(|peer| peer.storage_id == replica.storage_id)
-            {
-                return Ok(UploadTarget {
-                    storage_id: peer.storage_id,
-                    volume_id: replica.volume_id,
-                    iroh_endpoint: peer.iroh_endpoint.clone(),
-                });
-            }
-        }
-        Err(Fs0Error::NotFound)
+        replicas
+            .iter()
+            .filter_map(|replica| {
+                storages
+                    .iter()
+                    .find(|peer| peer.storage_id == replica.storage_id)
+                    .map(|peer| UploadTarget {
+                        storage_id: peer.storage_id,
+                        volume_id: replica.volume_id,
+                        iroh_endpoint: peer.iroh_endpoint.clone(),
+                    })
+            })
+            .collect()
     }
 
     async fn request(&self, request: ControlRequest) -> Result<ControlResponse> {
@@ -870,6 +948,7 @@ async fn upload_chunk_if_missing_on_connection(
         DataRequest::UploadChunk {
             volume_id,
             chunk_id: chunk.chunk_id,
+            compressed_hash: chunk.compressed_hash,
             raw_len: chunk.raw_len,
             compressed_bytes: chunk.compressed_bytes,
         },
