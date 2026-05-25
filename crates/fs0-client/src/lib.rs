@@ -14,12 +14,13 @@ use fs0_transport::{
 };
 use iroh::{
     Endpoint,
-    endpoint::{Connection, SendStream},
+    endpoint::{Connection, RecvStream, SendStream},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::task::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, Fs0Error>;
 
@@ -95,7 +96,8 @@ pub struct Fs0Client {
     control: Connection,
     _session: Arc<Mutex<SendStream>>,
     endpoint: Endpoint,
-    storages: Vec<StoragePeerInfo>,
+    storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
+    session_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Fs0Client {
@@ -149,6 +151,9 @@ impl Fs0Client {
             }
         };
 
+        let storages = Arc::new(RwLock::new(storages));
+        let session_task = spawn_session_reader(storages.clone(), session_recv);
+
         Ok(Self {
             options,
             client_id,
@@ -156,12 +161,17 @@ impl Fs0Client {
             _session: Arc::new(Mutex::new(session_send)),
             endpoint,
             storages,
+            session_task: Arc::new(Mutex::new(Some(session_task))),
         })
     }
 
     pub async fn shutdown(&self) -> Result<()> {
         self.control.close(0u32.into(), b"fs0 client shutdown");
         self.endpoint.close().await;
+        let session_task = self.session_task.lock().take();
+        if let Some(task) = session_task {
+            let _ = task.await;
+        }
         Ok(())
     }
 
@@ -171,7 +181,7 @@ impl Fs0Client {
     }
 
     pub fn storage_peers(&self) -> Vec<StoragePeerInfo> {
-        self.storages.clone()
+        self.storages.read().clone()
     }
 
     pub async fn central_status(&self) -> Result<CentralStatus> {
@@ -758,6 +768,7 @@ impl Fs0Client {
 
     fn upload_target(&self, volume_id: u64) -> Result<UploadTarget> {
         self.storages
+            .read()
             .iter()
             .find(|peer| {
                 peer.volumes
@@ -773,9 +784,9 @@ impl Fs0Client {
     }
 
     fn read_target(&self, replicas: &[fs0_core::ReplicaLocation]) -> Result<UploadTarget> {
+        let storages = self.storages.read();
         for replica in replicas {
-            if let Some(peer) = self
-                .storages
+            if let Some(peer) = storages
                 .iter()
                 .find(|peer| peer.storage_id == replica.storage_id)
             {
@@ -792,6 +803,37 @@ impl Fs0Client {
     async fn request(&self, request: ControlRequest) -> Result<ControlResponse> {
         control_rpc(&self.control, request).await
     }
+}
+
+fn spawn_session_reader(
+    storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
+    mut session_recv: RecvStream,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match read_frame::<SessionMessage, _>(&mut session_recv).await {
+                Ok(SessionMessage::StorageChanged(peer)) => {
+                    let mut peers = storages.write();
+                    if let Some(existing) = peers
+                        .iter_mut()
+                        .find(|existing| existing.storage_id == peer.storage_id)
+                    {
+                        *existing = peer;
+                    } else {
+                        peers.push(peer);
+                    }
+                    peers.sort_by_key(|peer| peer.storage_id);
+                }
+                Ok(SessionMessage::StorageRemoved { storage_id }) => {
+                    storages
+                        .write()
+                        .retain(|peer| peer.storage_id != storage_id);
+                }
+                Ok(SessionMessage::Error(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
 }
 
 async fn upload_chunk_if_missing_on_connection(

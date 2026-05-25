@@ -24,3 +24,4 @@ pub const MAX_OPEN_DATA_FILES: usize = 2048;
 pub const DATA_FILE_IDLE_TTL_MS: u64 = 60_000; // 60s
 pub const APPEND_LEASE_TTL_MS: u64 = 30_000;
 pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 32;
+pub const DEFAULT_REPLICATION_FACTOR: u16 = 2;

@@ -1,3 +1,4 @@
+use fs0_core::DEFAULT_REPLICATION_FACTOR;
 use fs0_core::Fs0Error;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -13,8 +14,9 @@ pub struct Fs0Config {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CentralConfig {
-    pub tcp_port: u16,
     pub db_path: PathBuf,
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: u16,
     pub p2p_relay: CentralP2pRelayConfig,
 }
 
@@ -30,7 +32,6 @@ pub struct StorageConfig {
     pub storage_id: u64,
     pub name: String,
     pub central_endpoint: Vec<u8>,
-    pub cert: PathBuf,
     pub p2p_relay: StorageP2pRelayConfig,
     #[serde(default)]
     pub volume_io: StorageVolumeIoConfig,
@@ -136,4 +137,8 @@ fn default_volume_read_concurrency() -> usize {
 
 fn default_volume_write_concurrency() -> usize {
     fs0_core::VOLUME_WRITE_CONCURRENCY
+}
+
+fn default_replication_factor() -> u16 {
+    DEFAULT_REPLICATION_FACTOR
 }

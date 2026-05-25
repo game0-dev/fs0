@@ -7,7 +7,7 @@ use fs0_core::{
 };
 use fs0_transport::{bind_endpoint, encode_endpoint_addr, read_frame, write_frame};
 use iroh::Endpoint;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendStream};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 pub struct CentralServer {
@@ -23,6 +23,7 @@ pub struct CentralServer {
     next_client_id: AtomicU64,
     storages: RwLock<HashMap<u64, StoragePeerInfo>>,
     online_volumes: RwLock<HashMap<u64, u64>>,
+    client_sessions: RwLock<HashMap<u64, Arc<AsyncMutex<SendStream>>>>,
     db: Mutex<CentralDb>,
     control_endpoint: Vec<u8>,
     endpoint: Endpoint,
@@ -37,6 +38,11 @@ impl CentralServer {
         if config.p2p_relay.public_url.trim().is_empty() {
             return Err(Fs0Error::InvalidConfig {
                 message: "p2p_relay.public_url must not be empty".to_owned(),
+            });
+        }
+        if config.replication_factor == 0 {
+            return Err(Fs0Error::InvalidConfig {
+                message: "replication_factor must be greater than zero".to_owned(),
             });
         }
 
@@ -55,6 +61,7 @@ impl CentralServer {
             next_client_id: AtomicU64::new(1),
             storages: RwLock::new(HashMap::new()),
             online_volumes: RwLock::new(HashMap::new()),
+            client_sessions: RwLock::new(HashMap::new()),
             db: Mutex::new(db),
             control_endpoint,
             endpoint: endpoint.clone(),
@@ -211,6 +218,32 @@ impl CentralServer {
             .retain(|_, mounted_storage_id| *mounted_storage_id != storage_id);
     }
 
+    fn unregister_client_session(&self, client_id: u64) {
+        self.client_sessions.write().remove(&client_id);
+    }
+
+    async fn broadcast_session_message(&self, message: SessionMessage) {
+        let sessions = self
+            .client_sessions
+            .read()
+            .iter()
+            .map(|(client_id, session)| (*client_id, session.clone()))
+            .collect::<Vec<_>>();
+        let mut dead_clients = Vec::new();
+        for (client_id, session) in sessions {
+            let mut send = session.lock().await;
+            if write_frame(&mut *send, &message).await.is_err() {
+                dead_clients.push(client_id);
+            }
+        }
+        if !dead_clients.is_empty() {
+            let mut client_sessions = self.client_sessions.write();
+            for client_id in dead_clients {
+                client_sessions.remove(&client_id);
+            }
+        }
+    }
+
     fn hydrate_read_plan_replicas(&self, mut plan: FileReadPlan) -> Result<FileReadPlan> {
         let bundle_replica_volumes = {
             let db = self.db.lock();
@@ -320,20 +353,30 @@ async fn handle_control_connection(
     };
     match session_message {
         SessionMessage::RegisterClient { .. } => {
+            let allocated_client_id = server.alloc_client_id();
             let storages = server.storage_peers_snapshot();
+            let session_writer = Arc::new(AsyncMutex::new(session_send));
+            server
+                .client_sessions
+                .write()
+                .insert(allocated_client_id, session_writer.clone());
+            let mut send = session_writer.lock().await;
             write_frame(
-                &mut session_send,
+                &mut *send,
                 &SessionMessage::ClientRegistered {
-                    client_id: server.alloc_client_id(),
+                    client_id: allocated_client_id,
                     storages,
                 },
             )
             .await?;
+            drop(send);
+            handle_client_session(server, allocated_client_id, session_recv, shutdown_notify).await;
+            return Ok(());
         }
         SessionMessage::RegisterStorage { request } => {
             let id = request.storage_id;
             match server.register_storage(request) {
-                Ok(_) => {
+                Ok(peer) => {
                     storage_id = Some(id);
                     let storages = server.storage_peers_snapshot();
                     write_frame(
@@ -344,6 +387,9 @@ async fn handle_control_connection(
                         },
                     )
                     .await?;
+                    server
+                        .broadcast_session_message(SessionMessage::StorageChanged(peer))
+                        .await;
                 }
                 Err(err) => {
                     write_frame(&mut session_send, &SessionMessage::Error(err)).await?;
@@ -397,8 +443,32 @@ async fn handle_control_connection(
 
     if let Some(storage_id) = storage_id {
         server.unregister_storage(storage_id);
+        server
+            .broadcast_session_message(SessionMessage::StorageRemoved { storage_id })
+            .await;
     }
     Ok(())
+}
+
+async fn handle_client_session(
+    server: Arc<CentralServer>,
+    client_id: u64,
+    mut session_recv: iroh::endpoint::RecvStream,
+    shutdown_notify: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => break,
+            request = read_frame::<SessionMessage, _>(&mut session_recv) => {
+                match request {
+                    Ok(SessionMessage::Ping) => {}
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    server.unregister_client_session(client_id);
 }
 
 async fn handle_control_request(
