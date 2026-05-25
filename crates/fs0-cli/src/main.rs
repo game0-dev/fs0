@@ -97,6 +97,15 @@ enum StorageCommand {
 
 #[derive(Debug, Subcommand)]
 enum VolumeCommand {
+    Create {
+        path: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        max_bytes: String,
+        #[arg(long)]
+        central: Option<PathBuf>,
+    },
     Init {
         path: PathBuf,
         #[arg(long)]
@@ -288,6 +297,22 @@ async fn run() -> fs0_client::Result<()> {
             }
         },
         Command::Volume { command } => match command {
+            VolumeCommand::Create {
+                path,
+                name,
+                max_bytes,
+                central,
+            } => {
+                let max_bytes = parse_bytes(&max_bytes)?;
+                let volume = fs0_volume::Volume::init(path, max_bytes)?;
+                let config = central.or_else(|| cli.config.clone());
+                let client = client(&config).await?;
+                let volume_id = client.create_volume(name, max_bytes).await?;
+                client.shutdown().await?;
+                let meta = volume.assign_volume_id(volume_id)?;
+                print_volume_meta(meta);
+                Ok(())
+            }
             VolumeCommand::Init { path, max_bytes } => {
                 let volume = fs0_volume::Volume::init(path, parse_bytes(&max_bytes)?)?;
                 print_volume_meta(volume.meta());

@@ -1,7 +1,0 @@
-tcp_port = 7000
-db_path = "central.sqlite"
-
-[p2p_relay]
-port = 3340
-quic_port = 7824
-public_url = "http://127.0.0.1:3340"
