@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
-use fs0_client::{ClientOptions, Fs0Client, ListOptions, ReadRange, WriteOptions};
+use fs0_client::{CentralStatus, ClientOptions, Fs0Client, ListOptions, ReadRange, WriteOptions};
 use fs0_config::{CentralConfig, Fs0Config, StorageConfig};
-use fs0_core::{CentralStatus, DirectoryEntries, Fs0Error};
+use fs0_core::{
+    DirectoryEntries, Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY,
+};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -49,8 +51,6 @@ enum Command {
         local_path: String,
         #[arg(long)]
         prefer_volume: Option<String>,
-        #[arg(long)]
-        idempotency_key: Option<String>,
     },
     Append {
         remote_path: String,
@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         prefer_volume: Option<String>,
         #[arg(long)]
-        idempotency_key: Option<String>,
+        offset: Option<u64>,
     },
     Rm {
         remote_path: String,
@@ -122,7 +122,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> fs0_client::Result<()> {
+async fn run() -> Fs0Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls { dir, limit, cursor } => {
@@ -176,12 +176,11 @@ async fn run() -> fs0_client::Result<()> {
             remote_path,
             local_path,
             prefer_volume,
-            idempotency_key,
         } => {
             let client = client(&cli.config).await?;
             let options = WriteOptions {
                 prefer_volume_name: prefer_volume,
-                idempotency_key,
+                offset: None,
             };
             let plan = if local_path == "-" {
                 client
@@ -204,12 +203,16 @@ async fn run() -> fs0_client::Result<()> {
             remote_path,
             local_path,
             prefer_volume,
-            idempotency_key,
+            offset,
         } => {
             let client = client(&cli.config).await?;
+            let offset = match offset {
+                Some(offset) => Some(offset),
+                None => Some(client.get_file_read_plan(&remote_path).await?.size),
+            };
             let options = WriteOptions {
                 prefer_volume_name: prefer_volume,
-                idempotency_key,
+                offset,
             };
             let plan = if local_path == "-" {
                 client
@@ -272,6 +275,10 @@ async fn run() -> fs0_client::Result<()> {
                 let client = client(&cli.config).await?;
                 let status = client.central_status().await?;
                 if cli.json {
+                    let status = serde_json::json!({
+                        "clients_count": status.clients_count,
+                        "storages": status.storages,
+                    });
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&status).map_err(json_error)?
@@ -299,17 +306,21 @@ async fn run() -> fs0_client::Result<()> {
                 central,
             } => {
                 let max_bytes = parse_bytes(&max_bytes)?;
-                let volume = fs0_volume::Volume::init(path, max_bytes)?;
+                fs0_volume::Volume::init_fs(&path, max_bytes)?;
                 let config = central.or_else(|| cli.config.clone());
                 let client = client(&config).await?;
                 let volume_id = client.create_volume(name, max_bytes).await?;
                 client.shutdown().await?;
-                let meta = volume.assign_volume_id(volume_id)?;
+                let meta = fs0_volume::Volume::init_volume_id(path, volume_id)?;
                 print_volume_meta(meta);
                 Ok(())
             }
             VolumeCommand::Meta { path } => {
-                let volume = fs0_volume::Volume::open(path)?;
+                let volume = fs0_volume::Volume::open(
+                    path,
+                    VOLUME_READ_CONCURRENCY as u32,
+                    VOLUME_WRITE_CONCURRENCY as u32,
+                )?;
                 print_volume_meta(volume.meta());
                 Ok(())
             }
@@ -317,7 +328,7 @@ async fn run() -> fs0_client::Result<()> {
     }
 }
 
-async fn client(config: &Option<PathBuf>) -> fs0_client::Result<Fs0Client> {
+async fn client(config: &Option<PathBuf>) -> Fs0Result<Fs0Client> {
     Fs0Client::connect(
         Fs0Config::load_from(config_path(config))?.client()?,
         ClientOptions::default(),
@@ -344,7 +355,7 @@ fn local_file_name(remote_path: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("fs0.out"))
 }
 
-fn parse_bytes(value: &str) -> fs0_client::Result<u64> {
+fn parse_bytes(value: &str) -> Fs0Result<u64> {
     let value = value.trim();
     let (number, multiplier) = match value.as_bytes().last().copied() {
         Some(b'k' | b'K') => (&value[..value.len() - 1], 1024u64),
@@ -378,13 +389,12 @@ fn print_central_status(status: CentralStatus) {
         println!("storage {} {}", storage.storage_id, storage.name);
         for volume in storage.volumes {
             println!(
-                "  volume {} {} capacity={} used={} raw={} compressed={}",
+                "  volume {} {} capacity={} used={} read_only={}",
                 volume.volume_id,
                 volume.name,
                 volume.max_bytes,
-                volume.used_bytes,
-                volume.raw_bytes,
-                volume.compressed_bytes,
+                volume.max_volume_offset,
+                volume.read_only,
             );
         }
     }
