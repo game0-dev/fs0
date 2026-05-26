@@ -276,6 +276,7 @@ pub struct BeginAppendRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantUploadLeaseRequest {
+    pub client_id: u64,
     pub file_id: u64,
     pub volume_id: u64,
     pub base_size: u64,

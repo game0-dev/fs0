@@ -1,9 +1,9 @@
 use crate::server::StorageServer;
-use fs0_core::{DataRequest, DataResponse, Fs0Error, blake3_hash};
+use fs0_core::{DataRequest, DataResponse, Fs0Error};
 use fs0_transport::{read_frame, write_frame};
 use iroh::{
     Endpoint,
-    endpoint::{RecvStream, SendStream},
+    endpoint::{Connection, RecvStream, SendStream},
 };
 use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
@@ -28,28 +28,13 @@ pub(crate) fn spawn_data_accept_loop(
                     if server.is_exiting() {
                         break;
                     }
+
                     let shutdown_notify = shutdown_notify.clone();
                     tokio::spawn(async move {
                         let Ok(connection) = incoming.await else {
                             return;
                         };
-                        loop {
-                            if server.is_exiting() {
-                                break;
-                            }
-                            tokio::select! {
-                                _ = shutdown_notify.notified() => break,
-                                stream = connection.accept_bi() => {
-                                    let Ok((send, recv)) = stream else {
-                                        break;
-                                    };
-                                    let server = server.clone();
-                                    tokio::spawn(async move {
-                                        handle_data_stream(server, send, recv).await;
-                                    });
-                                }
-                            }
-                        }
+                        handle_data_connection(server, connection, shutdown_notify).await;
                     });
                 }
             }
@@ -57,21 +42,92 @@ pub(crate) fn spawn_data_accept_loop(
     })
 }
 
-async fn handle_data_stream(
+async fn handle_data_connection(
+    server: Arc<StorageServer>,
+    connection: Connection,
+    shutdown_notify: Arc<Notify>,
+) {
+    let mut authenticated_client_id = None;
+
+    loop {
+        if server.is_exiting() {
+            break;
+        }
+
+        tokio::select! {
+            _ = shutdown_notify.notified() => break,
+            stream = connection.accept_bi() => {
+                let Ok((send, recv)) = stream else {
+                    break;
+                };
+
+                if authenticated_client_id.is_none() {
+                    authenticated_client_id = authenticate_data_connection(server.clone(), send, recv).await;
+                    if authenticated_client_id.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+
+                let client_id = authenticated_client_id.expect("authenticated client id is set");
+                let server = server.clone();
+                tokio::spawn(async move {
+                    handle_data_stream(server, client_id, send, recv).await;
+                });
+            }
+        }
+    }
+}
+
+async fn authenticate_data_connection(
     server: Arc<StorageServer>,
     mut send: SendStream,
     mut recv: RecvStream,
-) {
-    let Ok(request) = read_frame::<DataRequest, _>(&mut recv).await else {
-        return;
+) -> Option<u64> {
+    let response = match read_frame::<DataRequest, _>(&mut recv).await {
+        Ok(DataRequest::Authenticate {
+            client_id,
+            client_token,
+        }) => match server.validate_client_auth(client_id, client_token).await {
+            Ok(()) => {
+                let _ = write_frame(&mut send, &DataResponse::Authenticate { client_id }).await;
+                let _ = send.finish();
+                return Some(client_id);
+            }
+            Err(err) => DataResponse::Error(err),
+        },
+        Ok(_) => DataResponse::Error(Fs0Error::Unauthorized),
+        Err(err) => DataResponse::Error(err),
     };
-    let response = handle_data_request(server, request).await;
+
+    let _ = write_frame(&mut send, &response).await;
+    let _ = send.finish();
+    None
+}
+
+async fn handle_data_stream(
+    server: Arc<StorageServer>,
+    client_id: u64,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) {
+    let response = match read_frame::<DataRequest, _>(&mut recv).await {
+        Ok(DataRequest::Authenticate { .. }) => DataResponse::Error(Fs0Error::InvalidRequest),
+        Ok(request) => handle_data_request(server, client_id, request).await,
+        Err(err) => DataResponse::Error(err),
+    };
+
     let _ = write_frame(&mut send, &response).await;
     let _ = send.finish();
 }
 
-async fn handle_data_request(server: Arc<StorageServer>, request: DataRequest) -> DataResponse {
+async fn handle_data_request(
+    server: Arc<StorageServer>,
+    client_id: u64,
+    request: DataRequest,
+) -> DataResponse {
     match request {
+        DataRequest::Authenticate { .. } => DataResponse::Error(Fs0Error::InvalidRequest),
         DataRequest::HasChunk {
             volume_id,
             chunk_id,
@@ -96,11 +152,15 @@ async fn handle_data_request(server: Arc<StorageServer>, request: DataRequest) -
             compressed_bytes,
         } => {
             let compressed_len = compressed_bytes.len() as u64;
-            if blake3_hash(&compressed_bytes) != compressed_hash {
-                return DataResponse::Error(Fs0Error::HashMismatch { volume_offset: 0 });
-            }
             match server
-                .put_chunk(volume_id, chunk_id, raw_len, compressed_bytes)
+                .put_chunk(
+                    client_id,
+                    volume_id,
+                    chunk_id,
+                    compressed_hash,
+                    raw_len,
+                    compressed_bytes,
+                )
                 .await
             {
                 Ok(_) => DataResponse::UploadChunk {
@@ -140,7 +200,10 @@ async fn handle_data_request(server: Arc<StorageServer>, request: DataRequest) -
             volume_id,
             bundle_id,
             chunks,
-        } => match server.commit_bundle(volume_id, bundle_id, chunks).await {
+        } => match server
+            .commit_bundle(client_id, volume_id, bundle_id, chunks)
+            .await
+        {
             Ok(bundle) => DataResponse::CommitBundle {
                 bundle_id,
                 raw_len: bundle.raw_len,

@@ -55,3 +55,25 @@ pub fn hash_id_from_vec(value: Vec<u8>) -> Fs0Result<HashId> {
         })?;
     Ok(HashId(bytes))
 }
+
+pub fn decode_hex_bytes(value: &str, name: &str) -> Fs0Result<Vec<u8>> {
+    let value = value.strip_prefix("hex:").unwrap_or(value);
+    if !value.len().is_multiple_of(2) {
+        return Err(Fs0Error::InvalidConfig {
+            message: format!("{name} hex string must have an even number of digits"),
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for index in (0..value.len()).step_by(2) {
+        let byte =
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|err| {
+                Fs0Error::InvalidConfig {
+                    message: format!("invalid {name} hex at byte {}: {err}", index / 2),
+                }
+            })?;
+        bytes.push(byte);
+    }
+
+    Ok(bytes)
+}

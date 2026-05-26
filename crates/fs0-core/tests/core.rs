@@ -353,6 +353,7 @@ fn storage_peer() -> StoragePeerInfo {
 
 fn grant_upload_lease_request() -> GrantUploadLeaseRequest {
     GrantUploadLeaseRequest {
+        client_id: 3,
         file_id: 11,
         volume_id: 4,
         base_size: 0,
