@@ -1,12 +1,10 @@
 use fs0_core::{
-    AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
-    BundleReplicaReport, CentralStatus, CentralStorageStatus, CentralVolumeStatus,
-    CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DEFAULT_ZSTD_LEVEL,
-    DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
-    FileChangeLogs, FileReadPlan, Fs0Error, HashId, MAX_FRAME_BODY_LEN, RegisterStorageRequest,
-    ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo, UploadLease, blake3_hash,
-    bundle_hash_from_chunks, decode_frame, decode_frame_body, encode_frame, encode_frame_body,
-    zstd_compress, zstd_decompress,
+    blake3_hash, bundle_hash_from_chunks, zstd_compress, zstd_decompress, AppendLease,
+    BeginAppendRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
+    CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DataRequest,
+    DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
+    FileChangeLogs, FileReadPlan, Fs0Error, GrantUploadLeaseRequest, HashId, ReplicaLocation,
+    SessionMessage, StoragePeerInfo, StorageVolumeInfo, DEFAULT_ZSTD_LEVEL,
 };
 use serde::{Deserialize, Serialize};
 
@@ -88,76 +86,6 @@ fn zstd_roundtrip() {
 }
 
 #[test]
-fn frame_encode_decode_postcard_payload() {
-    let payload = TestPayload {
-        object_id: 11,
-        client_id: 13,
-        chunk_id: blake3_hash(b"/fs0/test"),
-        name: "frame".to_owned(),
-    };
-
-    let encoded = encode_frame(&payload).unwrap();
-    let decoded: TestPayload = decode_frame(&encoded).unwrap();
-
-    assert_eq!(decoded, payload);
-}
-
-#[test]
-fn frame_rejects_truncated_body() {
-    let payload = TestPayload {
-        object_id: 11,
-        client_id: 13,
-        chunk_id: blake3_hash(b"/fs0/test"),
-        name: "frame".to_owned(),
-    };
-
-    let mut encoded = encode_frame(&payload).unwrap();
-    encoded.pop();
-
-    let err = decode_frame::<TestPayload>(&encoded).unwrap_err();
-    assert!(matches!(err, Fs0Error::InvalidFrame { .. }));
-    assert!(err.to_string().contains("frame length mismatch"));
-}
-
-#[test]
-fn frame_rejects_declared_body_over_limit() {
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(&((MAX_FRAME_BODY_LEN as u32) + 1).to_le_bytes());
-
-    let err = decode_frame::<TestPayload>(&encoded).unwrap_err();
-    assert_eq!(
-        err,
-        Fs0Error::FrameTooLarge {
-            actual: MAX_FRAME_BODY_LEN + 1,
-            max: MAX_FRAME_BODY_LEN,
-        }
-    );
-}
-
-#[test]
-fn frame_body_roundtrip_preserves_raw_bytes() {
-    let body = b"raw frame body";
-    let encoded = encode_frame_body(body).unwrap();
-    let decoded = decode_frame_body(&encoded).unwrap();
-
-    assert_eq!(decoded, body);
-}
-
-#[test]
-fn frame_rejects_body_over_limit_before_encoding() {
-    let body = vec![0; MAX_FRAME_BODY_LEN + 1];
-    let err = encode_frame_body(&body).unwrap_err();
-
-    assert_eq!(
-        err,
-        Fs0Error::FrameTooLarge {
-            actual: MAX_FRAME_BODY_LEN + 1,
-            max: MAX_FRAME_BODY_LEN,
-        }
-    );
-}
-
-#[test]
 fn fs0_error_roundtrips_over_postcard() {
     let chunk_id = HashId([7; 32]);
     let error = Fs0Error::ChunkNotFound { chunk_id };
@@ -187,33 +115,26 @@ fn session_messages_roundtrip() {
     let storage = storage_peer();
     assert_postcard_roundtrip(&SessionMessage::Ping);
     assert_postcard_roundtrip(&SessionMessage::Pong);
-    assert_postcard_roundtrip(&SessionMessage::RegisterClient {
-        name: Some("client-a".to_owned()),
-    });
-    assert_postcard_roundtrip(&SessionMessage::ClientRegistered {
-        client_id: 42,
-        storages: vec![storage.clone()],
-    });
-    assert_postcard_roundtrip(&SessionMessage::RegisterStorage {
-        request: register_storage_request(),
-    });
-    assert_postcard_roundtrip(&SessionMessage::StorageRegistered {
-        storage_id: 7,
-        storages: vec![storage.clone()],
-    });
     assert_postcard_roundtrip(&SessionMessage::StorageChanged(storage));
     assert_postcard_roundtrip(&SessionMessage::StorageRemoved { storage_id: 7 });
-    assert_postcard_roundtrip(&SessionMessage::Error(Fs0Error::Unsupported));
 }
 
 #[test]
 fn control_requests_roundtrip() {
+    assert_postcard_roundtrip(&ControlRequest::RegisterClient {
+        name: Some("client-a".to_owned()),
+        token: "client-token".to_owned(),
+    });
+    assert_postcard_roundtrip(&ControlRequest::RegisterStorage {
+        name: "storage-a".to_owned(),
+        token: "storage-token".to_owned(),
+        volumes: storage_peer().volumes,
+        iroh_endpoint: vec![1, 2, 3],
+    });
     assert_postcard_roundtrip(&ControlRequest::CreateVolume {
         name: "hot".to_owned(),
         max_bytes: 1024,
     });
-    assert_postcard_roundtrip(&ControlRequest::GrantUploadLease(upload_lease()));
-    assert_postcard_roundtrip(&ControlRequest::RevokeUploadLease { lease_id: 9 });
     assert_postcard_roundtrip(&ControlRequest::CentralStatus);
     assert_postcard_roundtrip(&ControlRequest::ListDirectory {
         dir: "/trades".to_owned(),
@@ -250,10 +171,10 @@ fn control_requests_roundtrip() {
     });
     assert_postcard_roundtrip(&ControlRequest::BeginAppend(BeginAppendRequest {
         path: "/a.txt".to_owned(),
-        expected_size: 0,
+        offset: 0,
         create: true,
         prefer_volume_name: Some("hot".to_owned()),
-        idempotency_key: Some("append-1".to_owned()),
+        append_size_hint: Some(512),
     }));
     assert_postcard_roundtrip(&ControlRequest::CommitAppend(CommitAppendRequest {
         lease_id: 9,
@@ -262,17 +183,36 @@ fn control_requests_roundtrip() {
         bundles: vec![committed_bundle()],
     }));
     assert_postcard_roundtrip(&ControlRequest::AbortAppend { lease_id: 9 });
-    assert_postcard_roundtrip(&ControlRequest::ReportBundleReplica(BundleReplicaReport {
+    assert_postcard_roundtrip(&ControlRequest::GrantUploadLease(
+        grant_upload_lease_request(),
+    ));
+    assert_postcard_roundtrip(&ControlRequest::RevokeUploadLease { lease_id: 9 });
+    assert_postcard_roundtrip(&ControlRequest::ReportBundleReplica {
         events: vec![bundle_replica_event()],
-    }));
+    });
+    assert_postcard_roundtrip(&ControlRequest::ValidateClientAuth {
+        client_id: 42,
+        client_token: "client-token".to_owned(),
+    });
 }
 
 #[test]
 fn control_responses_roundtrip() {
-    assert_postcard_roundtrip(&ControlResponse::CreateVolume(2));
-    assert_postcard_roundtrip(&ControlResponse::UploadLeaseGranted { lease_id: 9 });
-    assert_postcard_roundtrip(&ControlResponse::UploadLeaseRevoked { lease_id: 9 });
-    assert_postcard_roundtrip(&ControlResponse::CentralStatus(central_status()));
+    let storage = storage_peer();
+    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict));
+    assert_postcard_roundtrip(&ControlResponse::RegisterClient {
+        client_id: 42,
+        storages: vec![storage.clone()],
+    });
+    assert_postcard_roundtrip(&ControlResponse::RegisterStorage {
+        storage_id: 7,
+        storages: vec![storage.clone()],
+    });
+    assert_postcard_roundtrip(&ControlResponse::CreateVolume { volume_id: 2 });
+    assert_postcard_roundtrip(&ControlResponse::CentralStatus {
+        clients_count: 1,
+        storages: vec![storage],
+    });
     assert_postcard_roundtrip(&ControlResponse::ListDirectory(DirectoryEntries {
         entries: Vec::new(),
         next_cursor: None,
@@ -293,6 +233,9 @@ fn control_responses_roundtrip() {
         file_id: 3,
         volume_id: 4,
         base_size: 0,
+        offset: 0,
+        rewrite_offset: 0,
+        first_bundle_index: 0,
         expires_at_ms: 2000,
         prefer_volume_name: Some("hot".to_owned()),
     }));
@@ -306,8 +249,10 @@ fn control_responses_roundtrip() {
     assert_postcard_roundtrip(&ControlResponse::CopyFileById(file_record("/copy-id")));
     assert_postcard_roundtrip(&ControlResponse::RenameFile(file_record("/renamed")));
     assert_postcard_roundtrip(&ControlResponse::RenameFileById(file_record("/renamed-id")));
+    assert_postcard_roundtrip(&ControlResponse::GrantUploadLease { lease_id: 9 });
+    assert_postcard_roundtrip(&ControlResponse::RevokeUploadLease);
     assert_postcard_roundtrip(&ControlResponse::ReportBundleReplica);
-    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict));
+    assert_postcard_roundtrip(&ControlResponse::ValidateClientAuth { client_id: 42 });
 }
 
 #[test]
@@ -319,6 +264,10 @@ fn data_protocol_roundtrip() {
         chunk_id,
     };
 
+    assert_postcard_roundtrip(&DataRequest::Authenticate {
+        client_id: 42,
+        client_token: "client-token".to_owned(),
+    });
     assert_postcard_roundtrip(&DataRequest::HasChunk {
         volume_id: 4,
         chunk_id,
@@ -348,6 +297,7 @@ fn data_protocol_roundtrip() {
         bundle_id,
     });
 
+    assert_postcard_roundtrip(&DataResponse::Authenticate { client_id: 42 });
     assert_postcard_roundtrip(&DataResponse::HasChunk {
         exists: true,
         raw_len: Some(12),
@@ -395,28 +345,17 @@ fn storage_peer() -> StoragePeerInfo {
             name: "hot".to_owned(),
             max_bytes: 1024 * 1024,
             max_volume_offset: 512,
+            read_only: false,
         }],
         iroh_endpoint: vec![1, 2, 3],
     }
 }
 
-fn register_storage_request() -> RegisterStorageRequest {
-    RegisterStorageRequest {
-        storage_id: 7,
-        name: "storage-a".to_owned(),
-        volumes: storage_peer().volumes,
-        iroh_endpoint: vec![1, 2, 3],
-    }
-}
-
-fn upload_lease() -> UploadLease {
-    UploadLease {
-        lease_id: 9,
-        client_id: 10,
+fn grant_upload_lease_request() -> GrantUploadLeaseRequest {
+    GrantUploadLeaseRequest {
         file_id: 11,
         volume_id: 4,
         base_size: 0,
-        expires_at_ms: 2000,
         prefer_volume_name: Some("hot".to_owned()),
     }
 }
@@ -467,22 +406,5 @@ fn file_record(path: &str) -> fs0_core::FileRecord {
         compressed_size_bytes: 3,
         created_at_ms: 1000,
         updated_at_ms: 2000,
-    }
-}
-
-fn central_status() -> CentralStatus {
-    CentralStatus {
-        storages: vec![CentralStorageStatus {
-            storage_id: 7,
-            name: "storage-a".to_owned(),
-            volumes: vec![CentralVolumeStatus {
-                volume_id: 4,
-                name: "hot".to_owned(),
-                max_bytes: 1024,
-                used_bytes: 512,
-                raw_bytes: 900,
-                compressed_bytes: 300,
-            }],
-        }],
     }
 }

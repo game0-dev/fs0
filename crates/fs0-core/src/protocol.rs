@@ -5,36 +5,25 @@ use serde::{Deserialize, Serialize};
 pub enum SessionMessage {
     Ping,
     Pong,
-    Error(Fs0Error),
-    RegisterClient {
-        name: Option<String>,
-    },
-    ClientRegistered {
-        client_id: u64,
-        storages: Vec<StoragePeerInfo>,
-    },
-    RegisterStorage {
-        request: RegisterStorageRequest,
-    },
-    StorageRegistered {
-        storage_id: u64,
-        storages: Vec<StoragePeerInfo>,
-    },
     StorageChanged(StoragePeerInfo),
-    StorageRemoved {
-        storage_id: u64,
-    },
+    StorageRemoved { storage_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
+    RegisterClient {
+        name: Option<String>,
+        token: String,
+    },
+    RegisterStorage {
+        name: String,
+        token: String,
+        volumes: Vec<StorageVolumeInfo>,
+        iroh_endpoint: Vec<u8>,
+    },
     CreateVolume {
         name: String,
         max_bytes: u64,
-    },
-    GrantUploadLease(UploadLease),
-    RevokeUploadLease {
-        lease_id: u64,
     },
     CentralStatus,
     ListDirectory {
@@ -79,20 +68,38 @@ pub enum ControlRequest {
     AbortAppend {
         lease_id: u64,
     },
-    ReportBundleReplica(BundleReplicaReport),
+    GrantUploadLease(GrantUploadLeaseRequest),
+    RevokeUploadLease {
+        lease_id: u64,
+    },
+    ReportBundleReplica {
+        events: Vec<BundleReplicaEvent>,
+    },
+    ValidateClientAuth {
+        client_id: u64,
+        client_token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
-    CreateVolume(u64),
-    UploadLeaseGranted { lease_id: u64 },
-    UploadLeaseRevoked { lease_id: u64 },
-    CentralStatus(CentralStatus),
+    Error(Fs0Error),
+    RegisterClient {
+        client_id: u64,
+        storages: Vec<StoragePeerInfo>,
+    },
+    RegisterStorage {
+        storage_id: u64,
+        storages: Vec<StoragePeerInfo>,
+    },
+    CreateVolume {
+        volume_id: u64,
+    },
+    CentralStatus {
+        clients_count: u32,
+        storages: Vec<StoragePeerInfo>,
+    },
     ListDirectory(DirectoryEntries),
-    GetFileChangeLogs(FileChangeLogs),
-    BeginAppend(AppendLease),
-    CommitAppend(FileReadPlan),
-    AbortAppend,
     GetFileReadPlan(FileReadPlan),
     GetFileReadPlanById(FileReadPlan),
     DeleteFile,
@@ -101,12 +108,26 @@ pub enum ControlResponse {
     CopyFileById(FileRecord),
     RenameFile(FileRecord),
     RenameFileById(FileRecord),
+    GetFileChangeLogs(FileChangeLogs),
+    BeginAppend(AppendLease),
+    CommitAppend(FileReadPlan),
+    AbortAppend,
+    GrantUploadLease {
+        lease_id: u64,
+    },
+    RevokeUploadLease,
     ReportBundleReplica,
-    Error(Fs0Error),
+    ValidateClientAuth {
+        client_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataRequest {
+    Authenticate {
+        client_id: u64,
+        client_token: String,
+    },
     HasChunk {
         volume_id: u64,
         chunk_id: HashId,
@@ -139,6 +160,9 @@ pub enum DataRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataResponse {
+    Authenticate {
+        client_id: u64,
+    },
     HasChunk {
         exists: bool,
         raw_len: Option<u64>,
@@ -172,28 +196,6 @@ pub enum DataResponse {
 pub struct BundleChunkRef {
     pub chunk_index: u64,
     pub chunk_id: HashId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CentralStatus {
-    pub storages: Vec<CentralStorageStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CentralStorageStatus {
-    pub storage_id: u64,
-    pub name: String,
-    pub volumes: Vec<CentralVolumeStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CentralVolumeStatus {
-    pub volume_id: u64,
-    pub name: String,
-    pub max_bytes: u64,
-    pub used_bytes: u64,
-    pub raw_bytes: u64,
-    pub compressed_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -304,19 +306,12 @@ pub struct ReplicaLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegisterStorageRequest {
-    pub storage_id: u64,
-    pub name: String,
-    pub volumes: Vec<StorageVolumeInfo>,
-    pub iroh_endpoint: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageVolumeInfo {
     pub volume_id: u64,
     pub name: String,
     pub max_bytes: u64,
     pub max_volume_offset: u64,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,10 +352,18 @@ pub struct DirectoryEntries {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginAppendRequest {
     pub path: String,
-    pub expected_size: u64,
+    pub offset: u64,
     pub create: bool,
     pub prefer_volume_name: Option<String>,
-    pub idempotency_key: Option<String>,
+    pub append_size_hint: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantUploadLeaseRequest {
+    pub file_id: u64,
+    pub volume_id: u64,
+    pub base_size: u64,
+    pub prefer_volume_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,26 +372,11 @@ pub struct AppendLease {
     pub file_id: u64,
     pub volume_id: u64,
     pub base_size: u64,
+    pub offset: u64,
+    pub rewrite_offset: u64,
+    pub first_bundle_index: u64,
     pub expires_at_ms: u64,
     pub prefer_volume_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UploadLease {
-    pub lease_id: u64,
-    pub client_id: u64,
-    pub file_id: u64,
-    pub volume_id: u64,
-    pub base_size: u64,
-    pub expires_at_ms: u64,
-    pub prefer_volume_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UploadTarget {
-    pub storage_id: u64,
-    pub volume_id: u64,
-    pub iroh_endpoint: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,11 +393,6 @@ pub struct CommittedBundle {
     pub bundle_id: HashId,
     pub raw_len: u64,
     pub compressed_len: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundleReplicaReport {
-    pub events: Vec<BundleReplicaEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

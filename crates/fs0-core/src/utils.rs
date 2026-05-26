@@ -50,6 +50,8 @@ pub fn join_fs0_path(dir: &str, name: &str) -> Result<String, Fs0Error> {
 pub fn hash_id_from_vec(value: Vec<u8>) -> Result<HashId, Fs0Error> {
     let bytes = value
         .try_into()
-        .map_err(|_value: Vec<u8>| Fs0Error::InvalidRequest)?;
+        .map_err(|_value: Vec<u8>| Fs0Error::InvalidData {
+            message: "hash id must be 32 bytes".to_owned(),
+        })?;
     Ok(HashId(bytes))
 }
