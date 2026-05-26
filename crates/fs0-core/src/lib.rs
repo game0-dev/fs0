@@ -27,7 +27,11 @@ pub const VOLUME_RAW_CHUNK_SIZE: u64 = 1024 * 1024; // 1M
 /// Size of each backing data file within a volume.
 pub const VOLUME_DEFAULT_DATA_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4G
 /// SQLite metadata filename stored inside each volume root.
-pub const VOLUME_DB_FILE: &str = ".f0.volume.sqlite";
+pub const VOLUME_DB_FILE: &str = ".fs0.sqlite";
+/// Prefix for each backing data file within a volume.
+pub const VOLUME_DATA_FILE_PREFIX: &str = ".fs0.data.";
+/// Current volume metadata format version.
+pub const VOLUME_FORMAT_VERSION: u64 = 1;
 /// Maximum number of concurrent chunk reads from a volume.
 pub const VOLUME_READ_CONCURRENCY: usize = 4;
 /// Maximum number of concurrent chunk writes to a volume.

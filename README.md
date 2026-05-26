@@ -346,7 +346,6 @@ Options:
 | Option | Description |
 |---|---|
 | `--prefer-volume <NAME>` | Prefer writing to a specific volume name. |
-| `--idempotency-key <KEY>` | Idempotency key for retry-safe writes. |
 
 ---
 
@@ -362,6 +361,7 @@ Examples:
 
 ```bash
 fs0 --config .local/fs0.local.toml append /hello.txt ./more.txt
+fs0 --config .local/fs0.local.toml append /hello.txt ./replacement.txt --offset 1024
 echo "line" | fs0 --config .local/fs0.local.toml append /hello.txt -
 ```
 
@@ -372,7 +372,7 @@ Options:
 | Option | Description |
 |---|---|
 | `--prefer-volume <NAME>` | Prefer writing to a specific volume name. |
-| `--idempotency-key <KEY>` | Idempotency key for retry-safe appends. |
+| `--offset <BYTES>` | Rewrite from a specific logical offset. Defaults to the current remote file size. |
 
 ---
 

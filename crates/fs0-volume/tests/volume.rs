@@ -1,5 +1,5 @@
 use fs0_core::{DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, blake3_hash, zstd_compress, zstd_decompress};
-use fs0_volume::{DATA_FILE_SIZE, RAW_CHUNK_SIZE, Volume};
+use fs0_volume::{VOLUME_DEFAULT_DATA_FILE_SIZE, VOLUME_RAW_CHUNK_SIZE, Volume};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -13,7 +13,7 @@ fn test_volume(path: &Path, max_bytes: u64) -> Volume {
 
 fn create_sparse_data_file(path: &Path) {
     let file = File::create(path.join(".fs0.0")).unwrap();
-    file.set_len(DATA_FILE_SIZE).unwrap();
+    file.set_len(VOLUME_DEFAULT_DATA_FILE_SIZE).unwrap();
 }
 
 async fn put(volume: &Volume, raw: &[u8]) -> (HashId, u64) {
@@ -29,7 +29,7 @@ async fn put(volume: &Volume, raw: &[u8]) -> (HashId, u64) {
 
 async fn read_raw(volume: &Volume, chunk_id: HashId) -> Vec<u8> {
     let compressed_bytes = volume.read_chunk(chunk_id).await.unwrap();
-    zstd_decompress(&compressed_bytes, RAW_CHUNK_SIZE as usize).unwrap()
+    zstd_decompress(&compressed_bytes, VOLUME_RAW_CHUNK_SIZE as usize).unwrap()
 }
 
 #[tokio::test]
@@ -50,11 +50,11 @@ async fn init_and_open_volume() {
 
 #[tokio::test]
 async fn constants_and_options_use_expected_sizes() {
-    let max_bytes = 2 * DATA_FILE_SIZE;
+    let max_bytes = 2 * VOLUME_DEFAULT_DATA_FILE_SIZE;
 
-    assert_eq!(RAW_CHUNK_SIZE, 1024 * 1024);
-    assert_eq!(DATA_FILE_SIZE, 4 * 1024 * 1024 * 1024);
-    assert_eq!(max_bytes, 2 * DATA_FILE_SIZE);
+    assert_eq!(VOLUME_RAW_CHUNK_SIZE, 1024 * 1024);
+    assert_eq!(VOLUME_DEFAULT_DATA_FILE_SIZE, 4 * 1024 * 1024 * 1024);
+    assert_eq!(max_bytes, 2 * VOLUME_DEFAULT_DATA_FILE_SIZE);
 }
 
 #[tokio::test]
@@ -75,8 +75,8 @@ async fn put_chunk_and_read_it_back() {
 async fn chunk_meta_returns_requested_chunk_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let volume = test_volume(temp.path(), 1024 * 1024);
-    let raw_a = vec![b'a'; RAW_CHUNK_SIZE as usize];
-    let raw_b = vec![b'b'; RAW_CHUNK_SIZE as usize];
+    let raw_a = vec![b'a'; VOLUME_RAW_CHUNK_SIZE as usize];
+    let raw_b = vec![b'b'; VOLUME_RAW_CHUNK_SIZE as usize];
 
     let (_a, _) = put(&volume, &raw_a).await;
     let (b, _) = put(&volume, &raw_b).await;

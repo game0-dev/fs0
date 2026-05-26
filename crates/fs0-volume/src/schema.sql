@@ -12,6 +12,7 @@ CREATE TABLE volume_meta (
 
 CREATE TABLE chunks (
   chunk_id BLOB PRIMARY KEY CHECK (length(chunk_id) = 32),
+  compressed_hash BLOB NOT NULL CHECK (length(compressed_hash) = 32),
   volume_offset INTEGER NOT NULL,
   raw_len INTEGER NOT NULL,
   compressed_len INTEGER NOT NULL

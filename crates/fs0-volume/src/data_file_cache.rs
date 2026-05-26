@@ -1,4 +1,8 @@
-use crate::{Fs0Error, Result, io_platform};
+use crate::io_platform;
+use fs0_core::{
+    Fs0Error, Fs0Result, VOLUME_DATA_FILE_IDLE_TTL_MS, VOLUME_DATA_FILE_PREFIX,
+    VOLUME_DEFAULT_DATA_FILE_SIZE, now_ms,
+};
 use parking_lot::{Mutex, RwLock};
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
@@ -20,7 +24,7 @@ pub(crate) struct DataFileCache {
     /// Example: 1 for one HDD-backed volume.
     write_sem: Arc<Semaphore>,
 
-    /// index == .data.{index}
+    /// index == {VOLUME_DATA_FILE_PREFIX}{index}
     ///
     /// Use Arc<DataFileSlot> so in-flight read/write tasks can keep a slot
     /// after releasing the Vec lock.
@@ -48,8 +52,7 @@ impl DataFileSlot {
     }
 
     fn touch(&self) {
-        self.last_access_ms
-            .store(crate::volume::now_ms(), Ordering::Relaxed);
+        self.last_access_ms.store(now_ms(), Ordering::Relaxed);
     }
 }
 
@@ -74,7 +77,7 @@ impl DataFileCache {
         }
     }
 
-    pub(crate) async fn read_at(&self, index: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub(crate) async fn read_at(&self, index: u64, offset: u64, len: usize) -> Fs0Result<Vec<u8>> {
         let (slot, file) = self.get_or_open(index, false).await?;
 
         let permit = self
@@ -102,7 +105,7 @@ impl DataFileCache {
         Ok(result?)
     }
 
-    pub(crate) async fn write_at(&self, index: u64, offset: u64, bytes: Vec<u8>) -> Result<()> {
+    pub(crate) async fn write_at(&self, index: u64, offset: u64, bytes: Vec<u8>) -> Fs0Result<()> {
         let (slot, file) = self.get_or_open(index, true).await?;
 
         let permit = self
@@ -143,7 +146,7 @@ impl DataFileCache {
                 continue;
             }
 
-            if now_ms.saturating_sub(last_access_ms) <= fs0_core::DATA_FILE_IDLE_TTL_MS {
+            if now_ms.saturating_sub(last_access_ms) <= VOLUME_DATA_FILE_IDLE_TTL_MS {
                 continue;
             }
 
@@ -159,7 +162,7 @@ impl DataFileCache {
         &self,
         index: u64,
         create_if_missing: bool,
-    ) -> Result<(Arc<DataFileSlot>, Arc<File>)> {
+    ) -> Fs0Result<(Arc<DataFileSlot>, Arc<File>)> {
         let index = usize::try_from(index).map_err(|_| Fs0Error::IntegerConversion {
             message: format!("data file index {index} exceeds usize"),
         })?;
@@ -179,14 +182,14 @@ impl DataFileCache {
 
         let root = self.root.clone();
         let open_slot = slot.clone();
-        let task_result = tokio::task::spawn_blocking(move || -> Result<Arc<File>> {
+        let task_result = tokio::task::spawn_blocking(move || -> Fs0Result<Arc<File>> {
             let mut guard = open_slot.file.lock();
 
             if let Some(file) = guard.as_ref() {
                 return Ok(file.clone());
             }
 
-            let path = root.join(format!(".fs0.{index}"));
+            let path = root.join(format!("{VOLUME_DATA_FILE_PREFIX}{index}"));
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -194,8 +197,8 @@ impl DataFileCache {
                 .truncate(false)
                 .open(&path)?;
 
-            if create_if_missing && file.metadata()?.len() < fs0_core::DATA_FILE_SIZE {
-                io_platform::preallocate(&file, fs0_core::DATA_FILE_SIZE)?;
+            if create_if_missing && file.metadata()?.len() < VOLUME_DEFAULT_DATA_FILE_SIZE {
+                io_platform::preallocate(&file, VOLUME_DEFAULT_DATA_FILE_SIZE)?;
             }
 
             let file = Arc::new(file);
