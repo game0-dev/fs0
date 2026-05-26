@@ -5,7 +5,6 @@ members = [
     "crates/fs0-config",
     "crates/fs0-client",
     "crates/fs0-core",
-    "crates/fs0-fuse",
     "crates/fs0-storage",
     "crates/fs0-transport",
     "crates/fs0-volume",

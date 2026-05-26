@@ -1055,10 +1055,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs0-fuse"
-version = "0.1.0"
-
-[[package]]
 name = "fs0-storage"
 version = "0.1.0"
 dependencies = [
