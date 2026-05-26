@@ -1,4 +1,4 @@
-use crate::{Fs0Error, HashId};
+use crate::{Fs0Error, Fs0Result, HashId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[must_use]
@@ -9,19 +9,19 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn u64_to_i64(value: u64, name: &str) -> Result<i64, Fs0Error> {
+pub fn u64_to_i64(value: u64, name: &str) -> Fs0Result<i64> {
     i64::try_from(value).map_err(|_| Fs0Error::IntegerConversion {
         message: format!("{name} value {value} does not fit in i64"),
     })
 }
 
-pub fn i64_to_u64(value: i64, name: &str) -> Result<u64, Fs0Error> {
+pub fn i64_to_u64(value: i64, name: &str) -> Fs0Result<u64> {
     u64::try_from(value).map_err(|_| Fs0Error::IntegerConversion {
         message: format!("{name} value {value} is negative"),
     })
 }
 
-pub fn split_fs0_path(path: &str) -> Result<(String, String), Fs0Error> {
+pub fn split_fs0_path(path: &str) -> Fs0Result<(String, String)> {
     if !path.starts_with('/') {
         return Err(Fs0Error::InvalidRequest);
     }
@@ -39,7 +39,7 @@ pub fn split_fs0_path(path: &str) -> Result<(String, String), Fs0Error> {
     Ok((parent.to_owned(), name.to_owned()))
 }
 
-pub fn join_fs0_path(dir: &str, name: &str) -> Result<String, Fs0Error> {
+pub fn join_fs0_path(dir: &str, name: &str) -> Fs0Result<String> {
     if dir == "/" {
         Ok(format!("/{name}"))
     } else {
@@ -47,7 +47,7 @@ pub fn join_fs0_path(dir: &str, name: &str) -> Result<String, Fs0Error> {
     }
 }
 
-pub fn hash_id_from_vec(value: Vec<u8>) -> Result<HashId, Fs0Error> {
+pub fn hash_id_from_vec(value: Vec<u8>) -> Fs0Result<HashId> {
     let bytes = value
         .try_into()
         .map_err(|_value: Vec<u8>| Fs0Error::InvalidData {
