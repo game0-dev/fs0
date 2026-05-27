@@ -1,8 +1,9 @@
 use crate::data_file_cache::DataFileCache;
 use crate::db::{InsertChunk, VolumeDb};
 use fs0_core::{
-    BundleChunkRef, BundleReplicaEvent, Fs0Error, Fs0Result, HashId, VOLUME_DEFAULT_DATA_FILE_SIZE,
-    VOLUME_DB_FILE, VOLUME_FORMAT_VERSION, blake3_hash, bundle_hash_from_chunks, now_ms,
+    BundleChunkRef, BundleReplicaEvent, Fs0Error, Fs0Result, HashId, VOLUME_DB_FILE,
+    VOLUME_DEFAULT_DATA_FILE_SIZE, VOLUME_FORMAT_VERSION, blake3_hash, bundle_hash_from_chunks,
+    now_ms,
 };
 use parking_lot::Mutex;
 use std::fs;
@@ -156,12 +157,19 @@ impl Volume {
             let mut db = self.db.lock();
             match db.load_chunk(chunk_id)? {
                 Some(existing) => {
-                    if existing.raw_len != raw_len {
+                    if existing.raw_len != raw_len
+                        || existing.compressed_len != compressed_len
+                        || existing.compressed_hash != compressed_hash
+                    {
                         warn!(
                             ?chunk_id,
                             existing_raw_len = existing.raw_len,
                             raw_len,
-                            "chunk id already exists with different raw length"
+                            existing_compressed_len = existing.compressed_len,
+                            compressed_len,
+                            existing_compressed_hash = ?existing.compressed_hash,
+                            compressed_hash = ?compressed_hash,
+                            "chunk id already exists with different integrity metadata"
                         );
                         return Err(Fs0Error::HashMismatch {
                             volume_offset: existing.volume_offset,
@@ -395,9 +403,7 @@ impl Volume {
     }
 
     pub async fn ack_pending_central_events(&self, max_event_id: u64) -> Fs0Result<()> {
-        self.db
-            .lock()
-            .ack_pending_central_events(max_event_id)?;
+        self.db.lock().ack_pending_central_events(max_event_id)?;
         debug!(max_event_id, "acked pending central events");
         Ok(())
     }
@@ -472,7 +478,6 @@ impl Volume {
         }
         Ok((raw_len, compressed_len))
     }
-
 }
 
 fn validate_chunk(_chunk_id: HashId, raw_len: u64, compressed_bytes: &[u8]) -> Fs0Result<()> {

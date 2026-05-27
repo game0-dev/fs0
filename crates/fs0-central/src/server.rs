@@ -376,15 +376,16 @@ impl CentralServer {
         client_id: u64,
     ) -> Fs0Result<fs0_core::FileReadPlan> {
         let lease_id = request.lease_id;
-        let plan = self
-            .db
-            .lock()
-            .commit_append(request, client_id)
-            .and_then(|plan| self.hydrate_read_plan_replicas(plan))?;
+        let result = {
+            self.db
+                .lock()
+                .commit_append(request, client_id)
+                .and_then(|plan| self.hydrate_read_plan_replicas(plan))
+        };
 
         self.revoke_storage_upload_lease(lease_id).await;
 
-        Ok(plan)
+        result
     }
 
     async fn abort_append(&self, lease_id: u64, client_id: u64) -> Fs0Result<()> {

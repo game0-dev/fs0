@@ -132,9 +132,8 @@ impl VolumeDb {
 
         stmt.query_row([], |row| {
             Ok(VolumeMeta {
-                volume_id: i64_to_u64(row.get(0)?, "volume_id").map_err(|err| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                })?,
+                volume_id: i64_to_u64(row.get(0)?, "volume_id")
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
                 format_version: i64_to_u64(row.get(1)?, "format_version")
                     .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
                 max_bytes: i64_to_u64(row.get(2)?, "max_bytes")
@@ -515,5 +514,4 @@ impl VolumeDb {
 
         Ok(())
     }
-
 }

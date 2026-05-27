@@ -162,6 +162,10 @@ impl CentralDb {
         if lease.base_size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict);
         }
+        if request.new_size < request.base_size {
+            return Err(Fs0Error::InvalidRequest);
+        }
+
         let (rewrite_offset, first_bundle_index) =
             Self::commit_rewrite_point(&tx, lease.file_id, request.new_size, &request.bundles)?;
         let rewritten_len = request
@@ -1182,6 +1186,173 @@ mod tests {
     }
 
     #[test]
+    fn commit_append_rejects_missing_lease() {
+        let (_temp, mut db, _volume_id) = test_db();
+
+        let result = db.commit_append(
+            CommitAppendRequest {
+                lease_id: 404,
+                base_size: 0,
+                new_size: 0,
+                bundles: Vec::new(),
+            },
+            1,
+        );
+
+        assert!(matches!(result, Err(Fs0Error::NotFound)));
+    }
+
+    #[test]
+    fn commit_append_rejects_wrong_client() {
+        let (_temp, mut db, volume_id) = test_db();
+        let lease = begin_create(&mut db, volume_id);
+        let bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, bundle_id, 12);
+
+        let result = db.commit_append(
+            CommitAppendRequest {
+                lease_id: lease.lease_id,
+                base_size: 0,
+                new_size: 12,
+                bundles: vec![committed_bundle(0, bundle_id, 12)],
+            },
+            2,
+        );
+
+        assert!(matches!(result, Err(Fs0Error::Unauthorized)));
+    }
+
+    #[test]
+    fn commit_append_rejects_stale_request_base_size() {
+        let (_temp, mut db, volume_id) = test_db();
+        let lease = begin_create(&mut db, volume_id);
+        let bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, bundle_id, 12);
+
+        let result = db.commit_append(
+            CommitAppendRequest {
+                lease_id: lease.lease_id,
+                base_size: 1,
+                new_size: 12,
+                bundles: vec![committed_bundle(0, bundle_id, 12)],
+            },
+            1,
+        );
+
+        assert!(matches!(result, Err(Fs0Error::VersionConflict)));
+    }
+
+    #[test]
+    fn commit_append_rejects_changed_file_size_since_lease() {
+        let (_temp, mut db, volume_id) = test_db();
+        let first_lease = begin_create(&mut db, volume_id);
+        let first_bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, first_bundle_id, 12);
+        db.commit_append(
+            CommitAppendRequest {
+                lease_id: first_lease.lease_id,
+                base_size: 0,
+                new_size: 12,
+                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
+            },
+            1,
+        )
+        .unwrap();
+
+        let stale_lease = begin_append(&mut db, volume_id, 12);
+        db.conn
+            .execute(
+                "UPDATE files SET size_bytes = ?2 WHERE file_id = ?1",
+                params![
+                    u64_to_i64(stale_lease.file_id, "file_id").unwrap(),
+                    u64_to_i64(24, "size_bytes").unwrap(),
+                ],
+            )
+            .unwrap();
+        let stale_bundle_id = HashId([2; 32]);
+        record_bundle(&mut db, volume_id, stale_bundle_id, 12);
+
+        let result = db.commit_append(
+            CommitAppendRequest {
+                lease_id: stale_lease.lease_id,
+                base_size: 12,
+                new_size: 24,
+                bundles: vec![committed_bundle(1, stale_bundle_id, 12)],
+            },
+            1,
+        );
+
+        assert!(matches!(result, Err(Fs0Error::VersionConflict)));
+    }
+
+    #[test]
+    fn commit_append_rejects_new_size_less_than_base_size() {
+        let (_temp, mut db, volume_id) = test_db();
+        let first_lease = begin_create(&mut db, volume_id);
+        let first_bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, first_bundle_id, 12);
+        db.commit_append(
+            CommitAppendRequest {
+                lease_id: first_lease.lease_id,
+                base_size: 0,
+                new_size: 12,
+                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
+            },
+            1,
+        )
+        .unwrap();
+
+        let lease = begin_append(&mut db, volume_id, 12);
+        let result = db.commit_append(
+            CommitAppendRequest {
+                lease_id: lease.lease_id,
+                base_size: 12,
+                new_size: 11,
+                bundles: Vec::new(),
+            },
+            1,
+        );
+
+        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
+    }
+
+    #[test]
+    fn begin_append_rejects_second_client_at_same_base_size() {
+        let (_temp, mut db, volume_id) = test_db();
+        let first_lease = begin_create(&mut db, volume_id);
+        let first_bundle_id = HashId([1; 32]);
+        record_bundle(&mut db, volume_id, first_bundle_id, 12);
+        db.commit_append(
+            CommitAppendRequest {
+                lease_id: first_lease.lease_id,
+                base_size: 0,
+                new_size: 12,
+                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
+            },
+            1,
+        )
+        .unwrap();
+
+        let _client_a_lease = begin_append(&mut db, volume_id, 12);
+        let client_b_lease = db.begin_append(
+            BeginAppendRequest {
+                path: "/file".to_owned(),
+                offset: 12,
+                create: false,
+                prefer_volume_name: None,
+                append_size_hint: None,
+            },
+            2,
+            volume_id,
+        );
+
+        assert!(matches!(
+            client_b_lease,
+            Err(Fs0Error::AlreadyExists { .. })
+        ));
+    }
+
+    #[test]
     fn record_bundle_events_rejects_metadata_conflicts() {
         let (_temp, mut db, volume_id) = test_db();
         let bundle_id = HashId([1; 32]);
@@ -1269,21 +1440,21 @@ mod tests {
         assert_eq!(rewrite_lease.rewrite_offset, 0);
         assert_eq!(rewrite_lease.first_bundle_index, 0);
         let replacement_bundle_id = HashId([3; 32]);
-        record_bundle(&mut db, volume_id, replacement_bundle_id, 8);
+        record_bundle(&mut db, volume_id, replacement_bundle_id, 23);
 
         let plan = db
             .commit_append(
                 CommitAppendRequest {
                     lease_id: rewrite_lease.lease_id,
                     base_size: 20,
-                    new_size: 8,
-                    bundles: vec![committed_bundle(0, replacement_bundle_id, 8)],
+                    new_size: 23,
+                    bundles: vec![committed_bundle(0, replacement_bundle_id, 23)],
                 },
                 1,
             )
             .unwrap();
 
-        assert_eq!(plan.size, 8);
+        assert_eq!(plan.size, 23);
         assert_eq!(plan.bundles.len(), 1);
         assert_eq!(plan.bundles[0].bundle_id, replacement_bundle_id);
         assert_eq!(plan.bundles[0].bundle_index, 0);

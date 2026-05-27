@@ -130,25 +130,28 @@ async fn init_rejects_volume_smaller_than_one_data_file() {
 }
 
 #[tokio::test]
-async fn same_raw_chunk_reuses_storage_across_compression_levels() {
+async fn same_raw_chunk_with_different_compression_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
     let raw = b"same raw chunk across compression levels".repeat(4096);
     let chunk_id = blake3_hash(&raw);
     let fast = zstd_compress(&raw, 1).unwrap();
-    let dense = zstd_compress(&raw, 9).unwrap();
+    let mut different_compressed_bytes = fast.clone();
+    *different_compressed_bytes.last_mut().unwrap() ^= 1;
 
     let first = volume
         .put_chunk(chunk_id, raw.len() as u64, fast)
         .await
         .unwrap();
     let offset = volume.meta().active_volume_offset;
-    let second = volume
-        .put_chunk(chunk_id, raw.len() as u64, dense)
-        .await
-        .unwrap();
+    let result = volume
+        .put_chunk(chunk_id, raw.len() as u64, different_compressed_bytes)
+        .await;
 
-    assert_eq!(first.volume_offset, second.volume_offset);
+    assert!(matches!(
+        result,
+        Err(Fs0Error::HashMismatch { volume_offset }) if volume_offset == first.volume_offset
+    ));
     assert_eq!(volume.meta().active_volume_offset, offset);
 }
 
