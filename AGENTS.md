@@ -20,6 +20,7 @@ Changes should live in the crate that owns the behavior. Do not move code into `
 - Use `pub(crate)` unless an item is clearly part of the crate API.
 - For ambiguous booleans or positional `Option` parameters, prefer enums, newtypes, or named structs.
 - Inline format arguments when possible: `format!("volume {volume_id}")`.
+- Merge imports that share the same root into one `use` tree. For example, keep all `std`, `crate`, or other imports together instead of splitting them across multiple `use` statements.
 - Use method references instead of redundant closures when the method form is clearer.
 - Collapse `if` statements when possible to avoid unnecessary nesting.
 - Prefer exhaustive `match` statements; avoid wildcard arms when adding a future variant should force a compile error.

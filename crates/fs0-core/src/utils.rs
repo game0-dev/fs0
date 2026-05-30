@@ -66,12 +66,11 @@ pub fn decode_hex_bytes(value: &str, name: &str) -> Fs0Result<Vec<u8>> {
 
     let mut bytes = Vec::with_capacity(value.len() / 2);
     for index in (0..value.len()).step_by(2) {
-        let byte =
-            u8::from_str_radix(&value[index..index + 2], 16).map_err(|err| {
-                Fs0Error::InvalidConfig {
-                    message: format!("invalid {name} hex at byte {}: {err}", index / 2),
-                }
-            })?;
+        let byte = u8::from_str_radix(&value[index..index + 2], 16).map_err(|err| {
+            Fs0Error::InvalidConfig {
+                message: format!("invalid {name} hex at byte {}: {err}", index / 2),
+            }
+        })?;
         bytes.push(byte);
     }
 

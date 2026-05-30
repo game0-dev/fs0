@@ -1,14 +1,16 @@
 use crate::io_platform;
 use fs0_core::{
     Fs0Error, Fs0Result, VOLUME_DATA_FILE_IDLE_TTL_MS, VOLUME_DATA_FILE_PREFIX,
-    VOLUME_DEFAULT_DATA_FILE_SIZE, now_ms,
+    VOLUME_DEFAULT_DATA_FILE_SIZE, utils::now_ms,
 };
 use parking_lot::{Mutex, RwLock};
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    fs::{File, OpenOptions},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::sync::Semaphore;
 
@@ -136,7 +138,7 @@ impl DataFileCache {
     /// Call this from a background task, e.g. every 10 seconds.
     ///
     /// Do not call this after every read/write.
-    pub(crate) fn reap_idle(&self, now_ms: u64) {
+    pub(crate) fn close_idle(&self, now_ms: u64) {
         let slots = self.slots.read();
 
         for slot in slots.iter() {

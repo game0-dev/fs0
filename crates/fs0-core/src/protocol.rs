@@ -133,9 +133,9 @@ pub enum DataRequest {
         chunk_id: HashId,
     },
     UploadChunk {
+        lease_id: u64,
         volume_id: u64,
         chunk_id: HashId,
-        compressed_hash: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     },
@@ -148,6 +148,7 @@ pub enum DataRequest {
         bundle_id: HashId,
     },
     CommitBundle {
+        lease_id: u64,
         volume_id: u64,
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
@@ -276,10 +277,12 @@ pub struct BeginAppendRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantUploadLeaseRequest {
+    pub lease_id: u64,
     pub client_id: u64,
     pub file_id: u64,
     pub volume_id: u64,
     pub base_size: u64,
+    pub expires_at_ms: u64,
     pub prefer_volume_name: Option<String>,
 }
 

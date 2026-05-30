@@ -39,11 +39,10 @@ CREATE INDEX idx_bundle_chunks_chunk
 CREATE INDEX idx_bundle_chunks_bundle
   ON bundle_chunks(bundle_id);
 
-CREATE TABLE pending_central_events (
+CREATE TABLE bundle_change_records (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_type TEXT NOT NULL CHECK (
     event_type IN ('bundle_stored', 'bundle_deleted')
   ),
-  bundle_id BLOB NOT NULL UNIQUE CHECK (length(bundle_id) = 32),
-  last_failed_at_ms INTEGER
+  bundle_id BLOB NOT NULL UNIQUE CHECK (length(bundle_id) = 32)
 );

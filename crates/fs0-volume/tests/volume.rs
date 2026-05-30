@@ -1,13 +1,17 @@
 use fs0_core::{
-    DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, VOLUME_DATA_FILE_PREFIX, VOLUME_DEFAULT_DATA_FILE_SIZE,
-    VOLUME_RAW_CHUNK_SIZE, VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY, blake3_hash,
+    DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, VOLUME_DATA_FILE_PREFIX, VOLUME_DB_FILE,
+    VOLUME_DEFAULT_DATA_FILE_SIZE, VOLUME_RAW_CHUNK_SIZE, VOLUME_READ_CONCURRENCY,
+    VOLUME_WRITE_CONCURRENCY, blake3_hash, bundle_hash_from_chunks,
+    protocol::{BundleChunkRef, BundleReplicaEventKind},
     zstd_compress, zstd_decompress,
 };
 use fs0_volume::Volume;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use rusqlite::{Connection, params};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Seek, SeekFrom, Write},
+    path::Path,
+};
 
 fn test_volume(path: &Path, max_bytes: u64) -> Volume {
     Volume::init_fs(path, max_bytes).unwrap();
@@ -37,7 +41,7 @@ async fn put(volume: &Volume, raw: &[u8]) -> (HashId, u64) {
 }
 
 async fn read_raw(volume: &Volume, chunk_id: HashId) -> Vec<u8> {
-    let compressed_bytes = volume.read_chunk(chunk_id).await.unwrap();
+    let (_meta, compressed_bytes) = volume.read_chunk(chunk_id).await.unwrap();
     zstd_decompress(&compressed_bytes, VOLUME_RAW_CHUNK_SIZE as usize).unwrap()
 }
 
@@ -90,6 +94,24 @@ async fn put_chunk_and_read_it_back() {
     assert_eq!(meta.raw_len, raw.len() as u64);
     assert_eq!(meta.compressed_len, compressed_len);
     assert_eq!(read_raw(&volume, chunk_id).await, raw);
+}
+
+#[tokio::test]
+async fn read_chunk_returns_metadata_and_compressed_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let raw = b"read with metadata";
+    let (chunk_id, compressed_len) = put(&volume, raw).await;
+
+    let (meta, compressed_bytes) = volume.read_chunk(chunk_id).await.unwrap();
+
+    assert_eq!(meta.chunk_id, chunk_id);
+    assert_eq!(meta.raw_len, raw.len() as u64);
+    assert_eq!(meta.compressed_len, compressed_len);
+    assert_eq!(
+        zstd_decompress(&compressed_bytes, VOLUME_RAW_CHUNK_SIZE as usize).unwrap(),
+        raw
+    );
 }
 
 #[tokio::test]
@@ -184,6 +206,128 @@ async fn read_chunk_does_not_hash_check_stored_bytes() {
     file.write_all(&[9]).unwrap();
     file.sync_data().unwrap();
 
-    let read = volume.read_chunk(chunk_id).await.unwrap();
+    let (_meta, read) = volume.read_chunk(chunk_id).await.unwrap();
     assert_eq!(read[0], 9);
+}
+
+#[tokio::test]
+async fn commit_bundle_rejects_bundle_hash_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let (chunk_id, _) = put(&volume, b"bundle hash").await;
+    let chunks = vec![BundleChunkRef {
+        chunk_index: 0,
+        chunk_id,
+    }];
+
+    let result = volume.commit_bundle(HashId([9; 32]), chunks).await;
+
+    assert!(matches!(result, Err(Fs0Error::InvalidData { .. })));
+}
+
+#[tokio::test]
+async fn commit_bundle_rejects_missing_chunk() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let missing = HashId([7; 32]);
+    let chunks = vec![BundleChunkRef {
+        chunk_index: 0,
+        chunk_id: missing,
+    }];
+    let bundle_id = bundle_hash_from_chunks(&chunks);
+
+    let result = volume.commit_bundle(bundle_id, chunks).await;
+
+    assert!(matches!(
+        result,
+        Err(Fs0Error::ChunkNotFound { chunk_id }) if chunk_id == missing
+    ));
+}
+
+#[tokio::test]
+async fn bundle_change_records_are_inserted_and_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let (chunk_id, compressed_len) = put(&volume, b"bundle changes").await;
+    let chunks = vec![BundleChunkRef {
+        chunk_index: 0,
+        chunk_id,
+    }];
+    let bundle_id = bundle_hash_from_chunks(&chunks);
+    volume.commit_bundle(bundle_id, chunks).await.unwrap();
+
+    let records = volume.get_bundle_change_records(10).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, BundleReplicaEventKind::Stored);
+    assert_eq!(records[0].bundle_id, bundle_id);
+    assert_eq!(records[0].raw_len, Some(b"bundle changes".len() as u64));
+    assert_eq!(records[0].compressed_len, Some(compressed_len));
+
+    volume
+        .remove_bundle_change_records(records[0].event_id)
+        .await
+        .unwrap();
+    assert!(
+        volume
+            .get_bundle_change_records(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn commit_bundle_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let (chunk_id, _) = put(&volume, b"idempotent bundle").await;
+    let chunks = vec![BundleChunkRef {
+        chunk_index: 0,
+        chunk_id,
+    }];
+    let bundle_id = bundle_hash_from_chunks(&chunks);
+
+    let first = volume
+        .commit_bundle(bundle_id, chunks.clone())
+        .await
+        .unwrap();
+    let second = volume.commit_bundle(bundle_id, chunks).await.unwrap();
+    let records = volume.get_bundle_change_records(10).await.unwrap();
+
+    assert_eq!(second, first);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, BundleReplicaEventKind::Stored);
+    assert_eq!(records[0].bundle_id, bundle_id);
+}
+
+#[tokio::test]
+async fn db_row_conversion_errors_are_sqlite_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let volume = test_volume(temp.path(), VOLUME_DEFAULT_DATA_FILE_SIZE);
+    let (chunk_id, _) = put(&volume, b"bad db row").await;
+
+    let conn = Connection::open(temp.path().join(VOLUME_DB_FILE)).unwrap();
+    conn.execute(
+        "UPDATE chunks SET raw_len = -1 WHERE chunk_id = ?1",
+        params![chunk_id.as_bytes().as_slice()],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        volume.chunk_meta(chunk_id).await,
+        Err(Fs0Error::Sqlite { .. })
+    ));
+
+    conn.execute("PRAGMA ignore_check_constraints = ON", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE chunks SET raw_len = 1, compressed_hash = x'00' WHERE chunk_id = ?1",
+        params![chunk_id.as_bytes().as_slice()],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        volume.chunk_meta(chunk_id).await,
+        Err(Fs0Error::Sqlite { .. })
+    ));
 }

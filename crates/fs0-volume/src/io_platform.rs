@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io;
+use std::{fs::File, io};
 
 #[cfg(unix)]
 pub(crate) fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {

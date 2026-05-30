@@ -2,13 +2,13 @@ pub mod compression;
 pub mod error;
 pub mod hash;
 pub mod protocol;
+pub mod sqlite;
 pub mod utils;
 
 pub use compression::*;
 pub use error::*;
 pub use hash::*;
-pub use protocol::*;
-pub use utils::*;
+pub use sqlite::*;
 
 /// Default zstd compression level used by fs0 clients.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 9;

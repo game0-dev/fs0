@@ -1,10 +1,13 @@
 use fs0_core::{
-    blake3_hash, bundle_hash_from_chunks, zstd_compress, zstd_decompress, AppendLease,
-    BeginAppendRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
-    CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DataRequest,
-    DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
-    FileChangeLogs, FileReadPlan, Fs0Error, GrantUploadLeaseRequest, HashId, ReplicaLocation,
-    SessionMessage, StoragePeerInfo, StorageVolumeInfo, DEFAULT_ZSTD_LEVEL,
+    DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
+    protocol::{
+        AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent,
+        BundleReplicaEventKind, CommitAppendRequest, CommittedBundle, ControlRequest,
+        ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog,
+        FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest,
+        ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo,
+    },
+    zstd_compress, zstd_decompress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -273,9 +276,9 @@ fn data_protocol_roundtrip() {
         chunk_id,
     });
     assert_postcard_roundtrip(&DataRequest::UploadChunk {
+        lease_id: 9,
         volume_id: 4,
         chunk_id,
-        compressed_hash: HashId([3; 32]),
         raw_len: 12,
         compressed_bytes: vec![1, 2, 3],
     });
@@ -288,6 +291,7 @@ fn data_protocol_roundtrip() {
         bundle_id,
     });
     assert_postcard_roundtrip(&DataRequest::CommitBundle {
+        lease_id: 9,
         volume_id: 4,
         bundle_id,
         chunks: vec![chunk.clone()],
@@ -353,10 +357,12 @@ fn storage_peer() -> StoragePeerInfo {
 
 fn grant_upload_lease_request() -> GrantUploadLeaseRequest {
     GrantUploadLeaseRequest {
+        lease_id: 9,
         client_id: 3,
         file_id: 11,
         volume_id: 4,
         base_size: 0,
+        expires_at_ms: 123_456,
         prefer_volume_name: Some("hot".to_owned()),
     }
 }
@@ -399,8 +405,8 @@ fn file_read_plan() -> FileReadPlan {
     }
 }
 
-fn file_record(path: &str) -> fs0_core::FileRecord {
-    fs0_core::FileRecord {
+fn file_record(path: &str) -> FileRecord {
+    FileRecord {
         file_id: 3,
         path: path.to_owned(),
         size_bytes: 12,
