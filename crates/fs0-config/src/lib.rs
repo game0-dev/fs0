@@ -26,14 +26,13 @@ use std::path::{Path, PathBuf};
 /// name = "local-storage-1"
 /// token = "dev-token"
 /// central_endpoint = "127.0.0.1:3340"
+/// check_hash_before_write = false
 ///
 /// [[storage.volumes]]
 /// path = ".local/volume-1"
 /// volume_id = 1
 /// name = "local-volume-1"
 /// read_only = false
-///
-/// [storage.volumes.volume_io]
 /// read_concurrency = 4
 /// write_concurrency = 1
 /// ```
@@ -67,6 +66,8 @@ pub struct StorageConfig {
     pub token: String,
     pub central_endpoint: String,
     pub volumes: Vec<StorageVolumeConfig>,
+    #[serde(default)]
+    pub check_hash_before_write: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -76,12 +77,6 @@ pub struct StorageVolumeConfig {
     pub name: String,
     #[serde(default)]
     pub read_only: bool,
-    #[serde(default)]
-    pub volume_io: StorageVolumeIoConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct StorageVolumeIoConfig {
     #[serde(default = "default_volume_read_concurrency")]
     pub read_concurrency: usize,
     #[serde(default = "default_volume_write_concurrency")]
@@ -92,15 +87,6 @@ pub struct StorageVolumeIoConfig {
 pub struct ClientConfig {
     pub token: String,
     pub central_endpoint: String,
-}
-
-impl Default for StorageVolumeIoConfig {
-    fn default() -> Self {
-        Self {
-            read_concurrency: default_volume_read_concurrency(),
-            write_concurrency: default_volume_write_concurrency(),
-        }
-    }
 }
 
 impl Fs0Config {

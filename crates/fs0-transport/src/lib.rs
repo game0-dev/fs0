@@ -1,7 +1,7 @@
 use fs0_core::{
-    ControlRequest, ControlResponse, DataRequest, DataResponse, Fs0Error, Fs0Result,
-    TRANSPORT_CONTROL_ALPN, TRANSPORT_DATA_ALPN, TRANSPORT_FRAME_LEN_BYTES,
+    Fs0Error, Fs0Result, TRANSPORT_CONTROL_ALPN, TRANSPORT_DATA_ALPN, TRANSPORT_FRAME_LEN_BYTES,
     TRANSPORT_MAX_FRAME_BODY_LEN,
+    protocol::{ControlRequest, ControlResponse, DataRequest, DataResponse},
 };
 use iroh::{
     Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl,
@@ -135,7 +135,10 @@ pub fn decode_endpoint_addr(bytes: &[u8]) -> Fs0Result<EndpointAddr> {
     Ok(postcard::from_bytes(bytes)?)
 }
 
-pub async fn connect_control(endpoint: &Endpoint, control_endpoint: &[u8]) -> Fs0Result<Connection> {
+pub async fn connect_control(
+    endpoint: &Endpoint,
+    control_endpoint: &[u8],
+) -> Fs0Result<Connection> {
     let addr = decode_endpoint_addr(control_endpoint)?;
     endpoint
         .connect(addr, TRANSPORT_CONTROL_ALPN)

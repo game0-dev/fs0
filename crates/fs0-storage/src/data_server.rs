@@ -1,13 +1,15 @@
 use crate::server::StorageServer;
-use fs0_core::{DataRequest, DataResponse, Fs0Error};
+use fs0_core::{
+    Fs0Error,
+    protocol::{DataRequest, DataResponse},
+};
 use fs0_transport::{read_frame, write_frame};
 use iroh::{
     Endpoint,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use std::sync::{Arc, Weak};
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 
 pub(crate) fn spawn_data_accept_loop(
     endpoint: Endpoint,
@@ -69,7 +71,9 @@ async fn handle_data_connection(
                     continue;
                 }
 
-                let client_id = authenticated_client_id.expect("authenticated client id is set");
+                let Some(client_id) = authenticated_client_id else {
+                    break;
+                };
                 let server = server.clone();
                 tokio::spawn(async move {
                     handle_data_stream(server, client_id, send, recv).await;
@@ -145,9 +149,9 @@ async fn handle_data_request(
             Err(err) => DataResponse::Error(err),
         },
         DataRequest::UploadChunk {
+            lease_id,
             volume_id,
             chunk_id,
-            compressed_hash,
             raw_len,
             compressed_bytes,
         } => {
@@ -155,9 +159,9 @@ async fn handle_data_request(
             match server
                 .put_chunk(
                     client_id,
+                    lease_id,
                     volume_id,
                     chunk_id,
-                    compressed_hash,
                     raw_len,
                     compressed_bytes,
                 )
@@ -197,11 +201,12 @@ async fn handle_data_request(
             Err(err) => DataResponse::Error(err),
         },
         DataRequest::CommitBundle {
+            lease_id,
             volume_id,
             bundle_id,
             chunks,
         } => match server
-            .commit_bundle(client_id, volume_id, bundle_id, chunks)
+            .commit_bundle(client_id, lease_id, volume_id, bundle_id, chunks)
             .await
         {
             Ok(bundle) => DataResponse::CommitBundle {

@@ -1,9 +1,12 @@
-use crate::data_server::spawn_data_accept_loop;
-use crate::{Fs0Result, StorageConfig};
+use crate::{Fs0Result, StorageConfig, data_server::spawn_data_accept_loop};
 use fs0_core::{
-    BundleChunkRef, BundleReplicaEvent, ControlRequest, ControlResponse, Fs0Error,
-    GrantUploadLeaseRequest, HashId, StorageVolumeInfo, TRANSPORT_DATA_ALPN,
-    VOLUME_DATA_FILE_IDLE_TTL_MS, blake3_hash, decode_hex_bytes, now_ms,
+    Fs0Error, HashId, TRANSPORT_DATA_ALPN, VOLUME_DATA_FILE_IDLE_TTL_MS, blake3_hash,
+    protocol::{
+        BundleChunkRef, BundleReplicaEvent, ControlRequest, ControlResponse,
+        GrantUploadLeaseRequest, StorageVolumeInfo,
+    },
+    utils::{decode_hex_bytes, now_ms},
+    zstd_decompress,
 };
 use fs0_transport::{connect_control, control_rpc, encode_endpoint_addr, read_frame, write_frame};
 use fs0_volume::{BundleMeta, ChunkMeta, Volume, VolumeMeta};
@@ -12,21 +15,24 @@ use iroh::{
     endpoint::{Connection, VarInt, presets},
 };
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-use tokio::time::{Duration, interval};
+use tokio::{
+    sync::Notify,
+    task::JoinHandle,
+    time::{Duration, interval},
+};
 
 #[derive(Debug)]
 pub struct StorageServer {
     config: Arc<StorageConfig>,
     storage_id: AtomicU64,
-    next_upload_lease_id: AtomicU64,
     volumes: Arc<HashMap<u64, Arc<Volume>>>,
     upload_leases: RwLock<HashMap<u64, UploadLeaseState>>,
     central_connection: Connection,
@@ -36,13 +42,14 @@ pub struct StorageServer {
     data_task: Mutex<Option<JoinHandle<()>>>,
     control_task: Mutex<Option<JoinHandle<()>>>,
     reporter_task: Mutex<Option<JoinHandle<()>>>,
-    file_reap_task: Mutex<Option<JoinHandle<()>>>,
+    idle_file_close_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UploadLeaseState {
     client_id: u64,
     volume_id: u64,
+    expires_at_ms: u64,
 }
 
 impl StorageServer {
@@ -63,7 +70,6 @@ impl StorageServer {
         let server = Arc::new(Self {
             config: Arc::new(config),
             storage_id: AtomicU64::new(storage_id),
-            next_upload_lease_id: AtomicU64::new(1),
             volumes,
             upload_leases: RwLock::new(HashMap::new()),
             central_connection: control,
@@ -73,7 +79,7 @@ impl StorageServer {
             data_task: Mutex::new(None),
             control_task: Mutex::new(None),
             reporter_task: Mutex::new(None),
-            file_reap_task: Mutex::new(None),
+            idle_file_close_task: Mutex::new(None),
         });
 
         *server.control_task.lock() = Some(spawn_control_accept_loop(
@@ -89,7 +95,7 @@ impl StorageServer {
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        *server.file_reap_task.lock() = Some(spawn_file_reap_loop(
+        *server.idle_file_close_task.lock() = Some(spawn_idle_file_close_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
@@ -134,7 +140,7 @@ impl StorageServer {
         let data_task = self.data_task.lock().take();
         let control_task = self.control_task.lock().take();
         let reporter_task = self.reporter_task.lock().take();
-        let file_reap_task = self.file_reap_task.lock().take();
+        let idle_file_close_task = self.idle_file_close_task.lock().take();
 
         if let Some(task) = data_task {
             let _ = task.await;
@@ -145,7 +151,7 @@ impl StorageServer {
         if let Some(task) = reporter_task {
             let _ = task.await;
         }
-        if let Some(task) = file_reap_task {
+        if let Some(task) = idle_file_close_task {
             let _ = task.await;
         }
     }
@@ -197,9 +203,9 @@ impl StorageServer {
     pub async fn put_chunk(
         &self,
         client_id: u64,
+        lease_id: u64,
         volume_id: u64,
         chunk_id: HashId,
-        compressed_hash: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Fs0Result<ChunkMeta> {
@@ -207,11 +213,9 @@ impl StorageServer {
             return Err(Fs0Error::Unauthorized);
         }
 
-        self.validate_upload_lease(client_id, volume_id)?;
+        self.validate_upload_lease(client_id, lease_id, volume_id)?;
 
-        if blake3_hash(&compressed_bytes) != compressed_hash {
-            return Err(Fs0Error::HashMismatch { volume_offset: 0 });
-        }
+        self.check_raw_hash_before_write(chunk_id, raw_len, &compressed_bytes)?;
 
         self.volume(volume_id)?
             .put_chunk(chunk_id, raw_len, compressed_bytes)
@@ -219,7 +223,8 @@ impl StorageServer {
     }
 
     pub async fn read_chunk(&self, volume_id: u64, chunk_id: HashId) -> Fs0Result<Vec<u8>> {
-        self.volume(volume_id)?.read_chunk(chunk_id).await
+        let (_chunk, bytes) = self.volume(volume_id)?.read_chunk(chunk_id).await?;
+        Ok(bytes)
     }
 
     pub async fn chunk_meta(&self, volume_id: u64, chunk_id: HashId) -> Fs0Result<ChunkMeta> {
@@ -241,6 +246,7 @@ impl StorageServer {
     pub(crate) async fn commit_bundle(
         &self,
         client_id: u64,
+        lease_id: u64,
         volume_id: u64,
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
@@ -249,13 +255,14 @@ impl StorageServer {
             return Err(Fs0Error::Unauthorized);
         }
 
-        self.validate_upload_lease(client_id, volume_id)?;
+        self.validate_upload_lease(client_id, lease_id, volume_id)?;
 
         let bundle = self
             .volume(volume_id)?
             .commit_bundle(bundle_id, chunks)
             .await?;
-        self.sync_pending_central_events_for_volume(volume_id).await?;
+        self.sync_bundle_change_records_for_volume(volume_id)
+            .await?;
 
         Ok(bundle)
     }
@@ -307,32 +314,72 @@ impl StorageServer {
             .is_some_and(|volume| volume.read_only)
     }
 
+    fn check_raw_hash_before_write(
+        &self,
+        chunk_id: HashId,
+        raw_len: u64,
+        compressed_bytes: &[u8],
+    ) -> Fs0Result<()> {
+        if !self.config.check_hash_before_write {
+            return Ok(());
+        }
+
+        let raw_len_usize = usize::try_from(raw_len).map_err(|_| Fs0Error::IntegerConversion {
+            message: format!("raw_len {raw_len} exceeds usize"),
+        })?;
+        let raw = zstd_decompress(compressed_bytes, raw_len_usize)?;
+        if raw.len() as u64 != raw_len {
+            return Err(Fs0Error::InvalidData {
+                message: format!(
+                    "decompressed chunk length {} does not match raw_len {raw_len}",
+                    raw.len()
+                ),
+            });
+        }
+        if blake3_hash(&raw) != chunk_id {
+            return Err(Fs0Error::HashMismatch { volume_offset: 0 });
+        }
+
+        Ok(())
+    }
+
     fn grant_upload_lease(&self, lease: GrantUploadLeaseRequest) -> Fs0Result<u64> {
         if !self.volumes.contains_key(&lease.volume_id) {
             return Err(Fs0Error::UnknownVolume);
         }
 
-        let lease_id = self.next_upload_lease_id.fetch_add(1, Ordering::AcqRel);
         self.upload_leases.write().insert(
-            lease_id,
+            lease.lease_id,
             UploadLeaseState {
                 client_id: lease.client_id,
                 volume_id: lease.volume_id,
+                expires_at_ms: lease.expires_at_ms,
             },
         );
 
-        Ok(lease_id)
+        Ok(lease.lease_id)
     }
 
     fn revoke_upload_lease(&self, lease_id: u64) {
         self.upload_leases.write().remove(&lease_id);
     }
 
-    fn validate_upload_lease(&self, client_id: u64, volume_id: u64) -> Fs0Result<()> {
-        let leases = self.upload_leases.read();
-        let allowed = leases
-            .values()
-            .any(|lease| lease.client_id == client_id && lease.volume_id == volume_id);
+    fn validate_upload_lease(
+        &self,
+        client_id: u64,
+        lease_id: u64,
+        volume_id: u64,
+    ) -> Fs0Result<()> {
+        let now = now_ms();
+        self.upload_leases
+            .write()
+            .retain(|_, lease| lease.expires_at_ms > now);
+
+        let allowed = self
+            .upload_leases
+            .read()
+            .get(&lease_id)
+            .is_some_and(|lease| lease.client_id == client_id && lease.volume_id == volume_id);
 
         if allowed {
             Ok(())
@@ -341,10 +388,7 @@ impl StorageServer {
         }
     }
 
-    async fn ack_pending_central_events(
-        &self,
-        events: &[BundleReplicaEvent],
-    ) -> Fs0Result<()> {
+    async fn remove_bundle_change_records(&self, events: &[BundleReplicaEvent]) -> Fs0Result<()> {
         let mut by_volume = HashMap::<u64, u64>::new();
         for event in events {
             by_volume
@@ -355,78 +399,43 @@ impl StorageServer {
 
         for (volume_id, max_event_id) in by_volume {
             self.volume(volume_id)?
-                .ack_pending_central_events(max_event_id)
+                .remove_bundle_change_records(max_event_id)
                 .await?;
         }
 
         Ok(())
     }
 
-    async fn mark_pending_central_events_failed(
-        &self,
-        events: &[BundleReplicaEvent],
-        failed_at_ms: u64,
-    ) -> Fs0Result<()> {
-        let mut by_volume = HashMap::<u64, u64>::new();
-        for event in events {
-            by_volume
-                .entry(event.volume_id)
-                .and_modify(|max_event_id| *max_event_id = (*max_event_id).max(event.event_id))
-                .or_insert(event.event_id);
-        }
-
-        for (volume_id, max_event_id) in by_volume {
-            self.volume(volume_id)?
-                .mark_pending_central_events_failed(max_event_id, failed_at_ms)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn sync_pending_central_events_for_volume(&self, volume_id: u64) -> Fs0Result<()> {
+    async fn sync_bundle_change_records_for_volume(&self, volume_id: u64) -> Fs0Result<()> {
         loop {
-            let mut events = self.volume(volume_id)?.pending_central_events(128).await?;
+            let mut events = self
+                .volume(volume_id)?
+                .get_bundle_change_records(128)
+                .await?;
             if events.is_empty() {
                 return Ok(());
             }
 
             events.sort_by_key(|event| event.event_id);
-            self.report_pending_central_events(events).await?;
+            self.report_bundle_change_records(events).await?;
         }
     }
 
-    async fn reconciliation_events(&self, limit: usize) -> Fs0Result<Vec<BundleReplicaEvent>> {
-        let mut events = Vec::new();
+    async fn sync_bundle_change_records(&self) -> Fs0Result<()> {
         let mut per_volume = self.volumes.iter().collect::<Vec<_>>();
         per_volume.sort_by_key(|(volume_id, _)| **volume_id);
 
-        for (_, volume) in per_volume {
-            events.extend(volume.reconciliation_events(limit).await?);
-            if events.len() >= limit {
-                events.truncate(limit);
-                break;
-            }
+        for (volume_id, _) in per_volume {
+            self.sync_bundle_change_records_for_volume(*volume_id)
+                .await?;
         }
 
-        Ok(events)
+        Ok(())
     }
 
-    async fn reconcile_central_events(&self) -> Fs0Result<()> {
-        let events = self.reconciliation_events(128).await?;
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        self.report_bundle_events(events).await
-    }
-
-    async fn report_pending_central_events(
-        &self,
-        events: Vec<BundleReplicaEvent>,
-    ) -> Fs0Result<()> {
+    async fn report_bundle_change_records(&self, events: Vec<BundleReplicaEvent>) -> Fs0Result<()> {
         self.report_bundle_events(events.clone()).await?;
-        self.ack_pending_central_events(&events).await
+        self.remove_bundle_change_records(&events).await
     }
 
     async fn report_bundle_events(&self, events: Vec<BundleReplicaEvent>) -> Fs0Result<()> {
@@ -439,18 +448,10 @@ impl StorageServer {
         .await
         {
             Ok(ControlResponse::ReportBundleReplica) => Ok(()),
-            Ok(response) => {
-                self.mark_pending_central_events_failed(&events, now_ms())
-                    .await?;
-                Err(Fs0Error::InvalidFrame {
-                    message: format!("unexpected report bundle replica response: {response:?}"),
-                })
-            }
-            Err(err) => {
-                self.mark_pending_central_events_failed(&events, now_ms())
-                    .await?;
-                Err(err)
-            }
+            Ok(response) => Err(Fs0Error::InvalidFrame {
+                message: format!("unexpected report bundle replica response: {response:?}"),
+            }),
+            Err(err) => Err(err),
         }
     }
 }
@@ -482,22 +483,22 @@ fn open_volumes(config: &StorageConfig) -> Fs0Result<HashMap<u64, Arc<Volume>>> 
             });
         }
 
-        let read_concurrency = u32::try_from(volume_config.volume_io.read_concurrency).map_err(
-            |_| Fs0Error::IntegerConversion {
+        let read_concurrency = u32::try_from(volume_config.read_concurrency).map_err(|_| {
+            Fs0Error::IntegerConversion {
                 message: format!(
                     "read_concurrency {} exceeds u32",
-                    volume_config.volume_io.read_concurrency
+                    volume_config.read_concurrency
                 ),
-            },
-        )?;
-        let write_concurrency = u32::try_from(volume_config.volume_io.write_concurrency).map_err(
-            |_| Fs0Error::IntegerConversion {
+            }
+        })?;
+        let write_concurrency = u32::try_from(volume_config.write_concurrency).map_err(|_| {
+            Fs0Error::IntegerConversion {
                 message: format!(
                     "write_concurrency {} exceeds u32",
-                    volume_config.volume_io.write_concurrency
+                    volume_config.write_concurrency
                 ),
-            },
-        )?;
+            }
+        })?;
         let volume = Volume::open(&volume_config.path, read_concurrency, write_concurrency)?;
         let meta = volume.meta();
 
@@ -532,17 +533,19 @@ async fn register_storage(
                 .volumes
                 .iter()
                 .find(|configured| configured.volume_id == volume.volume_id)
-                .expect("opened volume must exist in config");
+                .ok_or_else(|| Fs0Error::InvalidConfig {
+                    message: format!("opened volume {} is missing from config", volume.volume_id),
+                })?;
 
-            StorageVolumeInfo {
+            Ok(StorageVolumeInfo {
                 volume_id: volume.volume_id,
                 name: configured.name.clone(),
                 max_bytes: volume.max_bytes,
                 max_volume_offset: volume.active_volume_offset,
                 read_only: configured.read_only,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Fs0Result<Vec<_>>>()?;
     volume_infos.sort_by_key(|volume| volume.volume_id);
 
     match control_rpc(
@@ -630,12 +633,12 @@ fn spawn_bundle_reporter_loop(
                 break;
             }
 
-            let _ = server.reconcile_central_events().await;
+            let _ = server.sync_bundle_change_records().await;
         }
     })
 }
 
-fn spawn_file_reap_loop(
+fn spawn_idle_file_close_loop(
     server: Weak<StorageServer>,
     shutdown_notify: Arc<Notify>,
 ) -> JoinHandle<()> {
@@ -655,7 +658,7 @@ fn spawn_file_reap_loop(
             }
 
             for volume in server.volumes.values() {
-                volume.reap_idle_data_files();
+                volume.close_idle_data_files();
             }
         }
     })
