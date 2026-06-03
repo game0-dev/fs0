@@ -2,11 +2,60 @@ use crate::{Fs0Error, HashId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionMessage {
-    Ping,
-    Pong,
+pub enum ProtocolRequest {
+    Control(ControlRequest),
+    Data(DataRequest),
+    Event(ProtocolEvent),
+    CentralAdmin(CentralAdminRequest),
+    StorageAdmin(StorageAdminRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolResponse {
+    Error(Fs0Error),
+    Control(ControlResponse),
+    Data(DataResponse),
+    CentralAdmin(CentralAdminResponse),
+    StorageAdmin(StorageAdminResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolEvent {
     StorageChanged(StoragePeerInfo),
     StorageRemoved { storage_id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CentralAdminRequest {
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CentralAdminResponse {
+    Status(CentralAdminStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralAdminStatus {
+    pub clients_count: u32,
+    pub storages: Vec<StoragePeerInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageAdminRequest {
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageAdminResponse {
+    Status(StorageAdminStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageAdminStatus {
+    pub storage_id: u64,
+    pub volumes: Vec<StorageVolumeInfo>,
+    pub connected_storages: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,4 +11,7 @@ iroh.workspace = true
 iroh-relay.workspace = true
 postcard.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -16,6 +16,8 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 pub const TRANSPORT_CONTROL_ALPN: &[u8] = b"/fs0/control/1";
 /// ALPN protocol identifier for storage data-plane connections.
 pub const TRANSPORT_DATA_ALPN: &[u8] = b"/fs0/data/1";
+/// ALPN protocol identifier for storage-to-storage replication connections.
+pub const TRANSPORT_STORAGE_ALPN: &[u8] = b"/fs0/storage/1";
 /// Number of bytes used to prefix each postcard frame body length.
 pub const TRANSPORT_FRAME_LEN_BYTES: usize = 4;
 /// Maximum encoded frame body size accepted by the transport layer. 2MB
@@ -42,6 +44,8 @@ pub const VOLUME_MAX_OPEN_DATA_FILES: usize = 2048;
 pub const VOLUME_DATA_FILE_IDLE_TTL_MS: u64 = 60_000; // 60s
 /// Lifetime for append leases issued by central.
 pub const APPEND_LEASE_TTL_MS: u64 = 60_000;
+/// Maximum volume usage ratio accepted for new append placement.
+pub const APPEND_VOLUME_USAGE_THRESHOLD: f64 = 0.95;
 /// Default number of concurrent chunk uploads from the client.
 pub const DEFAULT_CLIENT_DATA_CONCURRENCY: usize = 32;
 /// Default desired replica count for newly written data.

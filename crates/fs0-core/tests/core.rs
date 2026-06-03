@@ -2,10 +2,12 @@ use fs0_core::{
     DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
     protocol::{
         AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent,
-        BundleReplicaEventKind, CommitAppendRequest, CommittedBundle, ControlRequest,
-        ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog,
-        FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest,
-        ReplicaLocation, SessionMessage, StoragePeerInfo, StorageVolumeInfo,
+        BundleReplicaEventKind, CentralAdminRequest, CentralAdminResponse, CentralAdminStatus,
+        CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DataRequest,
+        DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
+        FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest, ProtocolEvent,
+        ProtocolRequest, ProtocolResponse, ReplicaLocation, StorageAdminRequest,
+        StorageAdminResponse, StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo,
     },
     zstd_compress, zstd_decompress,
 };
@@ -114,12 +116,49 @@ fn fs0_error_conversions_keep_messages() {
 }
 
 #[test]
-fn session_messages_roundtrip() {
+fn protocol_requests_roundtrip() {
     let storage = storage_peer();
-    assert_postcard_roundtrip(&SessionMessage::Ping);
-    assert_postcard_roundtrip(&SessionMessage::Pong);
-    assert_postcard_roundtrip(&SessionMessage::StorageChanged(storage));
-    assert_postcard_roundtrip(&SessionMessage::StorageRemoved { storage_id: 7 });
+    assert_postcard_roundtrip(&ProtocolRequest::Control(ControlRequest::CentralStatus));
+    assert_postcard_roundtrip(&ProtocolRequest::Data(DataRequest::Authenticate {
+        client_id: 42,
+        client_token: "client-token".to_owned(),
+    }));
+    assert_postcard_roundtrip(&ProtocolRequest::AuthenticateStorage { storage_id: 7 });
+    assert_postcard_roundtrip(&ProtocolRequest::Event(ProtocolEvent::StorageChanged(
+        storage,
+    )));
+    assert_postcard_roundtrip(&ProtocolRequest::Event(ProtocolEvent::StorageRemoved {
+        storage_id: 7,
+    }));
+    assert_postcard_roundtrip(&ProtocolRequest::CentralAdmin(CentralAdminRequest::Status));
+    assert_postcard_roundtrip(&ProtocolRequest::StorageAdmin(StorageAdminRequest::Status));
+}
+
+#[test]
+fn protocol_responses_roundtrip() {
+    let storage = storage_peer();
+    assert_postcard_roundtrip(&ProtocolResponse::Error(Fs0Error::VersionConflict));
+    assert_postcard_roundtrip(&ProtocolResponse::Control(ControlResponse::CentralStatus {
+        clients_count: 1,
+        storages: vec![storage.clone()],
+    }));
+    assert_postcard_roundtrip(&ProtocolResponse::Data(DataResponse::Authenticate {
+        client_id: 42,
+    }));
+    assert_postcard_roundtrip(&ProtocolResponse::AuthenticateStorage { storage_id: 7 });
+    assert_postcard_roundtrip(&ProtocolResponse::CentralAdmin(
+        CentralAdminResponse::Status(CentralAdminStatus {
+            clients_count: 1,
+            storages: vec![storage],
+        }),
+    ));
+    assert_postcard_roundtrip(&ProtocolResponse::StorageAdmin(
+        StorageAdminResponse::Status(StorageAdminStatus {
+            storage_id: 7,
+            volumes: storage_peer().volumes,
+            connected_storages: vec![8, 9],
+        }),
+    ));
 }
 
 #[test]
