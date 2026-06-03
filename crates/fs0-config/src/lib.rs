@@ -10,23 +10,32 @@ use std::path::{Path, PathBuf};
 /// ```toml
 /// [central]
 /// db_path = ".local/central.sqlite"
+/// secret_key = "central-secret-key"
+/// bind_port = 3340
+/// public_addr = "127.0.0.1:3340"
 /// replication_factor = 2
 /// auth_tokens = ["dev-token"]
 ///
 /// [central.relay]
-/// port = 3340
-/// quic_port = 7824
-/// public_url = "http://127.0.0.1:3340"
+/// bind_port = 443
+/// public_url = "http://127.0.0.1:443"
 ///
 /// [client]
 /// token = "dev-token"
-/// central_endpoint = "127.0.0.1:3340"
+/// central_endpoint_id = "central-endpoint-id"
+/// central_addr = "127.0.0.1:3340"
 ///
 /// [storage]
 /// name = "local-storage-1"
 /// token = "dev-token"
-/// central_endpoint = "127.0.0.1:3340"
+/// secret_key = "storage-secret-key"
+/// bind_port = 3341
+/// central_endpoint_id = "central-endpoint-id"
+/// central_addr = "127.0.0.1:3340"
 /// check_hash_before_write = false
+///
+/// [storage.relay]
+/// url = "http://127.0.0.1:443"
 ///
 /// [[storage.volumes]]
 /// path = ".local/volume-1"
@@ -46,6 +55,10 @@ pub struct Fs0Config {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CentralConfig {
     pub db_path: PathBuf,
+    pub secret_key: String,
+    pub bind_port: u16,
+    #[serde(default)]
+    pub public_addr: Option<String>,
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u16,
     #[serde(default)]
@@ -55,16 +68,21 @@ pub struct CentralConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CentralRelayConfig {
-    pub port: u16,
-    pub quic_port: u16,
+    pub bind_port: u16,
     pub public_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     pub name: String,
+    pub secret_key: String,
     pub token: String,
-    pub central_endpoint: String,
+    pub central_endpoint_id: String,
+    pub central_addr: String,
+    #[serde(default)]
+    pub bind_port: Option<u16>,
+    #[serde(default)]
+    pub relay: Option<RelayClientConfig>,
     pub volumes: Vec<StorageVolumeConfig>,
     #[serde(default)]
     pub check_hash_before_write: bool,
@@ -86,7 +104,21 @@ pub struct StorageVolumeConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
     pub token: String,
-    pub central_endpoint: String,
+    pub central_endpoint_id: String,
+    pub central_addr: String,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    #[serde(default)]
+    pub bind_port: Option<u16>,
+    #[serde(default)]
+    pub relay: Option<RelayClientConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RelayClientConfig {
+    pub url: String,
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Fs0Config {
@@ -149,4 +181,67 @@ fn default_volume_write_concurrency() -> usize {
 
 fn default_replication_factor() -> u16 {
     DEFAULT_REPLICATION_FACTOR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_current_config_shape() {
+        let config: Fs0Config = toml::from_str(
+            r#"
+            [central]
+            db_path = ".local/central.sqlite"
+            secret_key = "central-secret-key"
+            bind_port = 3340
+            public_addr = "127.0.0.1:3340"
+            auth_tokens = ["dev-token"]
+
+            [central.relay]
+            bind_port = 443
+            public_url = "http://127.0.0.1:443"
+
+            [client]
+            token = "dev-token"
+            central_endpoint_id = "central-endpoint-id"
+            central_addr = "127.0.0.1:3340"
+
+            [storage]
+            name = "local-storage-1"
+            secret_key = "storage-secret-key"
+            token = "dev-token"
+            central_endpoint_id = "central-endpoint-id"
+            central_addr = "127.0.0.1:3340"
+            bind_port = 3341
+
+            [storage.relay]
+            url = "http://127.0.0.1:443"
+
+            [[storage.volumes]]
+            path = ".local/volume-1"
+            volume_id = 1
+            name = "local-volume-1"
+            "#,
+        )
+        .unwrap();
+
+        let central = config.central.unwrap();
+        assert_eq!(central.bind_port, 3340);
+        assert_eq!(central.public_addr.as_deref(), Some("127.0.0.1:3340"));
+        assert_eq!(central.relay.bind_port, 443);
+
+        let storage = config.storage.unwrap();
+        assert_eq!(storage.central_endpoint_id, "central-endpoint-id");
+        assert_eq!(storage.bind_port, Some(3341));
+        assert_eq!(
+            storage.relay.as_ref().map(|relay| relay.url.as_str()),
+            Some("http://127.0.0.1:443")
+        );
+        assert!(!storage.check_hash_before_write);
+
+        let client = config.client.unwrap();
+        assert_eq!(client.central_addr, "127.0.0.1:3340");
+        assert!(client.secret_key.is_none());
+    }
 }
