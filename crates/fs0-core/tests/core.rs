@@ -214,23 +214,30 @@ fn control_requests_roundtrip() {
     assert_postcard_roundtrip(&ControlRequest::BeginAppend(BeginAppendRequest {
         path: "/a.txt".to_owned(),
         offset: 0,
-        create: true,
         prefer_volume_name: Some("hot".to_owned()),
         append_size_hint: Some(512),
     }));
     assert_postcard_roundtrip(&ControlRequest::CommitAppend(CommitAppendRequest {
         lease_id: 9,
+        file_id: 11,
         base_size: 0,
         new_size: 512,
         bundles: vec![committed_bundle()],
     }));
-    assert_postcard_roundtrip(&ControlRequest::AbortAppend { lease_id: 9 });
+    assert_postcard_roundtrip(&ControlRequest::AbortAppend {
+        lease_id: 9,
+        file_id: 11,
+    });
     assert_postcard_roundtrip(&ControlRequest::GrantUploadLease(
         grant_upload_lease_request(),
     ));
     assert_postcard_roundtrip(&ControlRequest::RevokeUploadLease { lease_id: 9 });
     assert_postcard_roundtrip(&ControlRequest::ReportBundleReplica {
         events: vec![bundle_replica_event()],
+    });
+    assert_postcard_roundtrip(&ControlRequest::UpdateStorageVolumeOffset {
+        volume_id: 4,
+        max_volume_offset: 512,
     });
     assert_postcard_roundtrip(&ControlRequest::ValidateClientAuth {
         client_id: 42,
@@ -276,8 +283,6 @@ fn control_responses_roundtrip() {
         volume_id: 4,
         base_size: 0,
         offset: 0,
-        rewrite_offset: 0,
-        first_bundle_index: 0,
         expires_at_ms: 2000,
         prefer_volume_name: Some("hot".to_owned()),
     }));
@@ -294,6 +299,7 @@ fn control_responses_roundtrip() {
     assert_postcard_roundtrip(&ControlResponse::GrantUploadLease { lease_id: 9 });
     assert_postcard_roundtrip(&ControlResponse::RevokeUploadLease);
     assert_postcard_roundtrip(&ControlResponse::ReportBundleReplica);
+    assert_postcard_roundtrip(&ControlResponse::UpdateStorageVolumeOffset);
     assert_postcard_roundtrip(&ControlResponse::ValidateClientAuth { client_id: 42 });
 }
 
@@ -316,6 +322,7 @@ fn data_protocol_roundtrip() {
     });
     assert_postcard_roundtrip(&DataRequest::UploadChunk {
         lease_id: 9,
+        file_id: 11,
         volume_id: 4,
         chunk_id,
         raw_len: 12,
@@ -331,6 +338,7 @@ fn data_protocol_roundtrip() {
     });
     assert_postcard_roundtrip(&DataRequest::CommitBundle {
         lease_id: 9,
+        file_id: 11,
         volume_id: 4,
         bundle_id,
         chunks: vec![chunk.clone()],
@@ -397,7 +405,6 @@ fn storage_peer() -> StoragePeerInfo {
 fn grant_upload_lease_request() -> GrantUploadLeaseRequest {
     GrantUploadLeaseRequest {
         lease_id: 9,
-        client_id: 3,
         file_id: 11,
         volume_id: 4,
         base_size: 0,
@@ -408,7 +415,6 @@ fn grant_upload_lease_request() -> GrantUploadLeaseRequest {
 
 fn committed_bundle() -> CommittedBundle {
     CommittedBundle {
-        bundle_index: 0,
         bundle_id: HashId([2; 32]),
         raw_len: 12,
         compressed_len: 3,

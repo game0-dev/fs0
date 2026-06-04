@@ -174,8 +174,8 @@ impl Volume {
 
         let insert = {
             let mut db = self.db.lock();
-            match db.load_chunk(chunk_id)? {
-                Some(existing) => {
+            match db.load_chunk(chunk_id) {
+                Ok(existing) => {
                     if existing.raw_len != raw_len
                         || existing.compressed_len != compressed_len
                         || existing.compressed_hash != compressed_hash
@@ -203,7 +203,8 @@ impl Volume {
                     );
                     return Ok(existing);
                 }
-                None => {}
+                Err(Fs0Error::ChunkNotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
 
             let meta = db.meta();
@@ -263,9 +264,7 @@ impl Volume {
         let mut db = self.db.lock();
         db.insert_chunk(&insert)?;
 
-        let chunk = db
-            .load_chunk(chunk_id)?
-            .ok_or(Fs0Error::ChunkNotFound { chunk_id })?;
+        let chunk = db.load_chunk(chunk_id)?;
         info!(
             ?chunk_id,
             volume_offset = chunk.volume_offset,
@@ -279,11 +278,7 @@ impl Volume {
 
     pub async fn read_chunk(&self, chunk_id: HashId) -> Fs0Result<(ChunkMeta, Vec<u8>)> {
         debug!(?chunk_id, "reading chunk");
-        let chunk = self
-            .db
-            .lock()
-            .load_chunk(chunk_id)?
-            .ok_or(Fs0Error::ChunkNotFound { chunk_id })?;
+        let chunk = self.db.lock().load_chunk(chunk_id)?;
 
         let bytes = self
             .read_compressed_bytes(chunk.volume_offset, chunk.compressed_len)
@@ -292,10 +287,7 @@ impl Volume {
     }
 
     pub async fn chunk_meta(&self, chunk_id: HashId) -> Fs0Result<ChunkMeta> {
-        self.db
-            .lock()
-            .load_chunk(chunk_id)?
-            .ok_or(Fs0Error::ChunkNotFound { chunk_id })
+        self.db.lock().load_chunk(chunk_id)
     }
 
     pub async fn delete_chunk(&self, chunk_id: HashId) -> Fs0Result<()> {
@@ -342,15 +334,19 @@ impl Volume {
 
         let bundle = {
             let mut db = self.db.lock();
-            if let Some(existing) = db.load_bundle(bundle_id)? {
-                debug!(
-                    ?bundle_id,
-                    raw_len = existing.raw_len,
-                    compressed_len = existing.compressed_len,
-                    chunk_count = existing.chunk_count,
-                    "bundle already committed"
-                );
-                return Ok(existing);
+            match db.load_bundle(bundle_id) {
+                Ok(existing) => {
+                    debug!(
+                        ?bundle_id,
+                        raw_len = existing.raw_len,
+                        compressed_len = existing.compressed_len,
+                        chunk_count = existing.chunk_count,
+                        "bundle already committed"
+                    );
+                    return Ok(existing);
+                }
+                Err(Fs0Error::BundleNotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
 
             let chunk_ids = chunks

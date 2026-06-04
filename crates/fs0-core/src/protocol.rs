@@ -116,6 +116,7 @@ pub enum ControlRequest {
     CommitAppend(CommitAppendRequest),
     AbortAppend {
         lease_id: u64,
+        file_id: u64,
     },
     GrantUploadLease(GrantUploadLeaseRequest),
     RevokeUploadLease {
@@ -123,6 +124,10 @@ pub enum ControlRequest {
     },
     ReportBundleReplica {
         events: Vec<BundleReplicaEvent>,
+    },
+    UpdateStorageVolumeOffset {
+        volume_id: u64,
+        max_volume_offset: u64,
     },
     ValidateClientAuth {
         client_id: u64,
@@ -166,6 +171,7 @@ pub enum ControlResponse {
     },
     RevokeUploadLease,
     ReportBundleReplica,
+    UpdateStorageVolumeOffset,
     ValidateClientAuth {
         client_id: u64,
     },
@@ -183,6 +189,7 @@ pub enum DataRequest {
     },
     UploadChunk {
         lease_id: u64,
+        file_id: u64,
         volume_id: u64,
         chunk_id: HashId,
         raw_len: u64,
@@ -198,6 +205,7 @@ pub enum DataRequest {
     },
     CommitBundle {
         lease_id: u64,
+        file_id: u64,
         volume_id: u64,
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
@@ -319,7 +327,6 @@ pub struct DirectoryEntries {
 pub struct BeginAppendRequest {
     pub path: String,
     pub offset: u64,
-    pub create: bool,
     pub prefer_volume_name: Option<String>,
     pub append_size_hint: Option<u64>,
 }
@@ -327,7 +334,6 @@ pub struct BeginAppendRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantUploadLeaseRequest {
     pub lease_id: u64,
-    pub client_id: u64,
     pub file_id: u64,
     pub volume_id: u64,
     pub base_size: u64,
@@ -342,8 +348,6 @@ pub struct AppendLease {
     pub volume_id: u64,
     pub base_size: u64,
     pub offset: u64,
-    pub rewrite_offset: u64,
-    pub first_bundle_index: u64,
     pub expires_at_ms: u64,
     pub prefer_volume_name: Option<String>,
 }
@@ -351,6 +355,7 @@ pub struct AppendLease {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitAppendRequest {
     pub lease_id: u64,
+    pub file_id: u64,
     pub base_size: u64,
     pub new_size: u64,
     pub bundles: Vec<CommittedBundle>,
@@ -358,7 +363,6 @@ pub struct CommitAppendRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedBundle {
-    pub bundle_index: u64,
     pub bundle_id: HashId,
     pub raw_len: u64,
     pub compressed_len: u64,

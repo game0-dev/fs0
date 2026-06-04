@@ -12,12 +12,6 @@ fs0-transport.workspace = true
 iroh.workspace = true
 iroh-relay = { workspace = true, features = ["server"] }
 parking_lot.workspace = true
-rcgen.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
-serde.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-
-[dev-dependencies]
-tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

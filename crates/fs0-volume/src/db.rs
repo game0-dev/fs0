@@ -20,15 +20,14 @@ pub(crate) struct VolumeDb {
 impl VolumeDb {
     pub(crate) fn create(root: &Path, meta: &VolumeMeta) -> Fs0Result<Self> {
         let db_path = root.join(VOLUME_DB_FILE);
-        let mut conn = Connection::open(db_path)?;
+        let conn = Connection::open(db_path)?;
 
         conn.pragma_update(None, "journal_mode", "DELETE")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("schema.sql"))?;
 
-        let tx = conn.transaction()?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO volume_meta (
                 id, volume_id, format_version, max_bytes, active_volume_offset,
                 created_at_ms, updated_at_ms
@@ -44,7 +43,6 @@ impl VolumeDb {
                 u64_to_i64(meta.updated_at_ms, "updated_at_ms")?,
             ],
         )?;
-        tx.commit()?;
 
         Ok(Self {
             conn,
@@ -83,8 +81,7 @@ impl VolumeDb {
             });
         }
 
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        self.conn.execute(
             "UPDATE volume_meta
              SET volume_id = ?1,
                  updated_at_ms = ?2
@@ -94,7 +91,6 @@ impl VolumeDb {
                 u64_to_i64(updated_at_ms, "updated_at_ms")?,
             ],
         )?;
-        tx.commit()?;
 
         self.meta.volume_id = volume_id;
         self.meta.updated_at_ms = updated_at_ms;
@@ -122,24 +118,24 @@ impl VolumeDb {
         })?)
     }
 
-    pub(crate) fn load_chunk(&self, chunk_id: HashId) -> Fs0Result<Option<ChunkMeta>> {
+    pub(crate) fn load_chunk(&self, chunk_id: HashId) -> Fs0Result<ChunkMeta> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT chunk_id, compressed_hash, volume_offset, raw_len, compressed_len
              FROM chunks
              WHERE chunk_id = ?1",
         )?;
 
-        Ok(stmt
-            .query_row(params![chunk_id.as_bytes().as_slice()], |row| {
-                Ok(ChunkMeta {
-                    chunk_id: row.hash_id(0, "chunk_id")?,
-                    compressed_hash: row.hash_id(1, "compressed_hash")?,
-                    volume_offset: row.u64(2, "volume_offset")?,
-                    raw_len: row.u64(3, "raw_len")?,
-                    compressed_len: row.u64(4, "compressed_len")?,
-                })
+        stmt.query_row(params![chunk_id.as_bytes().as_slice()], |row| {
+            Ok(ChunkMeta {
+                chunk_id: row.hash_id(0, "chunk_id")?,
+                compressed_hash: row.hash_id(1, "compressed_hash")?,
+                volume_offset: row.u64(2, "volume_offset")?,
+                raw_len: row.u64(3, "raw_len")?,
+                compressed_len: row.u64(4, "compressed_len")?,
             })
-            .optional()?)
+        })
+        .optional()?
+        .ok_or(Fs0Error::ChunkNotFound { chunk_id })
     }
 
     pub(crate) fn load_chunks_by_ids(
@@ -181,7 +177,7 @@ impl VolumeDb {
         Ok(chunks)
     }
 
-    pub(crate) fn load_bundle(&self, bundle_id: HashId) -> Fs0Result<Option<BundleMeta>> {
+    pub(crate) fn load_bundle(&self, bundle_id: HashId) -> Fs0Result<BundleMeta> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT bc.bundle_id,
                     COALESCE(SUM(c.raw_len), 0),
@@ -193,34 +189,32 @@ impl VolumeDb {
              GROUP BY bc.bundle_id",
         )?;
 
-        Ok(stmt
-            .query_row(params![bundle_id.as_bytes().as_slice()], |row| {
-                Ok(BundleMeta {
-                    bundle_id: row.hash_id(0, "bundle_id")?,
-                    raw_len: row.u64(1, "raw_len")?,
-                    compressed_len: row.u64(2, "compressed_len")?,
-                    chunk_count: row.u64(3, "chunk_count")?,
-                })
+        stmt.query_row(params![bundle_id.as_bytes().as_slice()], |row| {
+            Ok(BundleMeta {
+                bundle_id: row.hash_id(0, "bundle_id")?,
+                raw_len: row.u64(1, "raw_len")?,
+                compressed_len: row.u64(2, "compressed_len")?,
+                chunk_count: row.u64(3, "chunk_count")?,
             })
-            .optional()?)
+        })
+        .optional()?
+        .ok_or(Fs0Error::BundleNotFound { bundle_id })
     }
 
     pub(crate) fn insert_chunk(&mut self, chunk: &ChunkMeta) -> Fs0Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO chunks (
                 chunk_id, compressed_hash, volume_offset, raw_len, compressed_len
             ) VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(chunk_id) DO NOTHING",
-            params![
-                chunk.chunk_id.as_bytes().as_slice(),
-                chunk.compressed_hash.as_bytes().as_slice(),
-                u64_to_i64(chunk.volume_offset, "volume offset")?,
-                u64_to_i64(chunk.raw_len, "raw len")?,
-                u64_to_i64(chunk.compressed_len, "compressed len")?,
-            ],
         )?;
-        tx.commit()?;
+        stmt.execute(params![
+            chunk.chunk_id.as_bytes().as_slice(),
+            chunk.compressed_hash.as_bytes().as_slice(),
+            u64_to_i64(chunk.volume_offset, "volume offset")?,
+            u64_to_i64(chunk.raw_len, "raw len")?,
+            u64_to_i64(chunk.compressed_len, "compressed len")?,
+        ])?;
 
         Ok(())
     }
@@ -230,8 +224,7 @@ impl VolumeDb {
         active_volume_offset: u64,
         updated_at_ms: u64,
     ) -> Fs0Result<VolumeMeta> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        self.conn.execute(
             "UPDATE volume_meta
              SET active_volume_offset = MAX(active_volume_offset, ?1),
                  updated_at_ms = ?2
@@ -241,7 +234,6 @@ impl VolumeDb {
                 u64_to_i64(updated_at_ms, "updated_at_ms")?,
             ],
         )?;
-        tx.commit()?;
 
         self.meta = Self::load_meta_from_conn(&self.conn)?;
 
@@ -249,12 +241,10 @@ impl VolumeDb {
     }
 
     pub(crate) fn delete_chunk(&mut self, chunk_id: HashId) -> Fs0Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        self.conn.execute(
             "DELETE FROM chunks WHERE chunk_id = ?1",
             params![chunk_id.as_bytes().as_slice()],
         )?;
-        tx.commit()?;
 
         Ok(())
     }
@@ -270,24 +260,26 @@ impl VolumeDb {
             params![bundle_id.as_bytes().as_slice()],
         )?;
 
-        for chunk in chunks {
-            tx.execute(
+        {
+            let mut insert_bundle_chunk = tx.prepare(
                 "INSERT INTO bundle_chunks (
                     bundle_id, chunk_index, chunk_id
                 ) VALUES (?1, ?2, ?3)",
-                params![
+            )?;
+
+            for chunk in chunks {
+                insert_bundle_chunk.execute(params![
                     bundle_id.as_bytes().as_slice(),
                     u64_to_i64(chunk.chunk_index, "chunk_index")?,
                     chunk.chunk_id.as_bytes().as_slice(),
-                ],
-            )?;
+                ])?;
+            }
         }
 
         Self::insert_bundle_change_record(&tx, bundle_id, BundleReplicaEventKind::Stored)?;
         tx.commit()?;
 
-        self.load_bundle(bundle_id)?
-            .ok_or(Fs0Error::BundleNotFound { bundle_id })
+        self.load_bundle(bundle_id)
     }
 
     pub(crate) fn delete_bundle(&mut self, bundle_id: HashId) -> Fs0Result<()> {
@@ -380,12 +372,10 @@ impl VolumeDb {
     }
 
     pub(crate) fn remove_bundle_change_records(&mut self, max_event_id: u64) -> Fs0Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        self.conn.execute(
             "DELETE FROM bundle_change_records WHERE event_id <= ?1",
             params![u64_to_i64(max_event_id, "max_event_id")?],
         )?;
-        tx.commit()?;
 
         Ok(())
     }

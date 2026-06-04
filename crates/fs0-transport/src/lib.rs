@@ -13,7 +13,8 @@ use std::net::SocketAddr;
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub url: String,
-    pub quic_port: Option<u16>,
+    pub token: String,
+    pub quic_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -94,14 +95,15 @@ impl Transport {
     }
 }
 
-fn relay_mode(relay: &RelayConfig) -> Fs0Result<RelayMode> {
-    let relay_url = relay
+fn relay_mode(config: &RelayConfig) -> Fs0Result<RelayMode> {
+    let relay_url = config
         .url
         .parse::<RelayUrl>()
         .map_err(|err: iroh::RelayUrlParseError| Fs0Error::InvalidConfig {
-            message: format!("invalid relay url {}: {err}", relay.url),
+            message: format!("invalid relay url {}: {err}", config.url),
         })?;
-    let relay = IrohRelayConfig::new(relay_url, relay.quic_port.map(RelayQuicConfig::new));
+    let relay = IrohRelayConfig::new(relay_url, Some(RelayQuicConfig::new(config.quic_port)))
+        .with_auth_token(config.token.clone());
     Ok(RelayMode::Custom(RelayMap::from(relay)))
 }
 

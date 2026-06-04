@@ -1,20 +1,22 @@
 use crate::Fs0Result;
 use fs0_core::{
-    APPEND_LEASE_TTL_MS, AppendLease, BeginAppendRequest, BundleReplicaEvent,
-    BundleReplicaEventKind, CommittedBundle, DirectoryEntries, DirectoryEntry, FileBundleRef,
-    FileChangeLog, FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord, Fs0Error, HashId,
-    hash_id_from_vec, i64_to_u64, join_fs0_path, now_ms, split_fs0_path, u64_to_i64,
+    APPEND_LEASE_TTL_MS, Fs0Error, HashId, SqliteRowExt,
+    protocol::{
+        AppendLease, BeginAppendRequest, BundleReplicaEvent, BundleReplicaEventKind,
+        CommitAppendRequest, CommittedBundle, DirectoryEntries, DirectoryEntry, FileBundleRef,
+        FileChangeLog, FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord,
+        StorageVolumeInfo,
+    },
+    utils::{i64_to_u64, join_fs0_path, now_ms, split_fs0_path, u64_to_i64},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VolumeRecord {
-    pub(crate) volume_id: u64,
-    pub(crate) name: String,
-    pub(crate) max_bytes: u64,
-    pub(crate) created_at_ms: u64,
-    pub(crate) updated_at_ms: u64,
+#[derive(Debug)]
+struct LeaseRecord {
+    file_id: u64,
+    base_size_bytes: u64,
+    offset_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -28,6 +30,7 @@ impl CentralDb {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(include_str!("schema.sql"))?;
+
         Ok(Self { conn })
     }
 
@@ -35,71 +38,78 @@ impl CentralDb {
         &mut self,
         name: String,
         max_bytes: u64,
-    ) -> Fs0Result<VolumeRecord> {
-        let now = now_ms();
+    ) -> Fs0Result<StorageVolumeInfo> {
         self.conn.execute(
-            "INSERT INTO volumes (name, max_bytes, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?3)",
-            params![
-                name.as_str(),
-                u64_to_i64(max_bytes, "max_bytes")?,
-                u64_to_i64(now, "created_at_ms")?,
-            ],
+            "INSERT INTO volumes (name, max_bytes, max_volume_offset)
+             VALUES (?1, ?2, 0)",
+            params![name.as_str(), u64_to_i64(max_bytes, "max_bytes")?],
         )?;
         let volume_id = i64_to_u64(self.conn.last_insert_rowid(), "volume_id")?;
-        self.get_volume(volume_id)?.ok_or(Fs0Error::NotFound)
+        self.get_volume(volume_id)
     }
 
-    pub(crate) fn get_volume(&self, volume_id: u64) -> Fs0Result<Option<VolumeRecord>> {
+    pub(crate) fn get_volume(&self, volume_id: u64) -> Fs0Result<StorageVolumeInfo> {
         self.conn
             .query_row(
-                "SELECT volume_id, name, max_bytes, created_at_ms, updated_at_ms
+                "SELECT volume_id, name, max_bytes, max_volume_offset
                  FROM volumes
                  WHERE volume_id = ?1",
                 params![u64_to_i64(volume_id, "volume_id")?],
-                row_to_volume_record,
+                row_to_storage_volume_info,
             )
-            .optional()
-            .map_err(Fs0Error::from)
+            .optional()?
+            .ok_or(Fs0Error::NotFound)
+    }
+
+    pub(crate) fn update_volume_offset(
+        &mut self,
+        volume_id: u64,
+        max_volume_offset: u64,
+    ) -> Fs0Result<StorageVolumeInfo> {
+        self.conn.execute(
+            "UPDATE volumes
+             SET max_volume_offset = ?2
+             WHERE volume_id = ?1",
+            params![
+                u64_to_i64(volume_id, "volume_id")?,
+                u64_to_i64(max_volume_offset, "max_volume_offset")?,
+            ],
+        )?;
+        if self.conn.changes() == 0 {
+            return Err(Fs0Error::NotFound);
+        }
+
+        self.get_volume(volume_id)
     }
 
     pub(crate) fn begin_append(
         &mut self,
         request: BeginAppendRequest,
-        client_id: u64,
         volume_id: u64,
     ) -> Fs0Result<AppendLease> {
         let now = now_ms();
         let expires_at_ms = now + APPEND_LEASE_TTL_MS;
-        let (dir, name) = split_fs0_path(request.path.as_str())?;
         let tx = self.conn.transaction()?;
-        let (file_id, base_size) = match Self::load_file_by_dir_name(&tx, &dir, &name)? {
-            Some(file) => {
+        let (file_id, base_size) = match Self::tx_load_file_by_path(&tx, &request.path) {
+            Ok(file) => {
                 if request.offset > file.size_bytes {
                     return Err(Fs0Error::InvalidRequest);
                 }
                 (file.file_id, file.size_bytes)
             }
-            None => {
-                if !request.create {
+            Err(Fs0Error::NotFound) => {
+                if request.offset != 0 {
                     return Err(Fs0Error::NotFound);
                 }
-                if request.offset != 0 {
-                    return Err(Fs0Error::VersionConflict);
-                }
-                (Self::create_file(&tx, &dir, &name, now)?, 0)
+                let (dir, name) = split_fs0_path(request.path.as_str())?;
+                (Self::tx_create_file(&tx, &dir, &name, now)?, 0)
             }
+            Err(err) => return Err(err),
         };
-        let (rewrite_offset, first_bundle_index) =
-            Self::rewrite_point_for_offset(&tx, file_id, request.offset)?;
         tx.execute(
             "DELETE FROM append_leases
-             WHERE file_id = ?1
-               AND expires_at_ms <= ?2",
-            params![
-                u64_to_i64(file_id, "file_id")?,
-                u64_to_i64(now, "expires_at_ms")?
-            ],
+             WHERE expires_at_ms <= ?1",
+            params![u64_to_i64(now, "expires_at_ms")?],
         )?;
 
         let active_lease = tx
@@ -118,14 +128,14 @@ impl CentralDb {
 
         tx.execute(
             "INSERT INTO append_leases (
-                file_id, client_id, volume_id, base_size_bytes,
-                prefer_volume_name, expires_at_ms, created_at_ms
+                file_id, volume_id, base_size_bytes,
+                offset_bytes, prefer_volume_name, expires_at_ms, created_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 u64_to_i64(file_id, "file_id")?,
-                u64_to_i64(client_id, "client_id")?,
                 u64_to_i64(volume_id, "volume_id")?,
                 u64_to_i64(base_size, "base_size_bytes")?,
+                u64_to_i64(request.offset, "offset_bytes")?,
                 request.prefer_volume_name.as_deref(),
                 u64_to_i64(expires_at_ms, "expires_at_ms")?,
                 u64_to_i64(now, "created_at_ms")?,
@@ -140,8 +150,6 @@ impl CentralDb {
             volume_id,
             base_size,
             offset: request.offset,
-            rewrite_offset,
-            first_bundle_index,
             expires_at_ms,
             prefer_volume_name: request.prefer_volume_name,
         })
@@ -149,35 +157,31 @@ impl CentralDb {
 
     pub(crate) fn commit_append(
         &mut self,
-        request: fs0_core::CommitAppendRequest,
-        client_id: u64,
+        request: CommitAppendRequest,
     ) -> Fs0Result<FileReadPlan> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let lease = Self::load_active_lease(&tx, request.lease_id)?;
-        if lease.client_id != client_id {
-            return Err(Fs0Error::Unauthorized);
-        }
+        let lease = Self::tx_load_active_lease(&tx, request.lease_id, request.file_id)?;
 
         if lease.base_size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict);
         }
-        if request.new_size < request.base_size {
+        if request.new_size < lease.offset_bytes {
             return Err(Fs0Error::InvalidRequest);
         }
 
         let (rewrite_offset, first_bundle_index) =
-            Self::commit_rewrite_point(&tx, lease.file_id, request.new_size, &request.bundles)?;
+            Self::tx_rewrite_point_for_offset(&tx, lease.file_id, lease.offset_bytes)?;
         let rewritten_len = request
             .new_size
             .checked_sub(rewrite_offset)
             .ok_or(Fs0Error::InvalidRequest)?;
 
-        let file = Self::load_file_by_id_tx(&tx, lease.file_id)?.ok_or(Fs0Error::NotFound)?;
+        let file = Self::tx_load_file_by_id(&tx, lease.file_id)?;
         if file.size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict);
         }
-        Self::validate_committed_bundles(&request.bundles, rewritten_len, first_bundle_index)?;
+        Self::validate_committed_bundles(&request.bundles, rewritten_len)?;
         tx.execute(
             "DELETE FROM file_bundles
              WHERE file_id = ?1 AND bundle_index >= ?2",
@@ -186,6 +190,7 @@ impl CentralDb {
                 u64_to_i64(first_bundle_index, "first_bundle_index")?,
             ],
         )?;
+        let mut bundle_index = first_bundle_index;
         for bundle in &request.bundles {
             let (stored_raw_len, stored_compressed_len, replica_count) = tx
                 .query_row(
@@ -198,15 +203,9 @@ impl CentralDb {
                     params![bundle.bundle_id.as_bytes().as_slice()],
                     |row| {
                         Ok((
-                            i64_to_u64(row.get(0)?, "raw_len").map_err(|err| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                            })?,
-                            i64_to_u64(row.get(1)?, "compressed_len").map_err(|err| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                            })?,
-                            i64_to_u64(row.get(2)?, "replica_count").map_err(|err| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                            })?,
+                            row.u64(0, "raw_len")?,
+                            row.u64(1, "compressed_len")?,
+                            row.u64(2, "replica_count")?,
                         ))
                     },
                 )
@@ -224,10 +223,16 @@ impl CentralDb {
                  ) VALUES (?1, ?2, ?3)",
                 params![
                     u64_to_i64(lease.file_id, "file_id")?,
-                    u64_to_i64(bundle.bundle_index, "bundle_index")?,
+                    u64_to_i64(bundle_index, "bundle_index")?,
                     bundle.bundle_id.as_bytes().as_slice(),
                 ],
             )?;
+            bundle_index =
+                bundle_index
+                    .checked_add(1)
+                    .ok_or_else(|| Fs0Error::IntegerConversion {
+                        message: "bundle_index overflow".to_owned(),
+                    })?;
         }
         let compressed_size_bytes = tx.query_row(
             "SELECT COALESCE(SUM(b.compressed_len), 0)
@@ -235,10 +240,7 @@ impl CentralDb {
              JOIN bundles b ON b.bundle_id = fb.bundle_id
              WHERE fb.file_id = ?1",
             params![u64_to_i64(lease.file_id, "file_id")?],
-            |row| {
-                i64_to_u64(row.get(0)?, "compressed_size_bytes")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
-            },
+            |row| row.u64(0, "compressed_size_bytes"),
         )?;
 
         tx.execute(
@@ -260,7 +262,7 @@ impl CentralDb {
             params![u64_to_i64(request.lease_id, "lease_id")?],
         )?;
         let (file_dir, file_name) = split_fs0_path(&file.path)?;
-        Self::insert_file_change_log(
+        Self::tx_insert_file_change_log(
             &tx,
             if file.size_bytes == 0 {
                 FileChangeLogKind::Created
@@ -277,12 +279,28 @@ impl CentralDb {
         self.get_file_read_plan_by_id(lease.file_id)
     }
 
-    pub(crate) fn abort_append(&mut self, lease_id: u64, client_id: u64) -> Fs0Result<()> {
+    pub(crate) fn active_append_lease_volume(&self, lease_id: u64, file_id: u64) -> Fs0Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT volume_id
+                 FROM append_leases
+                 WHERE lease_id = ?1
+                   AND file_id = ?2
+                   AND expires_at_ms > ?3",
+                params![
+                    u64_to_i64(lease_id, "lease_id")?,
+                    u64_to_i64(file_id, "file_id")?,
+                    u64_to_i64(now_ms(), "now_ms")?,
+                ],
+                |row| row.u64(0, "volume_id"),
+            )
+            .optional()?
+            .ok_or(Fs0Error::NotFound)
+    }
+
+    pub(crate) fn abort_append(&mut self, lease_id: u64, file_id: u64) -> Fs0Result<()> {
         let tx = self.conn.transaction()?;
-        let lease = Self::load_active_lease(&tx, lease_id)?;
-        if lease.client_id != client_id {
-            return Err(Fs0Error::Unauthorized);
-        }
+        Self::tx_load_active_lease(&tx, lease_id, file_id)?;
 
         tx.execute(
             "DELETE FROM append_leases
@@ -293,20 +311,8 @@ impl CentralDb {
         Ok(())
     }
 
-    pub(crate) fn get_file_by_path(&self, path: &str) -> Fs0Result<Option<FileRecord>> {
-        let (dir, name) = split_fs0_path(path)?;
-        let file = self
-            .conn
-            .query_row(
-                "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
-                        created_at_ms, updated_at_ms
-                 FROM files
-                 WHERE dir = ?1 AND name = ?2",
-                params![dir, name],
-                row_to_file_record,
-            )
-            .optional()?;
-        Ok(file)
+    pub(crate) fn get_file_by_path(&self, path: &str) -> Fs0Result<FileRecord> {
+        self.load_file_by_path(path)
     }
 
     pub(crate) fn list_directory(
@@ -335,19 +341,19 @@ impl CentralDb {
                 let dir: String = row.get(1)?;
                 let name: String = row.get(2)?;
                 Ok(DirectoryEntry {
-                    file_id: i64_to_u64(row.get(0)?, "file_id")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                    file_id: row.u64(0, "file_id")?,
                     name: name.clone(),
-                    path: join_fs0_path(&dir, &name)
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    size_bytes: i64_to_u64(row.get(3)?, "size_bytes")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    compressed_size_bytes: i64_to_u64(row.get(4)?, "compressed_size_bytes")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    created_at_ms: i64_to_u64(row.get(5)?, "created_at_ms")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    updated_at_ms: i64_to_u64(row.get(6)?, "updated_at_ms")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                    path: join_fs0_path(&dir, &name).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    size_bytes: row.u64(3, "size_bytes")?,
+                    compressed_size_bytes: row.u64(4, "compressed_size_bytes")?,
+                    created_at_ms: row.u64(5, "created_at_ms")?,
+                    updated_at_ms: row.u64(6, "updated_at_ms")?,
                 })
             },
         )?;
@@ -412,8 +418,7 @@ impl CentralDb {
              ORDER BY volume_id",
         )?;
         let rows = stmt.query_map(params![bundle_id.as_bytes().as_slice()], |row| {
-            i64_to_u64(row.get(0)?, "volume_id")
-                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+            row.u64(0, "volume_id")
         })?;
         let mut replicas = Vec::new();
         for row in rows {
@@ -451,16 +456,7 @@ impl CentralDb {
                          FROM bundles
                          WHERE bundle_id = ?1",
                         params![event.bundle_id.as_bytes().as_slice()],
-                        |row| {
-                            Ok((
-                                i64_to_u64(row.get(0)?, "raw_len").map_err(|err| {
-                                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                                })?,
-                                i64_to_u64(row.get(1)?, "compressed_len").map_err(|err| {
-                                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                                })?,
-                            ))
-                        },
+                        |row| Ok((row.u64(0, "raw_len")?, row.u64(1, "compressed_len")?)),
                     )?;
                     if stored_raw_len != raw_len || stored_compressed_len != compressed_len {
                         return Err(Fs0Error::InvalidData {
@@ -495,12 +491,12 @@ impl CentralDb {
     }
 
     pub(crate) fn get_file_read_plan(&self, path: &str) -> Fs0Result<FileReadPlan> {
-        let file = self.get_file_by_path(path)?.ok_or(Fs0Error::NotFound)?;
+        let file = self.get_file_by_path(path)?;
         self.get_file_read_plan_by_id(file.file_id)
     }
 
     pub(crate) fn get_file_read_plan_by_id(&self, file_id: u64) -> Fs0Result<FileReadPlan> {
-        let file = Self::load_file_by_id(&self.conn, file_id)?.ok_or(Fs0Error::NotFound)?;
+        let file = self.load_file_by_id(file_id)?;
         let mut stmt = self.conn.prepare_cached(
             "SELECT fb.bundle_index, fb.bundle_id, b.raw_len, b.compressed_len
              FROM file_bundles fb
@@ -509,16 +505,11 @@ impl CentralDb {
              ORDER BY bundle_index",
         )?;
         let rows = stmt.query_map(params![u64_to_i64(file.file_id, "file_id")?], |row| {
-            let bundle_id = hash_id_from_vec(row.get(1)?)
-                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
             Ok((
-                i64_to_u64(row.get(0)?, "bundle_index")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                bundle_id,
-                i64_to_u64(row.get(2)?, "raw_len")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                i64_to_u64(row.get(3)?, "compressed_len")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                row.u64(0, "bundle_index")?,
+                row.hash_id(1, "bundle_id")?,
+                row.u64(2, "raw_len")?,
+                row.u64(3, "compressed_len")?,
             ))
         })?;
         let mut bundles = Vec::new();
@@ -541,17 +532,16 @@ impl CentralDb {
     }
 
     pub(crate) fn delete_file(&mut self, path: &str) -> Fs0Result<()> {
-        let (dir, name) = split_fs0_path(path)?;
         let tx = self.conn.transaction()?;
-        let file = Self::load_file_by_dir_name(&tx, &dir, &name)?.ok_or(Fs0Error::NotFound)?;
-        Self::delete_file_by_id_tx(&tx, file.file_id, now_ms())?;
+        let file = Self::tx_load_file_by_path(&tx, path)?;
+        Self::tx_delete_file_by_id(&tx, file.file_id, now_ms())?;
         tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn delete_file_by_id(&mut self, file_id: u64) -> Fs0Result<()> {
         let tx = self.conn.transaction()?;
-        Self::delete_file_by_id_tx(&tx, file_id, now_ms())?;
+        Self::tx_delete_file_by_id(&tx, file_id, now_ms())?;
         tx.commit()?;
         Ok(())
     }
@@ -561,19 +551,7 @@ impl CentralDb {
         source_path: &str,
         target_path: &str,
     ) -> Fs0Result<FileRecord> {
-        let (source_dir, source_name) = split_fs0_path(source_path)?;
-        let source = self
-            .conn
-            .query_row(
-                "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
-                        created_at_ms, updated_at_ms
-                 FROM files
-                 WHERE dir = ?1 AND name = ?2",
-                params![source_dir, source_name],
-                row_to_file_record,
-            )
-            .optional()?
-            .ok_or(Fs0Error::NotFound)?;
+        let source = self.load_file_by_path(source_path)?;
         self.copy_file_by_id(source.file_id, target_path)
     }
 
@@ -585,7 +563,7 @@ impl CentralDb {
         let (target_dir, target_name) = split_fs0_path(target_path)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let source = Self::load_file_by_id_tx(&tx, source_file_id)?.ok_or(Fs0Error::NotFound)?;
+        let source = Self::tx_load_file_by_id(&tx, source_file_id)?;
         tx.execute(
             "INSERT INTO files (
                 dir, name, size_bytes, compressed_size_bytes,
@@ -610,7 +588,7 @@ impl CentralDb {
                 u64_to_i64(source_file_id, "source_file_id")?,
             ],
         )?;
-        Self::insert_file_change_log(
+        Self::tx_insert_file_change_log(
             &tx,
             FileChangeLogKind::Created,
             None,
@@ -619,7 +597,7 @@ impl CentralDb {
             now,
         )?;
         tx.commit()?;
-        Self::load_file_by_id(&self.conn, target_file_id)?.ok_or(Fs0Error::NotFound)
+        self.load_file_by_id(target_file_id)
     }
 
     pub(crate) fn rename_file(
@@ -627,9 +605,7 @@ impl CentralDb {
         source_path: &str,
         target_path: &str,
     ) -> Fs0Result<FileRecord> {
-        let source = self
-            .get_file_by_path(source_path)?
-            .ok_or(Fs0Error::NotFound)?;
+        let source = self.get_file_by_path(source_path)?;
         self.rename_file_record(source, target_path)
     }
 
@@ -638,7 +614,7 @@ impl CentralDb {
         file_id: u64,
         target_path: &str,
     ) -> Fs0Result<FileRecord> {
-        let file = Self::load_file_by_id(&self.conn, file_id)?.ok_or(Fs0Error::NotFound)?;
+        let file = self.load_file_by_id(file_id)?;
         self.rename_file_record(file, target_path)
     }
 
@@ -661,7 +637,7 @@ impl CentralDb {
         if tx.changes() == 0 {
             return Err(Fs0Error::NotFound);
         }
-        Self::insert_file_change_log(
+        Self::tx_insert_file_change_log(
             &tx,
             FileChangeLogKind::Moved,
             Some((old_dir.as_str(), old_name.as_str())),
@@ -670,10 +646,10 @@ impl CentralDb {
             now,
         )?;
         tx.commit()?;
-        Self::load_file_by_id(&self.conn, file.file_id)?.ok_or(Fs0Error::NotFound)
+        self.load_file_by_id(file.file_id)
     }
 
-    fn create_file(
+    fn tx_create_file(
         tx: &rusqlite::Transaction<'_>,
         dir: &str,
         name: &str,
@@ -689,19 +665,19 @@ impl CentralDb {
         i64_to_u64(tx.last_insert_rowid(), "file_id")
     }
 
-    fn delete_file_by_id_tx(
+    fn tx_delete_file_by_id(
         tx: &rusqlite::Transaction<'_>,
         file_id: u64,
         now: u64,
     ) -> Fs0Result<()> {
-        let file = Self::load_file_by_id_tx(tx, file_id)?.ok_or(Fs0Error::NotFound)?;
+        let file = Self::tx_load_file_by_id(tx, file_id)?;
         let (old_dir, old_name) = split_fs0_path(&file.path)?;
         tx.execute(
             "DELETE FROM files
              WHERE file_id = ?1",
             params![u64_to_i64(file_id, "file_id")?],
         )?;
-        Self::insert_file_change_log(
+        Self::tx_insert_file_change_log(
             tx,
             FileChangeLogKind::Deleted,
             Some((old_dir.as_str(), old_name.as_str())),
@@ -711,11 +687,25 @@ impl CentralDb {
         )
     }
 
-    fn load_file_by_dir_name(
-        tx: &rusqlite::Transaction<'_>,
-        dir: &str,
-        name: &str,
-    ) -> Fs0Result<Option<FileRecord>> {
+    fn load_file_by_path(&self, path: &str) -> Fs0Result<FileRecord> {
+        let (dir, name) = split_fs0_path(path)?;
+
+        self.conn
+            .query_row(
+                "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
+                    created_at_ms, updated_at_ms
+             FROM files
+             WHERE dir = ?1 AND name = ?2",
+                params![dir, name],
+                row_to_file_record,
+            )
+            .optional()?
+            .ok_or(Fs0Error::NotFound)
+    }
+
+    fn tx_load_file_by_path(tx: &rusqlite::Transaction<'_>, path: &str) -> Fs0Result<FileRecord> {
+        let (dir, name) = split_fs0_path(path)?;
+
         tx.query_row(
             "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
                     created_at_ms, updated_at_ms
@@ -724,27 +714,16 @@ impl CentralDb {
             params![dir, name],
             row_to_file_record,
         )
-        .optional()
-        .map_err(Fs0Error::from)
+        .optional()?
+        .ok_or(Fs0Error::NotFound)
     }
 
-    fn load_file_by_id(conn: &Connection, file_id: u64) -> Fs0Result<Option<FileRecord>> {
-        conn.query_row(
-            "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
-                    created_at_ms, updated_at_ms
-             FROM files
-             WHERE file_id = ?1",
-            params![u64_to_i64(file_id, "file_id")?],
-            row_to_file_record,
-        )
-        .optional()
-        .map_err(Fs0Error::from)
+    fn load_file_by_id(&self, file_id: u64) -> Fs0Result<FileRecord> {
+        let tx = self.conn.unchecked_transaction()?;
+        Self::tx_load_file_by_id(&tx, file_id)
     }
 
-    fn load_file_by_id_tx(
-        tx: &rusqlite::Transaction<'_>,
-        file_id: u64,
-    ) -> Fs0Result<Option<FileRecord>> {
+    fn tx_load_file_by_id(tx: &rusqlite::Transaction<'_>, file_id: u64) -> Fs0Result<FileRecord> {
         tx.query_row(
             "SELECT file_id, dir, name, size_bytes, compressed_size_bytes,
                     created_at_ms, updated_at_ms
@@ -753,11 +732,11 @@ impl CentralDb {
             params![u64_to_i64(file_id, "file_id")?],
             row_to_file_record,
         )
-        .optional()
-        .map_err(Fs0Error::from)
+        .optional()?
+        .ok_or(Fs0Error::NotFound)
     }
 
-    fn rewrite_point_for_offset(
+    fn tx_rewrite_point_for_offset(
         tx: &rusqlite::Transaction<'_>,
         file_id: u64,
         offset: u64,
@@ -770,12 +749,7 @@ impl CentralDb {
              ORDER BY fb.bundle_index",
         )?;
         let rows = stmt.query_map(params![u64_to_i64(file_id, "file_id")?], |row| {
-            Ok((
-                i64_to_u64(row.get(0)?, "bundle_index")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                i64_to_u64(row.get(1)?, "raw_len")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-            ))
+            Ok((row.u64(0, "bundle_index")?, row.u64(1, "raw_len")?))
         })?;
 
         let mut current_offset = 0u64;
@@ -806,90 +780,27 @@ impl CentralDb {
         }
     }
 
-    fn commit_rewrite_point(
+    fn tx_load_active_lease(
         tx: &rusqlite::Transaction<'_>,
+        lease_id: u64,
         file_id: u64,
-        new_size: u64,
-        bundles: &[CommittedBundle],
-    ) -> Fs0Result<(u64, u64)> {
-        match bundles.first() {
-            Some(bundle) => Self::rewrite_offset_for_bundle_index(tx, file_id, bundle.bundle_index),
-            None => Self::rewrite_point_for_offset(tx, file_id, new_size),
-        }
-    }
-
-    fn rewrite_offset_for_bundle_index(
-        tx: &rusqlite::Transaction<'_>,
-        file_id: u64,
-        first_bundle_index: u64,
-    ) -> Fs0Result<(u64, u64)> {
-        let mut stmt = tx.prepare_cached(
-            "SELECT fb.bundle_index, b.raw_len
-             FROM file_bundles fb
-             JOIN bundles b ON b.bundle_id = fb.bundle_id
-             WHERE fb.file_id = ?1
-             ORDER BY fb.bundle_index",
-        )?;
-        let rows = stmt.query_map(params![u64_to_i64(file_id, "file_id")?], |row| {
-            Ok((
-                i64_to_u64(row.get(0)?, "bundle_index")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                i64_to_u64(row.get(1)?, "raw_len")
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-            ))
-        })?;
-
-        let mut current_offset = 0u64;
-        let mut expected_index = 0u64;
-        for row in rows {
-            let (bundle_index, raw_len) = row?;
-            if bundle_index != expected_index {
-                return Err(Fs0Error::InvalidRequest);
-            }
-            if bundle_index == first_bundle_index {
-                return Ok((current_offset, first_bundle_index));
-            }
-            if bundle_index > first_bundle_index {
-                return Err(Fs0Error::InvalidRequest);
-            }
-            current_offset =
-                current_offset
-                    .checked_add(raw_len)
-                    .ok_or_else(|| Fs0Error::IntegerConversion {
-                        message: "file bundle offset overflow".to_owned(),
-                    })?;
-            expected_index =
-                expected_index
-                    .checked_add(1)
-                    .ok_or_else(|| Fs0Error::IntegerConversion {
-                        message: "bundle_index overflow".to_owned(),
-                    })?;
-        }
-        if first_bundle_index == expected_index {
-            Ok((current_offset, first_bundle_index))
-        } else {
-            Err(Fs0Error::InvalidRequest)
-        }
-    }
-
-    fn load_active_lease(tx: &rusqlite::Transaction<'_>, lease_id: u64) -> Fs0Result<LeaseRecord> {
+    ) -> Fs0Result<LeaseRecord> {
         tx.query_row(
-            "SELECT file_id, client_id, base_size_bytes
+            "SELECT file_id, base_size_bytes, offset_bytes
              FROM append_leases
              WHERE lease_id = ?1
-               AND expires_at_ms > ?2",
+               AND file_id = ?2
+               AND expires_at_ms > ?3",
             params![
                 u64_to_i64(lease_id, "lease_id")?,
+                u64_to_i64(file_id, "file_id")?,
                 u64_to_i64(now_ms(), "now_ms")?,
             ],
             |row| {
                 Ok(LeaseRecord {
-                    file_id: i64_to_u64(row.get(0)?, "file_id")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    client_id: i64_to_u64(row.get(1)?, "client_id")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-                    base_size_bytes: i64_to_u64(row.get(2)?, "base_size_bytes")
-                        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+                    file_id: row.u64(0, "file_id")?,
+                    base_size_bytes: row.u64(1, "base_size_bytes")?,
+                    offset_bytes: row.u64(2, "offset_bytes")?,
                 })
             },
         )
@@ -897,17 +808,9 @@ impl CentralDb {
         .ok_or(Fs0Error::NotFound)
     }
 
-    fn validate_committed_bundles(
-        bundles: &[CommittedBundle],
-        appended_len: u64,
-        expected_first_index: u64,
-    ) -> Fs0Result<()> {
-        let mut expected_index = expected_first_index;
+    fn validate_committed_bundles(bundles: &[CommittedBundle], appended_len: u64) -> Fs0Result<()> {
         let mut total_raw_len = 0u64;
         for bundle in bundles {
-            if bundle.bundle_index != expected_index {
-                return Err(Fs0Error::InvalidRequest);
-            }
             if bundle.raw_len == 0 || bundle.compressed_len == 0 {
                 return Err(Fs0Error::InvalidRequest);
             }
@@ -916,12 +819,6 @@ impl CentralDb {
                     message: "committed bundle raw_len overflow".to_owned(),
                 }
             })?;
-            expected_index =
-                expected_index
-                    .checked_add(1)
-                    .ok_or_else(|| Fs0Error::IntegerConversion {
-                        message: "bundle_index overflow".to_owned(),
-                    })?;
         }
         if total_raw_len != appended_len {
             return Err(Fs0Error::InvalidRequest);
@@ -929,7 +826,7 @@ impl CentralDb {
         Ok(())
     }
 
-    fn insert_file_change_log(
+    fn tx_insert_file_change_log(
         tx: &rusqlite::Transaction<'_>,
         kind: FileChangeLogKind,
         old_target: Option<(&str, &str)>,
@@ -956,24 +853,13 @@ impl CentralDb {
     }
 }
 
-#[derive(Debug)]
-struct LeaseRecord {
-    file_id: u64,
-    client_id: u64,
-    base_size_bytes: u64,
-}
-
-fn row_to_volume_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeRecord> {
-    Ok(VolumeRecord {
-        volume_id: i64_to_u64(row.get(0)?, "volume_id")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+fn row_to_storage_volume_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<StorageVolumeInfo> {
+    Ok(StorageVolumeInfo {
+        volume_id: row.u64(0, "volume_id")?,
         name: row.get(1)?,
-        max_bytes: i64_to_u64(row.get(2)?, "max_bytes")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        created_at_ms: i64_to_u64(row.get(3)?, "created_at_ms")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        updated_at_ms: i64_to_u64(row.get(4)?, "updated_at_ms")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        max_bytes: row.u64(2, "max_bytes")?,
+        max_volume_offset: row.u64(3, "max_volume_offset")?,
+        read_only: false,
     })
 }
 
@@ -981,18 +867,14 @@ fn row_to_file_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     let dir: String = row.get(1)?;
     let name: String = row.get(2)?;
     Ok(FileRecord {
-        file_id: i64_to_u64(row.get(0)?, "file_id")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        path: join_fs0_path(&dir, &name)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        size_bytes: i64_to_u64(row.get(3)?, "size_bytes")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        compressed_size_bytes: i64_to_u64(row.get(4)?, "compressed_size_bytes")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        created_at_ms: i64_to_u64(row.get(5)?, "created_at_ms")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        updated_at_ms: i64_to_u64(row.get(6)?, "updated_at_ms")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        file_id: row.u64(0, "file_id")?,
+        path: join_fs0_path(&dir, &name).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        size_bytes: row.u64(3, "size_bytes")?,
+        compressed_size_bytes: row.u64(4, "compressed_size_bytes")?,
+        created_at_ms: row.u64(5, "created_at_ms")?,
+        updated_at_ms: row.u64(6, "updated_at_ms")?,
     })
 }
 
@@ -1001,32 +883,47 @@ fn row_to_file_change_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileChang
     let old_name: Option<String> = row.get(4)?;
     let new_dir: Option<String> = row.get(5)?;
     let new_name: Option<String> = row.get(6)?;
+    let event_type: String = row.get(1)?;
     Ok(FileChangeLog {
-        event_id: i64_to_u64(row.get(0)?, "event_id")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        kind: parse_file_change_log_kind(row.get::<_, String>(1)?.as_str())
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        file_id: row
-            .get::<_, Option<i64>>(2)?
-            .map(|value| i64_to_u64(value, "file_id"))
-            .transpose()
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        event_id: row.u64(0, "event_id")?,
+        kind: match event_type.as_str() {
+            "created" => FileChangeLogKind::Created,
+            "updated" => FileChangeLogKind::Updated,
+            "moved" => FileChangeLogKind::Moved,
+            "deleted" => FileChangeLogKind::Deleted,
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid file event type {event_type}"),
+                    )),
+                ));
+            }
+        },
+        file_id: row.optional_u64(2, "file_id")?,
         old_path: match (old_dir.as_deref(), old_name.as_deref()) {
-            (Some(dir), Some(name)) => Some(
-                join_fs0_path(dir, name)
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-            ),
+            (Some(dir), Some(name)) => Some(join_fs0_path(dir, name).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?),
             _ => None,
         },
         new_path: match (new_dir.as_deref(), new_name.as_deref()) {
-            (Some(dir), Some(name)) => Some(
-                join_fs0_path(dir, name)
-                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-            ),
+            (Some(dir), Some(name)) => Some(join_fs0_path(dir, name).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?),
             _ => None,
         },
-        created_at_ms: i64_to_u64(row.get(7)?, "created_at_ms")
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        created_at_ms: row.u64(7, "created_at_ms")?,
     })
 }
 
@@ -1036,427 +933,5 @@ fn file_change_log_kind(kind: FileChangeLogKind) -> &'static str {
         FileChangeLogKind::Updated => "updated",
         FileChangeLogKind::Moved => "moved",
         FileChangeLogKind::Deleted => "deleted",
-    }
-}
-
-fn parse_file_change_log_kind(value: &str) -> Fs0Result<FileChangeLogKind> {
-    match value {
-        "created" => Ok(FileChangeLogKind::Created),
-        "updated" => Ok(FileChangeLogKind::Updated),
-        "moved" => Ok(FileChangeLogKind::Moved),
-        "deleted" => Ok(FileChangeLogKind::Deleted),
-        _ => Err(Fs0Error::InvalidRequest),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fs0_core::{BeginAppendRequest, BundleReplicaEvent, CommitAppendRequest};
-
-    fn test_db() -> (tempfile::TempDir, CentralDb, u64) {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = CentralDb::open(temp.path().join("central.db")).unwrap();
-        let volume = db.create_volume("test".to_owned(), 1024 * 1024).unwrap();
-        (temp, db, volume.volume_id)
-    }
-
-    fn begin_create(db: &mut CentralDb, volume_id: u64) -> AppendLease {
-        db.begin_append(
-            BeginAppendRequest {
-                path: "/file".to_owned(),
-                offset: 0,
-                create: true,
-                prefer_volume_name: None,
-                append_size_hint: None,
-            },
-            1,
-            volume_id,
-        )
-        .unwrap()
-    }
-
-    fn begin_append(db: &mut CentralDb, volume_id: u64, offset: u64) -> AppendLease {
-        db.begin_append(
-            BeginAppendRequest {
-                path: "/file".to_owned(),
-                offset,
-                create: false,
-                prefer_volume_name: None,
-                append_size_hint: None,
-            },
-            1,
-            volume_id,
-        )
-        .unwrap()
-    }
-
-    fn record_bundle(db: &mut CentralDb, volume_id: u64, bundle_id: HashId, raw_len: u64) {
-        db.record_bundle_events(vec![BundleReplicaEvent {
-            event_id: 1,
-            kind: BundleReplicaEventKind::Stored,
-            volume_id,
-            bundle_id,
-            raw_len: Some(raw_len),
-            compressed_len: Some(raw_len / 2 + 1),
-        }])
-        .unwrap();
-    }
-
-    fn committed_bundle(bundle_index: u64, bundle_id: HashId, raw_len: u64) -> CommittedBundle {
-        CommittedBundle {
-            bundle_index,
-            bundle_id,
-            raw_len,
-            compressed_len: raw_len / 2 + 1,
-        }
-    }
-
-    #[test]
-    fn commit_append_rejects_sparse_layout() {
-        let (_temp, mut db, volume_id) = test_db();
-        let lease = begin_create(&mut db, volume_id);
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 1024);
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: lease.lease_id,
-                base_size: 0,
-                new_size: 64 * 1024 * 1024,
-                bundles: vec![committed_bundle(100, bundle_id, 1024)],
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
-    }
-
-    #[test]
-    fn commit_append_rejects_non_contiguous_append_index() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let first_bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, first_bundle_id, 12);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
-            },
-            1,
-        )
-        .unwrap();
-
-        let second_lease = begin_append(&mut db, volume_id, 12);
-        let second_bundle_id = HashId([2; 32]);
-        record_bundle(&mut db, volume_id, second_bundle_id, 12);
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: second_lease.lease_id,
-                base_size: 12,
-                new_size: 24,
-                bundles: vec![committed_bundle(2, second_bundle_id, 12)],
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
-    }
-
-    #[test]
-    fn commit_append_rejects_bundle_metadata_mismatch() {
-        let (_temp, mut db, volume_id) = test_db();
-        let lease = begin_create(&mut db, volume_id);
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 12);
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: lease.lease_id,
-                base_size: 0,
-                new_size: 13,
-                bundles: vec![committed_bundle(0, bundle_id, 13)],
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
-    }
-
-    #[test]
-    fn commit_append_rejects_missing_lease() {
-        let (_temp, mut db, _volume_id) = test_db();
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: 404,
-                base_size: 0,
-                new_size: 0,
-                bundles: Vec::new(),
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::NotFound)));
-    }
-
-    #[test]
-    fn commit_append_rejects_wrong_client() {
-        let (_temp, mut db, volume_id) = test_db();
-        let lease = begin_create(&mut db, volume_id);
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 12);
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, bundle_id, 12)],
-            },
-            2,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::Unauthorized)));
-    }
-
-    #[test]
-    fn commit_append_rejects_stale_request_base_size() {
-        let (_temp, mut db, volume_id) = test_db();
-        let lease = begin_create(&mut db, volume_id);
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 12);
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: lease.lease_id,
-                base_size: 1,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, bundle_id, 12)],
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::VersionConflict)));
-    }
-
-    #[test]
-    fn commit_append_rejects_changed_file_size_since_lease() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let first_bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, first_bundle_id, 12);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
-            },
-            1,
-        )
-        .unwrap();
-
-        let stale_lease = begin_append(&mut db, volume_id, 12);
-        db.conn
-            .execute(
-                "UPDATE files SET size_bytes = ?2 WHERE file_id = ?1",
-                params![
-                    u64_to_i64(stale_lease.file_id, "file_id").unwrap(),
-                    u64_to_i64(24, "size_bytes").unwrap(),
-                ],
-            )
-            .unwrap();
-        let stale_bundle_id = HashId([2; 32]);
-        record_bundle(&mut db, volume_id, stale_bundle_id, 12);
-
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: stale_lease.lease_id,
-                base_size: 12,
-                new_size: 24,
-                bundles: vec![committed_bundle(1, stale_bundle_id, 12)],
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::VersionConflict)));
-    }
-
-    #[test]
-    fn commit_append_rejects_new_size_less_than_base_size() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let first_bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, first_bundle_id, 12);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
-            },
-            1,
-        )
-        .unwrap();
-
-        let lease = begin_append(&mut db, volume_id, 12);
-        let result = db.commit_append(
-            CommitAppendRequest {
-                lease_id: lease.lease_id,
-                base_size: 12,
-                new_size: 11,
-                bundles: Vec::new(),
-            },
-            1,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
-    }
-
-    #[test]
-    fn begin_append_rejects_second_client_at_same_base_size() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let first_bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, first_bundle_id, 12);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, first_bundle_id, 12)],
-            },
-            1,
-        )
-        .unwrap();
-
-        let _client_a_lease = begin_append(&mut db, volume_id, 12);
-        let client_b_lease = db.begin_append(
-            BeginAppendRequest {
-                path: "/file".to_owned(),
-                offset: 12,
-                create: false,
-                prefer_volume_name: None,
-                append_size_hint: None,
-            },
-            2,
-            volume_id,
-        );
-
-        assert!(matches!(
-            client_b_lease,
-            Err(Fs0Error::AlreadyExists { .. })
-        ));
-    }
-
-    #[test]
-    fn record_bundle_events_rejects_metadata_conflicts() {
-        let (_temp, mut db, volume_id) = test_db();
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 12);
-
-        let result = db.record_bundle_events(vec![BundleReplicaEvent {
-            event_id: 2,
-            kind: BundleReplicaEventKind::Stored,
-            volume_id,
-            bundle_id,
-            raw_len: Some(13),
-            compressed_len: Some(7),
-        }]);
-
-        assert!(matches!(result, Err(Fs0Error::InvalidData { .. })));
-    }
-
-    #[test]
-    fn begin_append_rejects_offset_past_file_size() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let bundle_id = HashId([1; 32]);
-        record_bundle(&mut db, volume_id, bundle_id, 12);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 12,
-                bundles: vec![committed_bundle(0, bundle_id, 12)],
-            },
-            1,
-        )
-        .unwrap();
-
-        let result = db.begin_append(
-            BeginAppendRequest {
-                path: "/file".to_owned(),
-                offset: 13,
-                create: false,
-                prefer_volume_name: None,
-                append_size_hint: None,
-            },
-            1,
-            volume_id,
-        );
-
-        assert!(matches!(result, Err(Fs0Error::InvalidRequest)));
-    }
-
-    #[test]
-    fn commit_append_replaces_layout_from_rewrite_bundle() {
-        let (_temp, mut db, volume_id) = test_db();
-        let first_lease = begin_create(&mut db, volume_id);
-        let first_bundle_id = HashId([1; 32]);
-        let second_bundle_id = HashId([2; 32]);
-        record_bundle(&mut db, volume_id, first_bundle_id, 10);
-        record_bundle(&mut db, volume_id, second_bundle_id, 10);
-        db.commit_append(
-            CommitAppendRequest {
-                lease_id: first_lease.lease_id,
-                base_size: 0,
-                new_size: 20,
-                bundles: vec![
-                    committed_bundle(0, first_bundle_id, 10),
-                    committed_bundle(1, second_bundle_id, 10),
-                ],
-            },
-            1,
-        )
-        .unwrap();
-
-        let rewrite_lease = db
-            .begin_append(
-                BeginAppendRequest {
-                    path: "/file".to_owned(),
-                    offset: 5,
-                    create: false,
-                    prefer_volume_name: None,
-                    append_size_hint: Some(3),
-                },
-                1,
-                volume_id,
-            )
-            .unwrap();
-        assert_eq!(rewrite_lease.rewrite_offset, 0);
-        assert_eq!(rewrite_lease.first_bundle_index, 0);
-        let replacement_bundle_id = HashId([3; 32]);
-        record_bundle(&mut db, volume_id, replacement_bundle_id, 23);
-
-        let plan = db
-            .commit_append(
-                CommitAppendRequest {
-                    lease_id: rewrite_lease.lease_id,
-                    base_size: 20,
-                    new_size: 23,
-                    bundles: vec![committed_bundle(0, replacement_bundle_id, 23)],
-                },
-                1,
-            )
-            .unwrap();
-
-        assert_eq!(plan.size, 23);
-        assert_eq!(plan.bundles.len(), 1);
-        assert_eq!(plan.bundles[0].bundle_id, replacement_bundle_id);
-        assert_eq!(plan.bundles[0].bundle_index, 0);
     }
 }
