@@ -123,7 +123,6 @@ fn protocol_requests_roundtrip() {
         client_id: 42,
         client_token: "client-token".to_owned(),
     }));
-    assert_postcard_roundtrip(&ProtocolRequest::AuthenticateStorage { storage_id: 7 });
     assert_postcard_roundtrip(&ProtocolRequest::Event(ProtocolEvent::StorageChanged(
         storage,
     )));
@@ -145,7 +144,6 @@ fn protocol_responses_roundtrip() {
     assert_postcard_roundtrip(&ProtocolResponse::Data(DataResponse::Authenticate {
         client_id: 42,
     }));
-    assert_postcard_roundtrip(&ProtocolResponse::AuthenticateStorage { storage_id: 7 });
     assert_postcard_roundtrip(&ProtocolResponse::CentralAdmin(
         CentralAdminResponse::Status(CentralAdminStatus {
             clients_count: 1,
