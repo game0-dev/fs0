@@ -11,51 +11,53 @@ use std::path::{Path, PathBuf};
 /// [central]
 /// db_path = ".local/central.sqlite"
 /// secret_key = "central-secret-key"
-/// bind_port = 3340
-/// public_addr = "127.0.0.1:3340"
+/// bind_port = 7800
 /// replication_factor = 2
 /// auth_tokens = ["dev-token"]
 ///
 /// [central.relay]
-/// http_bind_port = 80
-/// public_url = "https://relay.example.com"
+/// public_url = "https://203.0.113.10:7801"
 /// token = "relay-token"
-///
-/// [central.relay.tls]
-/// https_bind_port = 443
+/// https_bind_port = 7801
+/// quic_bind_port = 7802
 /// cert_path = ".local/relay-cert.pem"
 /// key_path = ".local/relay-key.pem"
-///
-/// [central.relay.quic]
-/// bind_port = 7842
 ///
 /// [client]
 /// token = "dev-token"
 /// central_endpoint_id = "central-endpoint-id"
-/// central_addr = "127.0.0.1:3340"
+/// central_addr = "203.0.113.10:7800"
 ///
 /// [client.relay]
-/// url = "https://relay.example.com"
+/// url = "https://203.0.113.10:7801"
 /// token = "relay-token"
-/// quic_port = 7842
+/// quic_port = 7802
+/// ca_cert = """
+/// -----BEGIN CERTIFICATE-----
+/// ...
+/// -----END CERTIFICATE-----
+/// """
 ///
 /// [storage]
 /// name = "local-storage-1"
 /// token = "dev-token"
-/// secret_key = "storage-secret-key"
 /// bind_port = 3341
 /// central_endpoint_id = "central-endpoint-id"
-/// central_addr = "127.0.0.1:3340"
+/// central_addr = "203.0.113.10:7800"
 /// check_hash_before_write = false
 ///
 /// [storage.relay]
-/// url = "https://relay.example.com"
+/// url = "https://203.0.113.10:7801"
 /// token = "relay-token"
-/// quic_port = 7842
+/// quic_port = 7802
+/// ca_cert = """
+/// -----BEGIN CERTIFICATE-----
+/// ...
+/// -----END CERTIFICATE-----
+/// """
 ///
 /// [[storage.volumes]]
 /// path = ".local/volume-1"
-/// volume_id = 1
 /// name = "local-volume-1"
 /// read_only = false
 /// read_concurrency = 4
@@ -73,8 +75,6 @@ pub struct CentralConfig {
     pub db_path: PathBuf,
     pub secret_key: String,
     pub bind_port: u16,
-    #[serde(default)]
-    pub public_addr: Option<String>,
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u16,
     #[serde(default)]
@@ -84,29 +84,17 @@ pub struct CentralConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CentralRelayConfig {
-    pub http_bind_port: u16,
     pub public_url: String,
     pub token: String,
-    pub tls: CentralRelayTlsConfig,
-    pub quic: CentralRelayQuicConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CentralRelayTlsConfig {
     pub https_bind_port: u16,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CentralRelayQuicConfig {
-    pub bind_port: u16,
+    pub quic_bind_port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     pub name: String,
-    pub secret_key: String,
     pub token: String,
     pub central_endpoint_id: String,
     pub central_addr: String,
@@ -122,7 +110,6 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct StorageVolumeConfig {
     pub path: PathBuf,
-    pub volume_id: u64,
     pub name: String,
     #[serde(default)]
     pub read_only: bool,
@@ -138,10 +125,6 @@ pub struct ClientConfig {
     pub central_endpoint_id: String,
     pub central_addr: String,
     #[serde(default)]
-    pub secret_key: Option<String>,
-    #[serde(default)]
-    pub bind_port: Option<u16>,
-    #[serde(default)]
     pub relay: Option<RelayClientConfig>,
 }
 
@@ -150,6 +133,8 @@ pub struct RelayClientConfig {
     pub url: String,
     pub token: String,
     pub quic_port: u16,
+    #[serde(default)]
+    pub ca_cert: Option<String>,
 }
 
 impl Fs0Config {
@@ -225,68 +210,73 @@ mod tests {
             [central]
             db_path = ".local/central.sqlite"
             secret_key = "central-secret-key"
-            bind_port = 3340
-            public_addr = "127.0.0.1:3340"
+            bind_port = 7800
+            replication_factor = 2
             auth_tokens = ["dev-token"]
 
             [central.relay]
-            http_bind_port = 80
-            public_url = "https://relay.example.com"
+            public_url = "https://203.0.113.10:7801"
             token = "relay-token"
-
-            [central.relay.tls]
-            https_bind_port = 443
+            https_bind_port = 7801
             cert_path = ".local/relay-cert.pem"
             key_path = ".local/relay-key.pem"
-
-            [central.relay.quic]
-            bind_port = 7842
+            quic_bind_port = 7802
 
             [client]
             token = "dev-token"
             central_endpoint_id = "central-endpoint-id"
-            central_addr = "127.0.0.1:3340"
+            central_addr = "203.0.113.10:7800"
 
             [client.relay]
-            url = "https://relay.example.com"
+            url = "https://203.0.113.10:7801"
             token = "relay-token"
-            quic_port = 7842
+            quic_port = 7802
+            ca_cert = """
+            -----BEGIN CERTIFICATE-----
+            test-client-ca
+            -----END CERTIFICATE-----
+            """
 
             [storage]
             name = "local-storage-1"
-            secret_key = "storage-secret-key"
             token = "dev-token"
             central_endpoint_id = "central-endpoint-id"
-            central_addr = "127.0.0.1:3340"
+            central_addr = "203.0.113.10:7800"
             bind_port = 3341
+            check_hash_before_write = false
 
             [storage.relay]
-            url = "https://relay.example.com"
+            url = "https://203.0.113.10:7801"
             token = "relay-token"
-            quic_port = 7842
+            quic_port = 7802
+            ca_cert = """
+            -----BEGIN CERTIFICATE-----
+            test-storage-ca
+            -----END CERTIFICATE-----
+            """
 
             [[storage.volumes]]
             path = ".local/volume-1"
-            volume_id = 1
             name = "local-volume-1"
             "#,
         )
         .unwrap();
 
         let central = config.central.unwrap();
-        assert_eq!(central.bind_port, 3340);
-        assert_eq!(central.public_addr.as_deref(), Some("127.0.0.1:3340"));
-        assert_eq!(central.relay.http_bind_port, 80);
+        assert_eq!(central.bind_port, 7800);
+        assert_eq!(central.replication_factor, 2);
+        assert_eq!(central.relay.public_url, "https://203.0.113.10:7801");
         assert_eq!(central.relay.token, "relay-token");
-        assert_eq!(central.relay.tls.https_bind_port, 443);
-        assert_eq!(central.relay.quic.bind_port, 7842);
+        assert_eq!(central.relay.https_bind_port, 7801);
+        assert_eq!(central.relay.quic_bind_port, 7802);
 
         let storage = config.storage.unwrap();
         assert_eq!(storage.central_endpoint_id, "central-endpoint-id");
+        assert_eq!(storage.central_addr, "203.0.113.10:7800");
         assert_eq!(storage.bind_port, Some(3341));
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.url.as_str()),
-            Some("https://relay.example.com")
+            Some("https://203.0.113.10:7801")
         );
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.token.as_str()),
@@ -294,16 +284,33 @@ mod tests {
         );
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.quic_port),
-            Some(7842)
+            Some(7802)
+        );
+        assert!(
+            storage
+                .relay
+                .as_ref()
+                .and_then(|relay| relay.ca_cert.as_deref())
+                .is_some_and(|ca_cert| ca_cert.contains("test-storage-ca"))
         );
         assert!(!storage.check_hash_before_write);
 
         let client = config.client.unwrap();
-        assert_eq!(client.central_addr, "127.0.0.1:3340");
-        assert!(client.secret_key.is_none());
+        assert_eq!(client.central_addr, "203.0.113.10:7800");
+        assert_eq!(
+            client.relay.as_ref().map(|relay| relay.url.as_str()),
+            Some("https://203.0.113.10:7801")
+        );
         assert_eq!(
             client.relay.as_ref().map(|relay| relay.token.as_str()),
             Some("relay-token")
+        );
+        assert!(
+            client
+                .relay
+                .as_ref()
+                .and_then(|relay| relay.ca_cert.as_deref())
+                .is_some_and(|ca_cert| ca_cert.contains("test-client-ca"))
         );
     }
 }

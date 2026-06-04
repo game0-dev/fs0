@@ -276,7 +276,7 @@ impl VolumeDb {
             }
         }
 
-        Self::insert_bundle_change_record(&tx, bundle_id, BundleReplicaEventKind::Stored)?;
+        Self::insert_bundle_change_record_tx(&tx, bundle_id, BundleReplicaEventKind::Stored)?;
         tx.commit()?;
 
         self.load_bundle(bundle_id)
@@ -289,7 +289,7 @@ impl VolumeDb {
             params![bundle_id.as_bytes().as_slice()],
         )?;
 
-        Self::insert_bundle_change_record(&tx, bundle_id, BundleReplicaEventKind::Deleted)?;
+        Self::insert_bundle_change_record_tx(&tx, bundle_id, BundleReplicaEventKind::Deleted)?;
         tx.commit()?;
 
         Ok(())
@@ -380,7 +380,7 @@ impl VolumeDb {
         Ok(())
     }
 
-    fn insert_bundle_change_record(
+    fn insert_bundle_change_record_tx(
         tx: &Transaction<'_>,
         bundle_id: HashId,
         kind: BundleReplicaEventKind,

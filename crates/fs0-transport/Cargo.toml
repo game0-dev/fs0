@@ -6,10 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fs0-config.workspace = true
 fs0-core.workspace = true
 iroh.workspace = true
 iroh-relay.workspace = true
 postcard.workspace = true
+rustls.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 

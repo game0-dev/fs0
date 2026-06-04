@@ -3,19 +3,14 @@ mod connection;
 pub use connection::Connection;
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 
+use fs0_config::RelayClientConfig;
 use fs0_core::{Fs0Error, Fs0Result};
 use iroh::{
     Endpoint, RelayConfig as IrohRelayConfig, RelayMap, RelayMode, RelayUrl, endpoint::presets,
 };
-use iroh_relay::RelayQuicConfig;
+use iroh_relay::{RelayQuicConfig, tls::CaRootsConfig};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::net::SocketAddr;
-
-#[derive(Debug, Clone)]
-pub struct RelayConfig {
-    pub url: String,
-    pub token: String,
-    pub quic_port: u16,
-}
 
 #[derive(Debug, Clone)]
 pub struct Transport {
@@ -27,12 +22,20 @@ impl Transport {
         alpns: Vec<&[u8]>,
         secret_key: Option<SecretKey>,
         bind_addr: Option<SocketAddr>,
-        relay: Option<RelayConfig>,
+        relay: Option<RelayClientConfig>,
     ) -> Fs0Result<Self> {
         let alpns = alpns.into_iter().map(<[u8]>::to_vec).collect();
+        let ca_roots_config = relay
+            .as_ref()
+            .and_then(|relay| relay.ca_cert.as_deref())
+            .map(ca_roots_config)
+            .transpose()?;
         let mut builder = Endpoint::builder(presets::Minimal)
             .alpns(alpns)
             .relay_mode(relay.map_or(Ok(RelayMode::Disabled), |relay| relay_mode(&relay))?);
+        if let Some(ca_roots_config) = ca_roots_config {
+            builder = builder.ca_roots_config(ca_roots_config);
+        }
 
         if let Some(secret_key) = secret_key {
             builder = builder.secret_key(secret_key);
@@ -95,7 +98,7 @@ impl Transport {
     }
 }
 
-fn relay_mode(config: &RelayConfig) -> Fs0Result<RelayMode> {
+fn relay_mode(config: &RelayClientConfig) -> Fs0Result<RelayMode> {
     let relay_url = config
         .url
         .parse::<RelayUrl>()
@@ -105,6 +108,21 @@ fn relay_mode(config: &RelayConfig) -> Fs0Result<RelayMode> {
     let relay = IrohRelayConfig::new(relay_url, Some(RelayQuicConfig::new(config.quic_port)))
         .with_auth_token(config.token.clone());
     Ok(RelayMode::Custom(RelayMap::from(relay)))
+}
+
+fn ca_roots_config(ca_cert: &str) -> Fs0Result<CaRootsConfig> {
+    let certs = CertificateDer::pem_slice_iter(ca_cert.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Fs0Error::InvalidConfig {
+            message: format!("invalid relay ca_cert: {err}"),
+        })?;
+    if certs.is_empty() {
+        return Err(Fs0Error::InvalidConfig {
+            message: "relay ca_cert contains no certificates".to_owned(),
+        });
+    }
+
+    Ok(CaRootsConfig::custom(certs))
 }
 
 #[cfg(test)]
