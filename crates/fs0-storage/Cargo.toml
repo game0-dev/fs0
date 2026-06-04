@@ -12,7 +12,8 @@ fs0-transport.workspace = true
 fs0-volume.workspace = true
 iroh.workspace = true
 parking_lot.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
+postcard.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

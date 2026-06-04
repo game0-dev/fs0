@@ -1,101 +1,111 @@
-use crate::{Fs0Result, StorageConfig, data_server::spawn_data_accept_loop};
+use crate::{
+    Fs0Result, StorageConfig,
+    client_server::spawn_client_connection_loop,
+    tasks::{ServerTasks, spawn_bundle_reporter_loop, spawn_idle_file_close_loop},
+};
 use fs0_core::{
-    Fs0Error, HashId, TRANSPORT_DATA_ALPN, VOLUME_DATA_FILE_IDLE_TTL_MS, blake3_hash,
+    Fs0Error, HashId, TRANSPORT_CONTROL_ALPN, TRANSPORT_DATA_ALPN, blake3_hash,
     protocol::{
         BundleChunkRef, BundleReplicaEvent, ControlRequest, ControlResponse,
-        GrantUploadLeaseRequest, StorageVolumeInfo,
+        GrantUploadLeaseRequest, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
+        StorageVolumeInfo,
     },
-    utils::{decode_hex_bytes, now_ms},
+    utils::now_ms,
     zstd_decompress,
 };
-use fs0_transport::{connect_control, control_rpc, encode_endpoint_addr, read_frame, write_frame};
+use fs0_transport::{Connection, EndpointAddr, EndpointId, Transport};
 use fs0_volume::{BundleMeta, ChunkMeta, Volume, VolumeMeta};
-use iroh::{
-    Endpoint,
-    endpoint::{Connection, VarInt, presets},
-};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     path::Path,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{
-    sync::Notify,
-    task::JoinHandle,
-    time::{Duration, interval},
-};
+use tokio::{sync::Notify, task::JoinHandle};
 
 #[derive(Debug)]
 pub struct StorageServer {
     config: Arc<StorageConfig>,
-    storage_id: AtomicU64,
+    storage_id: u64,
     volumes: Arc<HashMap<u64, Arc<Volume>>>,
+    read_only_volume_ids: Arc<HashSet<u64>>,
     upload_leases: RwLock<HashMap<u64, UploadLeaseState>>,
     central_connection: Connection,
-    endpoint: Endpoint,
+    endpoint: Transport,
     exit: AtomicBool,
     shutdown_notify: Arc<Notify>,
-    data_task: Mutex<Option<JoinHandle<()>>>,
-    control_task: Mutex<Option<JoinHandle<()>>>,
-    reporter_task: Mutex<Option<JoinHandle<()>>>,
-    idle_file_close_task: Mutex<Option<JoinHandle<()>>>,
+    tasks: ServerTasks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UploadLeaseState {
-    client_id: u64,
+    file_id: u64,
     volume_id: u64,
     expires_at_ms: u64,
 }
 
+#[derive(Debug)]
+struct OpenedVolumes {
+    volumes: HashMap<u64, Arc<Volume>>,
+    read_only_volume_ids: HashSet<u64>,
+    infos: Vec<StorageVolumeInfo>,
+}
+
 impl StorageServer {
     pub async fn run(config: StorageConfig) -> Fs0Result<Arc<Self>> {
-        let volumes = Arc::new(open_volumes(&config)?);
-        let endpoint = Endpoint::builder(presets::N0)
-            .alpns(vec![TRANSPORT_DATA_ALPN.to_vec()])
-            .bind()
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })?;
-        let data_endpoint = encode_endpoint_addr(&endpoint)?;
-        let central_endpoint = decode_hex_bytes(&config.central_endpoint, "central_endpoint")?;
-        let control = connect_control(&endpoint, &central_endpoint).await?;
-        let storage_id = register_storage(&control, &config, &volumes, data_endpoint).await?;
+        let opened_volumes = open_volumes(&config)?;
+        let volume_infos = opened_volumes.infos;
+        let volumes = Arc::new(opened_volumes.volumes);
+        let read_only_volume_ids = Arc::new(opened_volumes.read_only_volume_ids);
+        let bind_addr = config
+            .bind_port
+            .map(|port| SocketAddr::from(([0, 0, 0, 0], port)));
+        let endpoint = Transport::bind(
+            vec![TRANSPORT_DATA_ALPN],
+            None,
+            bind_addr,
+            config.relay.clone(),
+        )
+        .await?;
+        let data_endpoint = postcard::to_allocvec(&endpoint.addr())?;
+        let central_endpoint = central_endpoint_addr(&config)?;
+        let central_connection = endpoint
+            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
+            .await?;
+        let (storage_id, _) =
+            register_storage(&central_connection, &config, volume_infos, data_endpoint).await?;
 
         let server = Arc::new(Self {
             config: Arc::new(config),
-            storage_id: AtomicU64::new(storage_id),
+            storage_id,
             volumes,
+            read_only_volume_ids,
             upload_leases: RwLock::new(HashMap::new()),
-            central_connection: control,
+            central_connection,
             endpoint,
             exit: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
-            data_task: Mutex::new(None),
-            control_task: Mutex::new(None),
-            reporter_task: Mutex::new(None),
-            idle_file_close_task: Mutex::new(None),
+            tasks: ServerTasks::new(),
         });
 
-        *server.control_task.lock() = Some(spawn_control_accept_loop(
+        server.tasks.push(spawn_control_accept_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        *server.data_task.lock() = Some(spawn_data_accept_loop(
+        server.tasks.push(spawn_connection_accept_loop(
             server.endpoint.clone(),
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        *server.reporter_task.lock() = Some(spawn_bundle_reporter_loop(
+        server.tasks.push(spawn_bundle_reporter_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        *server.idle_file_close_task.lock() = Some(spawn_idle_file_close_loop(
+        server.tasks.push(spawn_idle_file_close_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
@@ -114,11 +124,11 @@ impl StorageServer {
 
     #[must_use]
     pub fn storage_id(&self) -> u64 {
-        self.storage_id.load(Ordering::Acquire)
+        self.storage_id
     }
 
     #[must_use]
-    pub fn endpoint(&self) -> &Endpoint {
+    pub fn endpoint(&self) -> &Transport {
         &self.endpoint
     }
 
@@ -133,27 +143,10 @@ impl StorageServer {
         }
 
         self.shutdown_notify.notify_waiters();
-        self.central_connection
-            .close(VarInt::from_u32(0), b"storage shutdown");
+        self.central_connection.close(b"storage shutdown");
         self.endpoint.close().await;
 
-        let data_task = self.data_task.lock().take();
-        let control_task = self.control_task.lock().take();
-        let reporter_task = self.reporter_task.lock().take();
-        let idle_file_close_task = self.idle_file_close_task.lock().take();
-
-        if let Some(task) = data_task {
-            let _ = task.await;
-        }
-        if let Some(task) = control_task {
-            let _ = task.await;
-        }
-        if let Some(task) = reporter_task {
-            let _ = task.await;
-        }
-        if let Some(task) = idle_file_close_task {
-            let _ = task.await;
-        }
+        self.tasks.join_all().await;
     }
 
     #[must_use]
@@ -178,22 +171,32 @@ impl StorageServer {
             .ok_or(Fs0Error::UnknownVolume)
     }
 
+    pub(crate) fn close_idle_data_files(&self) {
+        for volume in self.volumes.values() {
+            volume.close_idle_data_files();
+        }
+    }
+
     pub async fn validate_client_auth(
         &self,
         client_id: u64,
         client_token: String,
     ) -> Fs0Result<()> {
-        match control_rpc(
-            &self.central_connection,
-            ControlRequest::ValidateClientAuth {
-                client_id,
-                client_token,
-            },
-        )
-        .await?
+        match self
+            .central_connection
+            .rpc(ProtocolRequest::Control(
+                ControlRequest::ValidateClientAuth {
+                    client_id,
+                    client_token,
+                },
+            ))
+            .await?
         {
-            ControlResponse::ValidateClientAuth { client_id: _ } => Ok(()),
-            ControlResponse::Error(err) => Err(err),
+            ProtocolResponse::Control(ControlResponse::ValidateClientAuth { client_id: _ }) => {
+                Ok(())
+            }
+            ProtocolResponse::Control(ControlResponse::Error(err))
+            | ProtocolResponse::Error(err) => Err(err),
             response => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected validate client auth response: {response:?}"),
             }),
@@ -202,8 +205,8 @@ impl StorageServer {
 
     pub async fn put_chunk(
         &self,
-        client_id: u64,
         lease_id: u64,
+        file_id: u64,
         volume_id: u64,
         chunk_id: HashId,
         raw_len: u64,
@@ -213,7 +216,7 @@ impl StorageServer {
             return Err(Fs0Error::Unauthorized);
         }
 
-        self.validate_upload_lease(client_id, lease_id, volume_id)?;
+        self.validate_upload_lease(lease_id, file_id, volume_id)?;
 
         self.check_raw_hash_before_write(chunk_id, raw_len, &compressed_bytes)?;
 
@@ -245,8 +248,8 @@ impl StorageServer {
 
     pub(crate) async fn commit_bundle(
         &self,
-        client_id: u64,
         lease_id: u64,
+        file_id: u64,
         volume_id: u64,
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
@@ -255,7 +258,7 @@ impl StorageServer {
             return Err(Fs0Error::Unauthorized);
         }
 
-        self.validate_upload_lease(client_id, lease_id, volume_id)?;
+        self.validate_upload_lease(lease_id, file_id, volume_id)?;
 
         let bundle = self
             .volume(volume_id)?
@@ -263,6 +266,7 @@ impl StorageServer {
             .await?;
         self.sync_bundle_change_records_for_volume(volume_id)
             .await?;
+        self.report_volume_offset(volume_id).await?;
 
         Ok(bundle)
     }
@@ -307,11 +311,7 @@ impl StorageServer {
     }
 
     fn is_volume_read_only(&self, volume_id: u64) -> bool {
-        self.config
-            .volumes
-            .iter()
-            .find(|volume| volume.volume_id == volume_id)
-            .is_some_and(|volume| volume.read_only)
+        self.read_only_volume_ids.contains(&volume_id)
     }
 
     fn check_raw_hash_before_write(
@@ -351,7 +351,7 @@ impl StorageServer {
         self.upload_leases.write().insert(
             lease.lease_id,
             UploadLeaseState {
-                client_id: lease.client_id,
+                file_id: lease.file_id,
                 volume_id: lease.volume_id,
                 expires_at_ms: lease.expires_at_ms,
             },
@@ -364,12 +364,7 @@ impl StorageServer {
         self.upload_leases.write().remove(&lease_id);
     }
 
-    fn validate_upload_lease(
-        &self,
-        client_id: u64,
-        lease_id: u64,
-        volume_id: u64,
-    ) -> Fs0Result<()> {
+    fn validate_upload_lease(&self, lease_id: u64, file_id: u64, volume_id: u64) -> Fs0Result<()> {
         let now = now_ms();
         self.upload_leases
             .write()
@@ -379,7 +374,7 @@ impl StorageServer {
             .upload_leases
             .read()
             .get(&lease_id)
-            .is_some_and(|lease| lease.client_id == client_id && lease.volume_id == volume_id);
+            .is_some_and(|lease| lease.file_id == file_id && lease.volume_id == volume_id);
 
         if allowed {
             Ok(())
@@ -421,7 +416,7 @@ impl StorageServer {
         }
     }
 
-    async fn sync_bundle_change_records(&self) -> Fs0Result<()> {
+    pub(crate) async fn sync_bundle_change_records(&self) -> Fs0Result<()> {
         let mut per_volume = self.volumes.iter().collect::<Vec<_>>();
         per_volume.sort_by_key(|(volume_id, _)| **volume_id);
 
@@ -439,17 +434,42 @@ impl StorageServer {
     }
 
     async fn report_bundle_events(&self, events: Vec<BundleReplicaEvent>) -> Fs0Result<()> {
-        match control_rpc(
-            &self.central_connection,
-            ControlRequest::ReportBundleReplica {
-                events: events.clone(),
-            },
-        )
-        .await
+        match self
+            .central_connection
+            .rpc(ProtocolRequest::Control(
+                ControlRequest::ReportBundleReplica {
+                    events: events.clone(),
+                },
+            ))
+            .await
         {
-            Ok(ControlResponse::ReportBundleReplica) => Ok(()),
+            Ok(ProtocolResponse::Control(ControlResponse::ReportBundleReplica)) => Ok(()),
+            Ok(ProtocolResponse::Control(ControlResponse::Error(err)))
+            | Ok(ProtocolResponse::Error(err)) => Err(err),
             Ok(response) => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected report bundle replica response: {response:?}"),
+            }),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn report_volume_offset(&self, volume_id: u64) -> Fs0Result<()> {
+        let max_volume_offset = self.volume(volume_id)?.meta().active_volume_offset;
+        match self
+            .central_connection
+            .rpc(ProtocolRequest::Control(
+                ControlRequest::UpdateStorageVolumeOffset {
+                    volume_id,
+                    max_volume_offset,
+                },
+            ))
+            .await
+        {
+            Ok(ProtocolResponse::Control(ControlResponse::UpdateStorageVolumeOffset)) => Ok(()),
+            Ok(ProtocolResponse::Control(ControlResponse::Error(err)))
+            | Ok(ProtocolResponse::Error(err)) => Err(err),
+            Ok(response) => Err(Fs0Error::InvalidFrame {
+                message: format!("unexpected update storage volume offset response: {response:?}"),
             }),
             Err(err) => Err(err),
         }
@@ -460,23 +480,18 @@ impl Drop for StorageServer {
     fn drop(&mut self) {
         self.exit.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
-        self.central_connection
-            .close(VarInt::from_u32(0), b"storage dropped");
+        self.central_connection.close(b"storage dropped");
     }
 }
 
-fn open_volumes(config: &StorageConfig) -> Fs0Result<HashMap<u64, Arc<Volume>>> {
+fn open_volumes(config: &StorageConfig) -> Fs0Result<OpenedVolumes> {
     let mut seen_ids = HashSet::with_capacity(config.volumes.len());
     let mut seen_names = HashSet::with_capacity(config.volumes.len());
     let mut volumes = HashMap::with_capacity(config.volumes.len());
+    let mut read_only_volume_ids = HashSet::new();
+    let mut infos = Vec::with_capacity(config.volumes.len());
 
     for volume_config in &config.volumes {
-        if !seen_ids.insert(volume_config.volume_id) {
-            return Err(Fs0Error::InvalidConfig {
-                message: format!("duplicate volume id {}", volume_config.volume_id),
-            });
-        }
-
         if !seen_names.insert(volume_config.name.clone()) {
             return Err(Fs0Error::InvalidConfig {
                 message: format!("duplicate volume name {}", volume_config.name),
@@ -501,70 +516,132 @@ fn open_volumes(config: &StorageConfig) -> Fs0Result<HashMap<u64, Arc<Volume>>> 
         })?;
         let volume = Volume::open(&volume_config.path, read_concurrency, write_concurrency)?;
         let meta = volume.meta();
-
-        if meta.volume_id != volume_config.volume_id {
+        if meta.volume_id == 0 {
             return Err(Fs0Error::InvalidConfig {
                 message: format!(
-                    "configured volume id {} does not match volume metadata id {}: {}",
-                    volume_config.volume_id,
-                    meta.volume_id,
+                    "volume {} has not been assigned a central volume id",
                     volume_config.path.display()
                 ),
             });
         }
+        if !seen_ids.insert(meta.volume_id) {
+            return Err(Fs0Error::InvalidConfig {
+                message: format!("duplicate volume id {}", meta.volume_id),
+            });
+        }
 
-        volumes.insert(volume_config.volume_id, Arc::new(volume));
+        infos.push(StorageVolumeInfo {
+            volume_id: meta.volume_id,
+            name: volume_config.name.clone(),
+            max_bytes: meta.max_bytes,
+            max_volume_offset: meta.active_volume_offset,
+            read_only: volume_config.read_only,
+        });
+        if volume_config.read_only {
+            read_only_volume_ids.insert(meta.volume_id);
+        }
+        volumes.insert(meta.volume_id, Arc::new(volume));
     }
+    infos.sort_by_key(|volume| volume.volume_id);
 
-    Ok(volumes)
+    Ok(OpenedVolumes {
+        volumes,
+        read_only_volume_ids,
+        infos,
+    })
+}
+
+fn central_endpoint_addr(config: &StorageConfig) -> Fs0Result<EndpointAddr> {
+    let endpoint_id =
+        parse_endpoint_id(&config.central_endpoint_id, "storage.central_endpoint_id")?;
+    let socket_addr = parse_socket_addr(&config.central_addr, "storage.central_addr")?;
+
+    Ok(EndpointAddr::new(endpoint_id).with_ip_addr(socket_addr))
+}
+
+fn parse_endpoint_id(value: &str, field: &str) -> Fs0Result<EndpointId> {
+    value
+        .parse::<EndpointId>()
+        .map_err(|err| Fs0Error::InvalidConfig {
+            message: format!("invalid {field}: {err}"),
+        })
+}
+
+fn parse_socket_addr(value: &str, field: &str) -> Fs0Result<SocketAddr> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|err| Fs0Error::InvalidConfig {
+            message: format!("invalid {field} {value}: {err}"),
+        })
 }
 
 async fn register_storage(
     control: &Connection,
     config: &StorageConfig,
-    volumes: &HashMap<u64, Arc<Volume>>,
+    volumes: Vec<StorageVolumeInfo>,
     data_endpoint: Vec<u8>,
-) -> Fs0Result<u64> {
-    let mut volume_infos = volumes
-        .values()
-        .map(|volume| volume.meta())
-        .map(|volume| {
-            let configured = config
-                .volumes
-                .iter()
-                .find(|configured| configured.volume_id == volume.volume_id)
-                .ok_or_else(|| Fs0Error::InvalidConfig {
-                    message: format!("opened volume {} is missing from config", volume.volume_id),
-                })?;
-
-            Ok(StorageVolumeInfo {
-                volume_id: volume.volume_id,
-                name: configured.name.clone(),
-                max_bytes: volume.max_bytes,
-                max_volume_offset: volume.active_volume_offset,
-                read_only: configured.read_only,
-            })
-        })
-        .collect::<Fs0Result<Vec<_>>>()?;
-    volume_infos.sort_by_key(|volume| volume.volume_id);
-
-    match control_rpc(
-        control,
-        ControlRequest::RegisterStorage {
+) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
+    match control
+        .rpc(ProtocolRequest::Control(ControlRequest::RegisterStorage {
             name: config.name.clone(),
             token: config.token.clone(),
-            volumes: volume_infos,
+            volumes,
             iroh_endpoint: data_endpoint,
-        },
-    )
-    .await?
+        }))
+        .await?
     {
-        ControlResponse::RegisterStorage { storage_id, .. } => Ok(storage_id),
-        ControlResponse::Error(err) => Err(err),
+        ProtocolResponse::Control(ControlResponse::RegisterStorage {
+            storage_id,
+            storages,
+        }) => Ok((storage_id, storages)),
+        ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
+            Err(err)
+        }
         response => Err(Fs0Error::InvalidFrame {
             message: format!("unexpected storage registration response: {response:?}"),
         }),
     }
+}
+
+fn spawn_connection_accept_loop(
+    endpoint: Transport,
+    server: Weak<StorageServer>,
+    shutdown_notify: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_notify.notified() => break,
+                accepted = endpoint.accept() => {
+                    let Some(server) = server.upgrade() else {
+                        break;
+                    };
+                    if server.is_exiting() {
+                        break;
+                    }
+
+                    let accepted = match accepted {
+                        Ok(Some(accepted)) => accepted,
+                        Ok(None) => break,
+                        Err(_) => continue,
+                    };
+                    let alpn = accepted.alpn().to_vec();
+                    let connection = accepted;
+
+                    match alpn.as_slice() {
+                        TRANSPORT_DATA_ALPN => {
+                            server.tasks.push(spawn_client_connection_loop(
+                                server.clone(),
+                                connection,
+                                shutdown_notify.clone(),
+                            ));
+                        }
+                        _ => connection.close(b"unsupported storage alpn"),
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn spawn_control_accept_loop(
@@ -572,29 +649,30 @@ fn spawn_control_accept_loop(
     shutdown_notify: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            let Some(server) = server.upgrade() else {
-                break;
-            };
-            if server.is_exiting() {
-                break;
-            }
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        if server.is_exiting() {
+            return;
+        }
 
-            tokio::select! {
-                _ = shutdown_notify.notified() => break,
-                stream = server.central_connection.accept_bi() => {
-                    let Ok((mut send, mut recv)) = stream else {
-                        break;
-                    };
-                    let response = match read_frame::<ControlRequest, _>(&mut recv).await {
-                        Ok(request) => handle_control_request(&server, request),
-                        Err(err) => ControlResponse::Error(err),
-                    };
-
-                    let _ = write_frame(&mut send, &response).await;
-                    let _ = send.finish();
+        tokio::select! {
+            _ = shutdown_notify.notified() => {}
+            _ = server.central_connection.serve({
+                let server = server.clone();
+                move |request| {
+                    let server = server.clone();
+                    async move {
+                        let response = match request {
+                            ProtocolRequest::Control(request) => {
+                                ProtocolResponse::Control(handle_control_request(&server, request))
+                            }
+                            _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
+                        };
+                        Ok(Some(response))
+                    }
                 }
-            }
+            }) => {}
         }
     })
 }
@@ -611,55 +689,4 @@ fn handle_control_request(server: &StorageServer, request: ControlRequest) -> Co
         }
         _ => ControlResponse::Error(Fs0Error::InvalidRequest),
     }
-}
-
-fn spawn_bundle_reporter_loop(
-    server: Weak<StorageServer>,
-    shutdown_notify: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(60));
-
-        loop {
-            tokio::select! {
-                _ = shutdown_notify.notified() => break,
-                _ = interval.tick() => {}
-            }
-
-            let Some(server) = server.upgrade() else {
-                break;
-            };
-            if server.is_exiting() {
-                break;
-            }
-
-            let _ = server.sync_bundle_change_records().await;
-        }
-    })
-}
-
-fn spawn_idle_file_close_loop(
-    server: Weak<StorageServer>,
-    shutdown_notify: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_millis(VOLUME_DATA_FILE_IDLE_TTL_MS));
-        loop {
-            tokio::select! {
-                _ = shutdown_notify.notified() => break,
-                _ = interval.tick() => {}
-            }
-
-            let Some(server) = server.upgrade() else {
-                break;
-            };
-            if server.is_exiting() {
-                break;
-            }
-
-            for volume in server.volumes.values() {
-                volume.close_idle_data_files();
-            }
-        }
-    })
 }

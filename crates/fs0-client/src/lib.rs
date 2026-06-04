@@ -1,22 +1,20 @@
 pub use fs0_config::ClientConfig;
 use fs0_config::Fs0Config;
 use fs0_core::{
-    AppendLease, BeginAppendRequest, BundleChunkRef, CommitAppendRequest, CommittedBundle,
-    ControlRequest, ControlResponse, DEFAULT_CLIENT_DATA_CONCURRENCY, DEFAULT_ZSTD_LEVEL,
-    DataRequest, DataResponse, DirectoryEntries, FileChangeLogs, FileReadPlan, Fs0Error, Fs0Result,
-    HashId, StoragePeerInfo, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE, blake3_hash,
-    bundle_hash_from_chunks, decode_hex_bytes, zstd_compress, zstd_decompress,
+    DEFAULT_CLIENT_DATA_CONCURRENCY, DEFAULT_ZSTD_LEVEL, Fs0Error, Fs0Result, HashId,
+    TRANSPORT_CONTROL_ALPN, TRANSPORT_DATA_ALPN, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE,
+    blake3_hash, bundle_hash_from_chunks,
+    protocol::{
+        AppendLease, BeginAppendRequest, BundleChunkRef, CommitAppendRequest, CommittedBundle,
+        ControlRequest, ControlResponse, DataRequest, DataResponse, DirectoryEntries,
+        FileBundleRef, FileChangeLogs, FileReadPlan, ProtocolRequest, ProtocolResponse,
+        ReplicaLocation, StoragePeerInfo,
+    },
+    zstd_compress, zstd_decompress,
 };
-use fs0_transport::{
-    connect_control, connect_data, control_rpc, data_rpc_on_connection, ping_data_peer,
-};
-use iroh::{
-    Endpoint,
-    endpoint::{Connection, presets},
-};
+use fs0_transport::{Connection, EndpointAddr, EndpointId, Transport};
 use parking_lot::RwLock;
-use std::path::Path;
-use std::sync::Arc;
+use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +85,6 @@ pub struct StorageTarget {
 #[derive(Debug, Clone)]
 pub struct ChunkUpload {
     pub chunk_id: HashId,
-    pub compressed_hash: HashId,
     pub raw_len: u64,
     pub compressed_bytes: Vec<u8>,
 }
@@ -112,38 +109,35 @@ pub struct Fs0Client {
     token: String,
     client_id: u64,
     control: Connection,
-    endpoint: Endpoint,
+    endpoint: Transport,
     storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
 }
 
 impl Fs0Client {
     pub async fn connect(config: ClientConfig, options: ClientOptions) -> Fs0Result<Self> {
-        let endpoint =
-            Endpoint::builder(presets::N0)
-                .bind()
-                .await
-                .map_err(|err| Fs0Error::Internal {
-                    message: err.to_string(),
-                })?;
-        let central_endpoint = decode_hex_bytes(&config.central_endpoint, "central_endpoint")?;
-        let control = connect_control(&endpoint, &central_endpoint).await?;
+        let endpoint = Transport::bind(Vec::new(), None, None, config.relay.clone()).await?;
+        let central_endpoint = central_endpoint_addr(&config)?;
+        let control = endpoint
+            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
+            .await?;
         let token = config.token;
 
-        let response = control_rpc(
-            &control,
-            ControlRequest::RegisterClient {
+        let response = control
+            .rpc(ProtocolRequest::Control(ControlRequest::RegisterClient {
                 name: options.name.clone(),
                 token: token.clone(),
-            },
-        )
-        .await?;
+            }))
+            .await?;
         let (client_id, storages) = match response {
-            ControlResponse::RegisterClient {
+            ProtocolResponse::Control(ControlResponse::RegisterClient {
                 client_id,
                 storages,
-            } => (client_id, storages),
-            ControlResponse::Error(err) => return Err(err),
-            response => return unexpected_control_response(response),
+            }) => (client_id, storages),
+            ProtocolResponse::Control(ControlResponse::Error(err))
+            | ProtocolResponse::Error(err) => {
+                return Err(err);
+            }
+            response => return unexpected_protocol_control_response(response),
         };
 
         Ok(Self {
@@ -164,7 +158,7 @@ impl Fs0Client {
     }
 
     pub async fn shutdown(&self) -> Fs0Result<()> {
-        self.control.close(0u32.into(), b"fs0 client shutdown");
+        self.control.close(b"fs0 client shutdown");
         self.endpoint.close().await;
 
         Ok(())
@@ -184,10 +178,13 @@ impl Fs0Client {
             ControlResponse::CentralStatus {
                 clients_count,
                 storages,
-            } => Ok(CentralStatus {
-                clients_count,
-                storages,
-            }),
+            } => {
+                self.set_storage_peers(storages.clone());
+                Ok(CentralStatus {
+                    clients_count,
+                    storages,
+                })
+            }
             ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
@@ -276,9 +273,9 @@ impl Fs0Client {
         }
     }
 
-    pub async fn abort_append(&self, lease_id: u64) -> Fs0Result<()> {
+    pub async fn abort_append(&self, lease_id: u64, file_id: u64) -> Fs0Result<()> {
         match self
-            .request(ControlRequest::AbortAppend { lease_id })
+            .request(ControlRequest::AbortAppend { lease_id, file_id })
             .await?
         {
             ControlResponse::AbortAppend => Ok(()),
@@ -440,7 +437,7 @@ impl Fs0Client {
     where
         R: AsyncRead + Unpin,
     {
-        self.write_from_reader(remote_path, reader, options, true, 0, append_size_hint)
+        self.write_from_reader(remote_path, reader, options, 0, append_size_hint)
             .await
     }
 
@@ -472,19 +469,15 @@ impl Fs0Client {
             None => self.get_file_read_plan(remote_path).await?.size,
         };
 
-        self.write_from_reader(
-            remote_path,
-            reader,
-            options,
-            false,
-            offset,
-            append_size_hint,
-        )
-        .await
+        self.write_from_reader(remote_path, reader, options, offset, append_size_hint)
+            .await
     }
 
     pub async fn ping_storage_peer(&self, peer: &StoragePeerInfo) -> Fs0Result<()> {
-        ping_data_peer(&self.endpoint, &peer.iroh_endpoint).await
+        let endpoint = decode_endpoint_addr(&peer.iroh_endpoint)?;
+        let connection = self.endpoint.connect(endpoint, TRANSPORT_DATA_ALPN).await?;
+        connection.close(b"fs0 data ping complete");
+        Ok(())
     }
 
     pub async fn ping_first_storage_peer(&self) -> Fs0Result<StoragePeerInfo> {
@@ -529,22 +522,20 @@ impl Fs0Client {
     pub async fn upload_chunk_if_missing(
         &self,
         target: &StorageTarget,
+        lease_id: u64,
+        file_id: u64,
         chunk_id: HashId,
         raw_len: u64,
         compressed_bytes: Vec<u8>,
     ) -> Fs0Result<bool> {
-        if self.storage_has_chunk(target, chunk_id).await?.is_some() {
-            return Ok(false);
-        }
-
-        let compressed_hash = blake3_hash(&compressed_bytes);
         let response = self
             .storage_rpc(
                 target,
                 DataRequest::UploadChunk {
+                    lease_id,
+                    file_id,
                     volume_id: target.volume_id,
                     chunk_id,
-                    compressed_hash,
                     raw_len,
                     compressed_bytes,
                 },
@@ -561,10 +552,14 @@ impl Fs0Client {
     pub async fn upload_chunks_if_missing(
         &self,
         target: &StorageTarget,
+        lease_id: u64,
+        file_id: u64,
         chunks: Vec<ChunkUpload>,
     ) -> Fs0Result<Vec<ChunkUploadResult>> {
         self.upload_chunks_if_missing_with_concurrency(
             target,
+            lease_id,
+            file_id,
             chunks,
             self.options.upload_concurrency,
         )
@@ -574,6 +569,8 @@ impl Fs0Client {
     pub async fn upload_chunks_if_missing_with_concurrency(
         &self,
         target: &StorageTarget,
+        lease_id: u64,
+        file_id: u64,
         chunks: Vec<ChunkUpload>,
         concurrency: usize,
     ) -> Fs0Result<Vec<ChunkUploadResult>> {
@@ -599,7 +596,10 @@ impl Fs0Client {
                 let connection = connection.clone();
                 let volume_id = target.volume_id;
                 upload_tasks.spawn(async move {
-                    upload_chunk_if_missing_on_connection(index, connection, volume_id, chunk).await
+                    upload_chunk_if_missing_on_connection(
+                        index, connection, lease_id, file_id, volume_id, chunk,
+                    )
+                    .await
                 });
             }
 
@@ -611,12 +611,12 @@ impl Fs0Client {
                 Some(Ok(Ok(result))) => results.push(result),
                 Some(Ok(Err(err))) => {
                     upload_tasks.abort_all();
-                    connection.close(0u32.into(), b"fs0 upload failed");
+                    connection.close(b"fs0 upload failed");
                     return Err(err);
                 }
                 Some(Err(err)) => {
                     upload_tasks.abort_all();
-                    connection.close(0u32.into(), b"fs0 upload task failed");
+                    connection.close(b"fs0 upload task failed");
                     return Err(Fs0Error::Internal {
                         message: err.to_string(),
                     });
@@ -625,7 +625,7 @@ impl Fs0Client {
             }
         }
 
-        connection.close(0u32.into(), b"fs0 upload complete");
+        connection.close(b"fs0 upload complete");
         results.sort_by_key(|(index, _)| *index);
 
         Ok(results
@@ -639,7 +639,6 @@ impl Fs0Client {
         remote_path: &str,
         reader: R,
         options: WriteOptions,
-        create: bool,
         offset: u64,
         append_size_hint: Option<u64>,
     ) -> Fs0Result<FileReadPlan>
@@ -650,57 +649,91 @@ impl Fs0Client {
             .begin_append(BeginAppendRequest {
                 path: remote_path.to_owned(),
                 offset,
-                create,
                 prefer_volume_name: options.prefer_volume_name,
                 append_size_hint,
             })
             .await?;
-        let prefix = if lease.offset > lease.rewrite_offset {
-            self.read_range_to_vec(
-                remote_path,
-                ReadRange {
-                    offset: lease.rewrite_offset,
-                    len: Some(lease.offset - lease.rewrite_offset),
-                },
-            )
-            .await?
+        let rewrite_offset = match self.rewrite_offset_for_lease(&lease).await {
+            Ok(rewrite_offset) => rewrite_offset,
+            Err(err) => {
+                let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                return Err(err);
+            }
+        };
+        let prefix = if lease.offset > rewrite_offset {
+            match self
+                .read_range_to_vec(
+                    remote_path,
+                    ReadRange {
+                        offset: rewrite_offset,
+                        len: Some(lease.offset - rewrite_offset),
+                    },
+                )
+                .await
+            {
+                Ok(prefix) => prefix,
+                Err(err) => {
+                    let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                    return Err(err);
+                }
+            }
         } else {
             Vec::new()
         };
         let mut rewritten_reader = std::io::Cursor::new(prefix).chain(reader);
 
         match self
-            .write_lease_from_reader(lease.clone(), &mut rewritten_reader)
+            .write_lease_from_reader(lease.clone(), rewrite_offset, &mut rewritten_reader)
             .await
         {
             Ok((new_size, bundles)) => {
-                self.commit_append(CommitAppendRequest {
-                    lease_id: lease.lease_id,
-                    base_size: lease.base_size,
-                    new_size,
-                    bundles,
-                })
-                .await
+                let commit = self
+                    .commit_append(CommitAppendRequest {
+                        lease_id: lease.lease_id,
+                        file_id: lease.file_id,
+                        base_size: lease.base_size,
+                        new_size,
+                        bundles,
+                    })
+                    .await;
+                if commit.is_err() {
+                    let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                }
+
+                commit
             }
             Err(err) => {
-                let _ = self.abort_append(lease.lease_id).await;
+                let _ = self.abort_append(lease.lease_id, lease.file_id).await;
                 Err(err)
             }
         }
     }
 
+    async fn rewrite_offset_for_lease(&self, lease: &AppendLease) -> Fs0Result<u64> {
+        if lease.base_size == 0 {
+            return Ok(0);
+        }
+
+        let plan = self.get_file_read_plan_by_id(lease.file_id).await?;
+        if plan.size != lease.base_size {
+            return Err(Fs0Error::VersionConflict);
+        }
+
+        rewrite_offset_for_plan(&plan, lease.offset)
+    }
+
     async fn write_lease_from_reader<R>(
         &self,
         lease: AppendLease,
+        rewrite_offset: u64,
         mut reader: R,
     ) -> Fs0Result<(u64, Vec<CommittedBundle>)>
     where
         R: AsyncRead + Unpin,
     {
-        let target = self.upload_target(lease.volume_id)?;
+        let target = self.upload_target(&lease)?;
         let mut buffer = vec![0u8; VOLUME_RAW_CHUNK_SIZE as usize];
-        let mut bundle_index = lease.first_bundle_index;
-        let mut next_size = lease.rewrite_offset;
+        let mut next_size = rewrite_offset;
         let mut current_bundle_raw = 0u64;
         let mut current_chunks = Vec::new();
         let mut current_uploads = Vec::new();
@@ -715,7 +748,6 @@ impl Fs0Client {
             let raw = &buffer[..read];
             let compressed = zstd_compress(raw, DEFAULT_ZSTD_LEVEL)?;
             let chunk_id = blake3_hash(raw);
-            let compressed_hash = blake3_hash(&compressed);
             let chunk_index = current_chunks.len() as u64;
 
             current_chunks.push(BundleChunkRef {
@@ -726,40 +758,53 @@ impl Fs0Client {
             next_size += read as u64;
             current_uploads.push(ChunkUpload {
                 chunk_id,
-                compressed_hash,
                 raw_len: read as u64,
                 compressed_bytes: compressed,
             });
 
             if current_bundle_raw >= VOLUME_BUNDLE_RAW_SIZE {
                 let bundle_id = bundle_hash_from_chunks(&current_chunks);
-                self.upload_chunks_if_missing(&target, std::mem::take(&mut current_uploads))
-                    .await?;
+                self.upload_chunks_if_missing(
+                    &target,
+                    lease.lease_id,
+                    lease.file_id,
+                    std::mem::take(&mut current_uploads),
+                )
+                .await?;
                 let bundle = self
-                    .commit_bundle(&target, bundle_id, std::mem::take(&mut current_chunks))
+                    .commit_bundle(
+                        &target,
+                        lease.lease_id,
+                        lease.file_id,
+                        bundle_id,
+                        std::mem::take(&mut current_chunks),
+                    )
                     .await?;
 
                 committed.push(CommittedBundle {
-                    bundle_index,
                     bundle_id,
                     raw_len: bundle.raw_len,
                     compressed_len: bundle.compressed_len,
                 });
-                bundle_index += 1;
                 current_bundle_raw = 0;
             }
         }
 
         if !current_chunks.is_empty() {
             let bundle_id = bundle_hash_from_chunks(&current_chunks);
-            self.upload_chunks_if_missing(&target, current_uploads)
+            self.upload_chunks_if_missing(&target, lease.lease_id, lease.file_id, current_uploads)
                 .await?;
             let bundle = self
-                .commit_bundle(&target, bundle_id, current_chunks)
+                .commit_bundle(
+                    &target,
+                    lease.lease_id,
+                    lease.file_id,
+                    bundle_id,
+                    current_chunks,
+                )
                 .await?;
 
             committed.push(CommittedBundle {
-                bundle_index,
                 bundle_id,
                 raw_len: bundle.raw_len,
                 compressed_len: bundle.compressed_len,
@@ -772,6 +817,8 @@ impl Fs0Client {
     async fn commit_bundle(
         &self,
         target: &StorageTarget,
+        lease_id: u64,
+        file_id: u64,
         bundle_id: HashId,
         chunks: Vec<BundleChunkRef>,
     ) -> Fs0Result<CommittedBundle> {
@@ -779,6 +826,8 @@ impl Fs0Client {
             .storage_rpc(
                 target,
                 DataRequest::CommitBundle {
+                    lease_id,
+                    file_id,
                     volume_id: target.volume_id,
                     bundle_id,
                     chunks,
@@ -792,7 +841,6 @@ impl Fs0Client {
                 compressed_len,
                 ..
             } => Ok(CommittedBundle {
-                bundle_index: 0,
                 bundle_id,
                 raw_len,
                 compressed_len,
@@ -844,7 +892,7 @@ impl Fs0Client {
 
     async fn download_bundle_from_replicas(
         &self,
-        bundle: &fs0_core::FileBundleRef,
+        bundle: &FileBundleRef,
     ) -> Fs0Result<Vec<VerifiedChunk>> {
         let mut last_error = None;
 
@@ -861,7 +909,7 @@ impl Fs0Client {
     async fn download_verified_bundle(
         &self,
         target: &StorageTarget,
-        bundle: &fs0_core::FileBundleRef,
+        bundle: &FileBundleRef,
     ) -> Fs0Result<Vec<VerifiedChunk>> {
         let chunks = self.list_bundle_chunks(target, bundle.bundle_id).await?;
         if bundle_hash_from_chunks(&chunks) != bundle.bundle_id {
@@ -888,7 +936,11 @@ impl Fs0Client {
                 });
             }
 
-            let raw = zstd_decompress(&compressed, raw_len as usize)?;
+            let raw_len_usize =
+                usize::try_from(raw_len).map_err(|_| Fs0Error::IntegerConversion {
+                    message: format!("raw_len {raw_len} exceeds usize"),
+                })?;
+            let raw = zstd_decompress(&compressed, raw_len_usize)?;
             if raw.len() as u64 != raw_len || blake3_hash(&raw) != chunk.chunk_id {
                 return Err(Fs0Error::HashMismatch { volume_offset: 0 });
             }
@@ -921,39 +973,43 @@ impl Fs0Client {
         Ok(verified)
     }
 
-    fn upload_target(&self, volume_id: u64) -> Fs0Result<StorageTarget> {
-        self.storages
-            .read()
-            .iter()
-            .find(|peer| {
-                peer.volumes
-                    .iter()
-                    .any(|volume| volume.volume_id == volume_id)
-            })
-            .map(|peer| StorageTarget {
-                storage_id: peer.storage_id,
-                volume_id,
-                iroh_endpoint: peer.iroh_endpoint.clone(),
-            })
-            .ok_or(Fs0Error::NotFound)
-    }
-
-    fn read_targets(&self, replicas: &[fs0_core::ReplicaLocation]) -> Vec<StorageTarget> {
+    fn read_targets(&self, replicas: &[ReplicaLocation]) -> Vec<StorageTarget> {
         let storages = self.storages.read();
-
         replicas
             .iter()
             .filter_map(|replica| {
                 storages
                     .iter()
-                    .find(|peer| peer.storage_id == replica.storage_id)
-                    .map(|peer| StorageTarget {
-                        storage_id: peer.storage_id,
+                    .find(|storage| storage.storage_id == replica.storage_id)
+                    .map(|storage| StorageTarget {
+                        storage_id: storage.storage_id,
                         volume_id: replica.volume_id,
-                        iroh_endpoint: peer.iroh_endpoint.clone(),
+                        iroh_endpoint: storage.iroh_endpoint.clone(),
                     })
             })
             .collect()
+    }
+
+    fn set_storage_peers(&self, storages: Vec<StoragePeerInfo>) {
+        *self.storages.write() = storages;
+    }
+
+    fn upload_target(&self, lease: &AppendLease) -> Fs0Result<StorageTarget> {
+        self.storages
+            .read()
+            .iter()
+            .find_map(|storage| {
+                storage
+                    .volumes
+                    .iter()
+                    .find(|volume| volume.volume_id == lease.volume_id)
+                    .map(|volume| StorageTarget {
+                        storage_id: storage.storage_id,
+                        volume_id: volume.volume_id,
+                        iroh_endpoint: storage.iroh_endpoint.clone(),
+                    })
+            })
+            .ok_or(Fs0Error::NotFound)
     }
 
     async fn storage_rpc(
@@ -964,86 +1020,141 @@ impl Fs0Client {
         let connection = self
             .connect_authenticated_data(&target.iroh_endpoint)
             .await?;
-        let response = data_rpc_on_connection(&connection, request).await;
-        connection.close(0u32.into(), b"fs0 data rpc complete");
+        let response = request_data(&connection, request).await;
+        connection.close(b"fs0 data rpc complete");
 
         response
     }
 
     async fn connect_authenticated_data(&self, data_endpoint: &[u8]) -> Fs0Result<Connection> {
-        let connection = connect_data(&self.endpoint, data_endpoint).await?;
-        match data_rpc_on_connection(
-            &connection,
-            DataRequest::Authenticate {
+        let data_endpoint = decode_endpoint_addr(data_endpoint)?;
+        let connection = self
+            .endpoint
+            .connect(data_endpoint, TRANSPORT_DATA_ALPN)
+            .await?;
+        match connection
+            .rpc(ProtocolRequest::Data(DataRequest::Authenticate {
                 client_id: self.client_id,
                 client_token: self.token.clone(),
-            },
-        )
-        .await?
+            }))
+            .await?
         {
-            DataResponse::Authenticate { client_id } if client_id == self.client_id => {
+            ProtocolResponse::Data(DataResponse::Authenticate { client_id })
+                if client_id == self.client_id =>
+            {
                 Ok(connection)
             }
-            DataResponse::Error(err) => Err(err),
-            response => unexpected_data_response(response),
+            ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => {
+                Err(err)
+            }
+            response => unexpected_protocol_data_response(response),
         }
     }
 
     async fn request(&self, request: ControlRequest) -> Fs0Result<ControlResponse> {
-        control_rpc(&self.control, request).await
+        request_control(&self.control, request).await
     }
 }
 
 async fn upload_chunk_if_missing_on_connection(
     index: usize,
     connection: Arc<Connection>,
+    lease_id: u64,
+    file_id: u64,
     volume_id: u64,
     chunk: ChunkUpload,
 ) -> Fs0Result<(usize, ChunkUploadResult)> {
-    match data_rpc_on_connection(
-        &connection,
-        DataRequest::HasChunk {
+    match connection
+        .rpc(ProtocolRequest::Data(DataRequest::UploadChunk {
+            lease_id,
+            file_id,
             volume_id,
             chunk_id: chunk.chunk_id,
-        },
-    )
-    .await?
-    {
-        DataResponse::HasChunk { exists: true, .. } => {
-            return Ok((
-                index,
-                ChunkUploadResult {
-                    chunk_id: chunk.chunk_id,
-                    uploaded: false,
-                },
-            ));
-        }
-        DataResponse::HasChunk { exists: false, .. } => {}
-        DataResponse::Error(err) => return Err(err),
-        response => return unexpected_data_response(response),
-    }
-
-    match data_rpc_on_connection(
-        &connection,
-        DataRequest::UploadChunk {
-            volume_id,
-            chunk_id: chunk.chunk_id,
-            compressed_hash: chunk.compressed_hash,
             raw_len: chunk.raw_len,
             compressed_bytes: chunk.compressed_bytes,
-        },
-    )
-    .await?
+        }))
+        .await?
     {
-        DataResponse::UploadChunk { .. } => Ok((
+        ProtocolResponse::Data(DataResponse::UploadChunk { .. }) => Ok((
             index,
             ChunkUploadResult {
                 chunk_id: chunk.chunk_id,
                 uploaded: true,
             },
         )),
-        DataResponse::Error(err) => Err(err),
-        response => unexpected_data_response(response),
+        ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => Err(err),
+        response => unexpected_protocol_data_response(response),
+    }
+}
+
+fn rewrite_offset_for_plan(plan: &FileReadPlan, offset: u64) -> Fs0Result<u64> {
+    if offset > plan.size {
+        return Err(Fs0Error::InvalidRequest);
+    }
+
+    let mut current_offset = 0u64;
+    for bundle in &plan.bundles {
+        let bundle_end = current_offset.checked_add(bundle.raw_len).ok_or_else(|| {
+            Fs0Error::IntegerConversion {
+                message: "file bundle offset overflow".to_owned(),
+            }
+        })?;
+        if offset < bundle_end {
+            return Ok(current_offset);
+        }
+        current_offset = bundle_end;
+    }
+
+    if offset == current_offset {
+        Ok(current_offset)
+    } else {
+        Err(Fs0Error::InvalidRequest)
+    }
+}
+
+fn central_endpoint_addr(config: &ClientConfig) -> Fs0Result<EndpointAddr> {
+    let endpoint_id = parse_endpoint_id(&config.central_endpoint_id, "client.central_endpoint_id")?;
+    let socket_addr = parse_socket_addr(&config.central_addr, "client.central_addr")?;
+
+    Ok(EndpointAddr::new(endpoint_id).with_ip_addr(socket_addr))
+}
+
+fn decode_endpoint_addr(bytes: &[u8]) -> Fs0Result<EndpointAddr> {
+    postcard::from_bytes(bytes).map_err(Fs0Error::from)
+}
+
+fn parse_endpoint_id(value: &str, field: &str) -> Fs0Result<EndpointId> {
+    value
+        .parse::<EndpointId>()
+        .map_err(|err| Fs0Error::InvalidConfig {
+            message: format!("invalid {field}: {err}"),
+        })
+}
+
+fn parse_socket_addr(value: &str, field: &str) -> Fs0Result<SocketAddr> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|err| Fs0Error::InvalidConfig {
+            message: format!("invalid {field} {value}: {err}"),
+        })
+}
+
+async fn request_control(
+    connection: &Connection,
+    request: ControlRequest,
+) -> Fs0Result<ControlResponse> {
+    match connection.rpc(ProtocolRequest::Control(request)).await? {
+        ProtocolResponse::Control(response) => Ok(response),
+        ProtocolResponse::Error(err) => Err(err),
+        response => unexpected_protocol_control_response(response),
+    }
+}
+
+async fn request_data(connection: &Connection, request: DataRequest) -> Fs0Result<DataResponse> {
+    match connection.rpc(ProtocolRequest::Data(request)).await? {
+        ProtocolResponse::Data(response) => Ok(response),
+        ProtocolResponse::Error(err) => Err(err),
+        response => unexpected_protocol_data_response(response),
     }
 }
 
@@ -1054,6 +1165,18 @@ fn unexpected_control_response<T>(response: ControlResponse) -> Fs0Result<T> {
 }
 
 fn unexpected_data_response<T>(response: DataResponse) -> Fs0Result<T> {
+    Err(Fs0Error::InvalidFrame {
+        message: format!("unexpected data response: {response:?}"),
+    })
+}
+
+fn unexpected_protocol_control_response<T>(response: ProtocolResponse) -> Fs0Result<T> {
+    Err(Fs0Error::InvalidFrame {
+        message: format!("unexpected control response: {response:?}"),
+    })
+}
+
+fn unexpected_protocol_data_response<T>(response: ProtocolResponse) -> Fs0Result<T> {
     Err(Fs0Error::InvalidFrame {
         message: format!("unexpected data response: {response:?}"),
     })

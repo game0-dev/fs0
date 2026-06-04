@@ -12,6 +12,7 @@ fs0-core.workspace = true
 fs0-transport.workspace = true
 iroh.workspace = true
 parking_lot.workspace = true
+postcard.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync"] }
 
 [dev-dependencies]
