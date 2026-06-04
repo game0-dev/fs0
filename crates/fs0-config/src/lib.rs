@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// auth_tokens = ["dev-token"]
 ///
 /// [central.relay]
-/// public_url = "https://203.0.113.10:7801"
+/// public_url = "https://1.2.3.4:7801"
 /// token = "relay-token"
 /// https_bind_port = 7801
 /// quic_bind_port = 7802
@@ -26,10 +26,10 @@ use std::path::{Path, PathBuf};
 /// [client]
 /// token = "dev-token"
 /// central_endpoint_id = "central-endpoint-id"
-/// central_addr = "203.0.113.10:7800"
+/// central_addr = "1.2.3.4:7800"
 ///
 /// [client.relay]
-/// url = "https://203.0.113.10:7801"
+/// url = "https://1.2.3.4:7801"
 /// token = "relay-token"
 /// quic_port = 7802
 /// ca_cert = """
@@ -43,11 +43,11 @@ use std::path::{Path, PathBuf};
 /// token = "dev-token"
 /// bind_port = 3341
 /// central_endpoint_id = "central-endpoint-id"
-/// central_addr = "203.0.113.10:7800"
+/// central_addr = "1.2.3.4:7800"
 /// check_hash_before_write = false
 ///
 /// [storage.relay]
-/// url = "https://203.0.113.10:7801"
+/// url = "https://1.2.3.4:7801"
 /// token = "relay-token"
 /// quic_port = 7802
 /// ca_cert = """
@@ -215,7 +215,7 @@ mod tests {
             auth_tokens = ["dev-token"]
 
             [central.relay]
-            public_url = "https://203.0.113.10:7801"
+            public_url = "https://1.2.3.4:7801"
             token = "relay-token"
             https_bind_port = 7801
             cert_path = ".local/relay-cert.pem"
@@ -225,10 +225,10 @@ mod tests {
             [client]
             token = "dev-token"
             central_endpoint_id = "central-endpoint-id"
-            central_addr = "203.0.113.10:7800"
+            central_addr = "1.2.3.4:7800"
 
             [client.relay]
-            url = "https://203.0.113.10:7801"
+            url = "https://1.2.3.4:7801"
             token = "relay-token"
             quic_port = 7802
             ca_cert = """
@@ -241,12 +241,12 @@ mod tests {
             name = "local-storage-1"
             token = "dev-token"
             central_endpoint_id = "central-endpoint-id"
-            central_addr = "203.0.113.10:7800"
+            central_addr = "1.2.3.4:7800"
             bind_port = 3341
             check_hash_before_write = false
 
             [storage.relay]
-            url = "https://203.0.113.10:7801"
+            url = "https://1.2.3.4:7801"
             token = "relay-token"
             quic_port = 7802
             ca_cert = """
@@ -265,18 +265,18 @@ mod tests {
         let central = config.central.unwrap();
         assert_eq!(central.bind_port, 7800);
         assert_eq!(central.replication_factor, 2);
-        assert_eq!(central.relay.public_url, "https://203.0.113.10:7801");
+        assert_eq!(central.relay.public_url, "https://1.2.3.4:7801");
         assert_eq!(central.relay.token, "relay-token");
         assert_eq!(central.relay.https_bind_port, 7801);
         assert_eq!(central.relay.quic_bind_port, 7802);
 
         let storage = config.storage.unwrap();
         assert_eq!(storage.central_endpoint_id, "central-endpoint-id");
-        assert_eq!(storage.central_addr, "203.0.113.10:7800");
+        assert_eq!(storage.central_addr, "1.2.3.4:7800");
         assert_eq!(storage.bind_port, Some(3341));
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.url.as_str()),
-            Some("https://203.0.113.10:7801")
+            Some("https://1.2.3.4:7801")
         );
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.token.as_str()),
@@ -296,10 +296,10 @@ mod tests {
         assert!(!storage.check_hash_before_write);
 
         let client = config.client.unwrap();
-        assert_eq!(client.central_addr, "203.0.113.10:7800");
+        assert_eq!(client.central_addr, "1.2.3.4:7800");
         assert_eq!(
             client.relay.as_ref().map(|relay| relay.url.as_str()),
-            Some("https://203.0.113.10:7801")
+            Some("https://1.2.3.4:7801")
         );
         assert_eq!(
             client.relay.as_ref().map(|relay| relay.token.as_str()),

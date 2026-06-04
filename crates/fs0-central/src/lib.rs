@@ -1,4 +1,5 @@
 mod db;
+mod file_catalog;
 mod server;
 
 pub use fs0_config::CentralConfig;

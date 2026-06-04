@@ -21,6 +21,8 @@ pub enum Fs0Error {
     InvalidConfig { message: String },
     #[error("invalid data: {message}")]
     InvalidData { message: String },
+    #[error("invalid path: {path}")]
+    InvalidPath { path: String },
     #[error("integer conversion failed: {message}")]
     IntegerConversion { message: String },
     #[error("path already exists: {path}")]

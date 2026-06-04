@@ -102,12 +102,18 @@ Create `.local/fs0.local.toml`:
 ```toml
 [central]
 db_path = ".local/central.sqlite"
+secret_key = "central-secret-key"
+bind_port = 7800
 replication_factor = 2
+auth_tokens = ["dev-token"]
 
-[central.p2p_relay]
-port = 3340
-quic_port = 7824
-public_url = "http://127.0.0.1:3340"
+[central.relay]
+public_url = "https://1.2.3.4:7801"
+token = "relay-token"
+https_bind_port = 7801
+cert_path = ".local/relay-cert.pem"
+key_path = ".local/relay-key.pem"
+quic_bind_port = 7802
 ```
 
 Run the central server:
@@ -149,28 +155,40 @@ Add the endpoint printed by `fs0 central run`:
 
 ```toml
 [client]
-central_endpoint = []
-# Fill this with the endpoint printed by `fs0 central run`.
+token = "dev-token"
+central_endpoint_id = "central-endpoint-id"
+central_addr = "1.2.3.4:7800"
 
-[client.p2p_relay]
-port = 3340
-quic_port = 7824
-public_url = "http://127.0.0.1:3340"
+[client.relay]
+url = "https://1.2.3.4:7801"
+token = "relay-token"
+quic_port = 7802
+ca_cert = """
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
 
 [storage]
-storage_id = 1
 name = "local-storage-1"
-central_endpoint = []
-# Fill this with the endpoint printed by `fs0 central run`.
+token = "dev-token"
+central_endpoint_id = "central-endpoint-id"
+central_addr = "1.2.3.4:7800"
+bind_port = 3341
 
-[storage.p2p_relay]
-port = 3340
-quic_port = 7824
-public_url = "http://127.0.0.1:3340"
+[storage.relay]
+url = "https://1.2.3.4:7801"
+token = "relay-token"
+quic_port = 7802
+ca_cert = """
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
 
 [[storage.volumes]]
 path = ".local/volume-1"
-volume_id = 1
+name = "local-volume-1"
 ```
 
 ---

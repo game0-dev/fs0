@@ -97,6 +97,9 @@ fn fs0_error_roundtrips_over_postcard() {
 
     assert_postcard_roundtrip(&error);
     assert!(error.to_string().contains("was not found"));
+    assert_postcard_roundtrip(&Fs0Error::InvalidPath {
+        path: "/bad//path".to_owned(),
+    });
 }
 
 #[test]

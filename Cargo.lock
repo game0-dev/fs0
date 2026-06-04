@@ -991,11 +991,8 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "parking_lot",
- "rcgen",
  "rusqlite",
  "rustls",
- "serde",
- "tempfile",
  "tokio",
 ]
 
@@ -1064,6 +1061,7 @@ dependencies = [
  "fs0-volume",
  "iroh",
  "parking_lot",
+ "postcard",
  "tempfile",
  "tokio",
 ]
@@ -1072,10 +1070,12 @@ dependencies = [
 name = "fs0-transport"
 version = "0.1.0"
 dependencies = [
+ "fs0-config",
  "fs0-core",
  "iroh",
  "iroh-relay",
  "postcard",
+ "rustls",
  "serde",
  "tokio",
 ]

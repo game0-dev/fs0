@@ -546,15 +546,14 @@ async fn spawn_relay(config: &fs0_config::CentralRelayConfig) -> Fs0Result<Relay
         });
     }
 
-    let mut relay_config =
-        RelayServerConfig::new(SocketAddr::from(([0, 0, 0, 0], config.http_bind_port)));
+    let mut relay_config = RelayServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
     relay_config.access = relay_access_config(config.token.clone());
-    relay_config.tls = Some(relay_tls_config(&config.tls)?);
+    relay_config.tls = Some(relay_tls_config(config)?);
 
     let mut root_config = RelayRootConfig::default();
     root_config.quic = Some(RelayQuicConfig::new(SocketAddr::from((
         [0, 0, 0, 0],
-        config.quic.bind_port,
+        config.quic_bind_port,
     ))));
     root_config.relay = Some(relay_config);
 
@@ -581,25 +580,25 @@ fn relay_access_config(token: String) -> RelayAccessConfig {
     }))
 }
 
-fn relay_tls_config(config: &fs0_config::CentralRelayTlsConfig) -> Fs0Result<RelayTlsConfig> {
+fn relay_tls_config(config: &fs0_config::CentralRelayConfig) -> Fs0Result<RelayTlsConfig> {
     let certs = CertificateDer::pem_file_iter(&config.cert_path)
         .map_err(|err| Fs0Error::InvalidConfig {
             message: format!(
-                "failed to open central.relay.tls cert_path {}: {err}",
+                "failed to open central.relay cert_path {}: {err}",
                 config.cert_path.display()
             ),
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| Fs0Error::InvalidConfig {
             message: format!(
-                "failed to read central.relay.tls cert_path {}: {err}",
+                "failed to read central.relay cert_path {}: {err}",
                 config.cert_path.display()
             ),
         })?;
     if certs.is_empty() {
         return Err(Fs0Error::InvalidConfig {
             message: format!(
-                "central.relay.tls cert_path {} contains no certificates",
+                "central.relay cert_path {} contains no certificates",
                 config.cert_path.display()
             ),
         });
@@ -608,7 +607,7 @@ fn relay_tls_config(config: &fs0_config::CentralRelayTlsConfig) -> Fs0Result<Rel
     let private_key =
         PrivateKeyDer::from_pem_file(&config.key_path).map_err(|err| Fs0Error::InvalidConfig {
             message: format!(
-                "failed to read central.relay.tls key_path {}: {err}",
+                "failed to read central.relay key_path {}: {err}",
                 config.key_path.display()
             ),
         })?;
@@ -617,12 +616,12 @@ fn relay_tls_config(config: &fs0_config::CentralRelayTlsConfig) -> Fs0Result<Rel
     ))
     .with_safe_default_protocol_versions()
     .map_err(|err| Fs0Error::InvalidConfig {
-        message: format!("failed to configure central.relay.tls protocols: {err}"),
+        message: format!("failed to configure central.relay TLS protocols: {err}"),
     })?
     .with_no_client_auth()
     .with_single_cert(certs, private_key)
     .map_err(|err| Fs0Error::InvalidConfig {
-        message: format!("invalid central.relay.tls certificate or key: {err}"),
+        message: format!("invalid central.relay certificate or key: {err}"),
     })?;
 
     Ok(RelayTlsConfig::new(
