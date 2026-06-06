@@ -1,88 +1,11 @@
 use crate::server::StorageServer;
 use fs0_core::{
     Fs0Error,
-    protocol::{DataRequest, DataResponse, ProtocolRequest, ProtocolResponse},
+    protocol::{DataRequest, DataResponse},
 };
-use fs0_transport::Connection;
 use std::sync::Arc;
-use tokio::{
-    sync::{Mutex, Notify},
-    task::JoinHandle,
-};
 
-pub(crate) fn spawn_client_connection_loop(
-    server: Arc<StorageServer>,
-    connection: Connection,
-    shutdown_notify: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        handle_client_connection(server, connection, shutdown_notify).await;
-    })
-}
-
-async fn handle_client_connection(
-    server: Arc<StorageServer>,
-    connection: Connection,
-    shutdown_notify: Arc<Notify>,
-) {
-    if server.is_exiting() {
-        return;
-    }
-
-    let authenticated_client_id = Arc::new(Mutex::new(None));
-    tokio::select! {
-        _ = shutdown_notify.notified() => {}
-        _ = connection.serve({
-            let server = server.clone();
-            let authenticated_client_id = authenticated_client_id.clone();
-            move |request| {
-                let server = server.clone();
-                let authenticated_client_id = authenticated_client_id.clone();
-                async move {
-                    if let Some(client_id) = *authenticated_client_id.lock().await {
-                        return Ok(Some(
-                            handle_authenticated_data_request(server, client_id, request).await,
-                        ));
-                    }
-
-                    match request {
-                        ProtocolRequest::Data(DataRequest::Authenticate {
-                            client_id,
-                            client_token,
-                        }) => match server.validate_client_auth(client_id, client_token).await {
-                            Ok(()) => {
-                                *authenticated_client_id.lock().await = Some(client_id);
-                                Ok(Some(ProtocolResponse::Data(DataResponse::Authenticate {
-                                    client_id,
-                                })))
-                            }
-                            Err(err) => Ok(Some(ProtocolResponse::Error(err))),
-                        },
-                        _ => Ok(Some(ProtocolResponse::Error(Fs0Error::Unauthorized))),
-                    }
-                }
-            }
-        }) => {}
-    }
-}
-
-async fn handle_authenticated_data_request(
-    server: Arc<StorageServer>,
-    client_id: u64,
-    request: ProtocolRequest,
-) -> ProtocolResponse {
-    match request {
-        ProtocolRequest::Data(DataRequest::Authenticate { .. }) => {
-            ProtocolResponse::Error(Fs0Error::InvalidRequest)
-        }
-        ProtocolRequest::Data(request) => {
-            ProtocolResponse::Data(handle_data_request(server, client_id, request).await)
-        }
-        _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
-    }
-}
-
-async fn handle_data_request(
+pub(super) async fn handle_data_request(
     server: Arc<StorageServer>,
     _client_id: u64,
     request: DataRequest,

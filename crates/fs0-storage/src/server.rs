@@ -1,19 +1,18 @@
-use crate::{
-    Fs0Result, StorageConfig,
-    client_server::spawn_client_connection_loop,
-    tasks::{ServerTasks, spawn_bundle_reporter_loop, spawn_idle_file_close_loop},
-};
+mod registration;
+mod spawn;
+mod tasks;
+
+use crate::{Fs0Result, StorageConfig};
 use fs0_core::{
-    Fs0Error, HashId, TRANSPORT_CONTROL_ALPN, TRANSPORT_DATA_ALPN, blake3_hash,
+    Fs0Error, HashId, TRANSPORT_CONTROL_ALPN, blake3_hash,
     protocol::{
         BundleChunkRef, BundleReplicaEvent, ControlRequest, ControlResponse,
-        GrantUploadLeaseRequest, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
-        StorageVolumeInfo,
+        GrantUploadLeaseRequest, ProtocolRequest, ProtocolResponse,
     },
     utils::now_ms,
     zstd_decompress,
 };
-use fs0_transport::{Connection, EndpointAddr, EndpointId, Transport};
+use fs0_transport::{Connection, Transport};
 use fs0_volume::{BundleMeta, ChunkMeta, Volume, VolumeMeta};
 use parking_lot::RwLock;
 use std::{
@@ -21,11 +20,11 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 pub struct StorageServer {
@@ -34,11 +33,11 @@ pub struct StorageServer {
     volumes: Arc<HashMap<u64, Arc<Volume>>>,
     read_only_volume_ids: Arc<HashSet<u64>>,
     upload_leases: RwLock<HashMap<u64, UploadLeaseState>>,
-    central_connection: Connection,
+    pub(super) central_connection: Connection,
     endpoint: Transport,
     exit: AtomicBool,
     shutdown_notify: Arc<Notify>,
-    tasks: ServerTasks,
+    tasks: tasks::ServerTasks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,16 +47,9 @@ struct UploadLeaseState {
     expires_at_ms: u64,
 }
 
-#[derive(Debug)]
-struct OpenedVolumes {
-    volumes: HashMap<u64, Arc<Volume>>,
-    read_only_volume_ids: HashSet<u64>,
-    infos: Vec<StorageVolumeInfo>,
-}
-
 impl StorageServer {
     pub async fn run(config: StorageConfig) -> Fs0Result<Arc<Self>> {
-        let opened_volumes = open_volumes(&config)?;
+        let opened_volumes = registration::open_volumes(&config)?;
         let volume_infos = opened_volumes.infos;
         let volumes = Arc::new(opened_volumes.volumes);
         let read_only_volume_ids = Arc::new(opened_volumes.read_only_volume_ids);
@@ -65,19 +57,24 @@ impl StorageServer {
             .bind_port
             .map(|port| SocketAddr::from(([0, 0, 0, 0], port)));
         let endpoint = Transport::bind(
-            vec![TRANSPORT_DATA_ALPN],
+            vec![fs0_core::TRANSPORT_DATA_ALPN],
             None,
             bind_addr,
             config.relay.clone(),
         )
         .await?;
         let data_endpoint = postcard::to_allocvec(&endpoint.addr())?;
-        let central_endpoint = central_endpoint_addr(&config)?;
+        let central_endpoint = registration::central_endpoint_addr(&config)?;
         let central_connection = endpoint
             .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
             .await?;
-        let (storage_id, _) =
-            register_storage(&central_connection, &config, volume_infos, data_endpoint).await?;
+        let (storage_id, _) = registration::register_storage(
+            &central_connection,
+            &config,
+            volume_infos,
+            data_endpoint,
+        )
+        .await?;
 
         let server = Arc::new(Self {
             config: Arc::new(config),
@@ -89,23 +86,23 @@ impl StorageServer {
             endpoint,
             exit: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
-            tasks: ServerTasks::new(),
+            tasks: tasks::ServerTasks::new(),
         });
 
-        server.tasks.push(spawn_control_accept_loop(
+        server.tasks.push(spawn::spawn_control_accept_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        server.tasks.push(spawn_connection_accept_loop(
+        server.tasks.push(spawn::spawn_connection_accept_loop(
             server.endpoint.clone(),
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        server.tasks.push(spawn_bundle_reporter_loop(
+        server.tasks.push(tasks::spawn_bundle_reporter_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
-        server.tasks.push(spawn_idle_file_close_loop(
+        server.tasks.push(tasks::spawn_idle_file_close_loop(
             Arc::downgrade(&server),
             server.shutdown_notify.clone(),
         ));
@@ -310,6 +307,39 @@ impl StorageServer {
         Ok(Some((raw_len, compressed_len)))
     }
 
+    pub(crate) fn grant_upload_lease(&self, lease: GrantUploadLeaseRequest) -> Fs0Result<u64> {
+        if !self.volumes.contains_key(&lease.volume_id) {
+            return Err(Fs0Error::UnknownVolume);
+        }
+
+        self.upload_leases.write().insert(
+            lease.lease_id,
+            UploadLeaseState {
+                file_id: lease.file_id,
+                volume_id: lease.volume_id,
+                expires_at_ms: lease.expires_at_ms,
+            },
+        );
+
+        Ok(lease.lease_id)
+    }
+
+    pub(crate) fn revoke_upload_lease(&self, lease_id: u64) {
+        self.upload_leases.write().remove(&lease_id);
+    }
+
+    pub(crate) async fn sync_bundle_change_records(&self) -> Fs0Result<()> {
+        let mut per_volume = self.volumes.iter().collect::<Vec<_>>();
+        per_volume.sort_by_key(|(volume_id, _)| **volume_id);
+
+        for (volume_id, _) in per_volume {
+            self.sync_bundle_change_records_for_volume(*volume_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     fn is_volume_read_only(&self, volume_id: u64) -> bool {
         self.read_only_volume_ids.contains(&volume_id)
     }
@@ -341,27 +371,6 @@ impl StorageServer {
         }
 
         Ok(())
-    }
-
-    fn grant_upload_lease(&self, lease: GrantUploadLeaseRequest) -> Fs0Result<u64> {
-        if !self.volumes.contains_key(&lease.volume_id) {
-            return Err(Fs0Error::UnknownVolume);
-        }
-
-        self.upload_leases.write().insert(
-            lease.lease_id,
-            UploadLeaseState {
-                file_id: lease.file_id,
-                volume_id: lease.volume_id,
-                expires_at_ms: lease.expires_at_ms,
-            },
-        );
-
-        Ok(lease.lease_id)
-    }
-
-    fn revoke_upload_lease(&self, lease_id: u64) {
-        self.upload_leases.write().remove(&lease_id);
     }
 
     fn validate_upload_lease(&self, lease_id: u64, file_id: u64, volume_id: u64) -> Fs0Result<()> {
@@ -414,18 +423,6 @@ impl StorageServer {
             events.sort_by_key(|event| event.event_id);
             self.report_bundle_change_records(events).await?;
         }
-    }
-
-    pub(crate) async fn sync_bundle_change_records(&self) -> Fs0Result<()> {
-        let mut per_volume = self.volumes.iter().collect::<Vec<_>>();
-        per_volume.sort_by_key(|(volume_id, _)| **volume_id);
-
-        for (volume_id, _) in per_volume {
-            self.sync_bundle_change_records_for_volume(*volume_id)
-                .await?;
-        }
-
-        Ok(())
     }
 
     async fn report_bundle_change_records(&self, events: Vec<BundleReplicaEvent>) -> Fs0Result<()> {
@@ -481,212 +478,5 @@ impl Drop for StorageServer {
         self.exit.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.central_connection.close(b"storage dropped");
-    }
-}
-
-fn open_volumes(config: &StorageConfig) -> Fs0Result<OpenedVolumes> {
-    let mut seen_ids = HashSet::with_capacity(config.volumes.len());
-    let mut seen_names = HashSet::with_capacity(config.volumes.len());
-    let mut volumes = HashMap::with_capacity(config.volumes.len());
-    let mut read_only_volume_ids = HashSet::new();
-    let mut infos = Vec::with_capacity(config.volumes.len());
-
-    for volume_config in &config.volumes {
-        if !seen_names.insert(volume_config.name.clone()) {
-            return Err(Fs0Error::InvalidConfig {
-                message: format!("duplicate volume name {}", volume_config.name),
-            });
-        }
-
-        let read_concurrency = u32::try_from(volume_config.read_concurrency).map_err(|_| {
-            Fs0Error::IntegerConversion {
-                message: format!(
-                    "read_concurrency {} exceeds u32",
-                    volume_config.read_concurrency
-                ),
-            }
-        })?;
-        let write_concurrency = u32::try_from(volume_config.write_concurrency).map_err(|_| {
-            Fs0Error::IntegerConversion {
-                message: format!(
-                    "write_concurrency {} exceeds u32",
-                    volume_config.write_concurrency
-                ),
-            }
-        })?;
-        let volume = Volume::open(&volume_config.path, read_concurrency, write_concurrency)?;
-        let meta = volume.meta();
-        if meta.volume_id == 0 {
-            return Err(Fs0Error::InvalidConfig {
-                message: format!(
-                    "volume {} has not been assigned a central volume id",
-                    volume_config.path.display()
-                ),
-            });
-        }
-        if !seen_ids.insert(meta.volume_id) {
-            return Err(Fs0Error::InvalidConfig {
-                message: format!("duplicate volume id {}", meta.volume_id),
-            });
-        }
-
-        infos.push(StorageVolumeInfo {
-            volume_id: meta.volume_id,
-            name: volume_config.name.clone(),
-            max_bytes: meta.max_bytes,
-            max_volume_offset: meta.active_volume_offset,
-            read_only: volume_config.read_only,
-        });
-        if volume_config.read_only {
-            read_only_volume_ids.insert(meta.volume_id);
-        }
-        volumes.insert(meta.volume_id, Arc::new(volume));
-    }
-    infos.sort_by_key(|volume| volume.volume_id);
-
-    Ok(OpenedVolumes {
-        volumes,
-        read_only_volume_ids,
-        infos,
-    })
-}
-
-fn central_endpoint_addr(config: &StorageConfig) -> Fs0Result<EndpointAddr> {
-    let endpoint_id =
-        parse_endpoint_id(&config.central_endpoint_id, "storage.central_endpoint_id")?;
-    let socket_addr = parse_socket_addr(&config.central_addr, "storage.central_addr")?;
-
-    Ok(EndpointAddr::new(endpoint_id).with_ip_addr(socket_addr))
-}
-
-fn parse_endpoint_id(value: &str, field: &str) -> Fs0Result<EndpointId> {
-    value
-        .parse::<EndpointId>()
-        .map_err(|err| Fs0Error::InvalidConfig {
-            message: format!("invalid {field}: {err}"),
-        })
-}
-
-fn parse_socket_addr(value: &str, field: &str) -> Fs0Result<SocketAddr> {
-    value
-        .parse::<SocketAddr>()
-        .map_err(|err| Fs0Error::InvalidConfig {
-            message: format!("invalid {field} {value}: {err}"),
-        })
-}
-
-async fn register_storage(
-    control: &Connection,
-    config: &StorageConfig,
-    volumes: Vec<StorageVolumeInfo>,
-    data_endpoint: Vec<u8>,
-) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
-    match control
-        .rpc(ProtocolRequest::Control(ControlRequest::RegisterStorage {
-            name: config.name.clone(),
-            token: config.token.clone(),
-            volumes,
-            iroh_endpoint: data_endpoint,
-        }))
-        .await?
-    {
-        ProtocolResponse::Control(ControlResponse::RegisterStorage {
-            storage_id,
-            storages,
-        }) => Ok((storage_id, storages)),
-        ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
-            Err(err)
-        }
-        response => Err(Fs0Error::InvalidFrame {
-            message: format!("unexpected storage registration response: {response:?}"),
-        }),
-    }
-}
-
-fn spawn_connection_accept_loop(
-    endpoint: Transport,
-    server: Weak<StorageServer>,
-    shutdown_notify: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_notify.notified() => break,
-                accepted = endpoint.accept() => {
-                    let Some(server) = server.upgrade() else {
-                        break;
-                    };
-                    if server.is_exiting() {
-                        break;
-                    }
-
-                    let accepted = match accepted {
-                        Ok(Some(accepted)) => accepted,
-                        Ok(None) => break,
-                        Err(_) => continue,
-                    };
-                    let alpn = accepted.alpn().to_vec();
-                    let connection = accepted;
-
-                    match alpn.as_slice() {
-                        TRANSPORT_DATA_ALPN => {
-                            server.tasks.push(spawn_client_connection_loop(
-                                server.clone(),
-                                connection,
-                                shutdown_notify.clone(),
-                            ));
-                        }
-                        _ => connection.close(b"unsupported storage alpn"),
-                    }
-                }
-            }
-        }
-    })
-}
-
-fn spawn_control_accept_loop(
-    server: Weak<StorageServer>,
-    shutdown_notify: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(server) = server.upgrade() else {
-            return;
-        };
-        if server.is_exiting() {
-            return;
-        }
-
-        tokio::select! {
-            _ = shutdown_notify.notified() => {}
-            _ = server.central_connection.serve({
-                let server = server.clone();
-                move |request| {
-                    let server = server.clone();
-                    async move {
-                        let response = match request {
-                            ProtocolRequest::Control(request) => {
-                                ProtocolResponse::Control(handle_control_request(&server, request))
-                            }
-                            _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
-                        };
-                        Ok(Some(response))
-                    }
-                }
-            }) => {}
-        }
-    })
-}
-
-fn handle_control_request(server: &StorageServer, request: ControlRequest) -> ControlResponse {
-    match request {
-        ControlRequest::GrantUploadLease(lease) => match server.grant_upload_lease(lease) {
-            Ok(lease_id) => ControlResponse::GrantUploadLease { lease_id },
-            Err(err) => ControlResponse::Error(err),
-        },
-        ControlRequest::RevokeUploadLease { lease_id } => {
-            server.revoke_upload_lease(lease_id);
-            ControlResponse::RevokeUploadLease
-        }
-        _ => ControlResponse::Error(Fs0Error::InvalidRequest),
     }
 }

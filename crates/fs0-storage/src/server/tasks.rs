@@ -9,20 +9,20 @@ use tokio::{
 };
 
 #[derive(Debug, Default)]
-pub(crate) struct ServerTasks {
+pub(super) struct ServerTasks {
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ServerTasks {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn push(&self, handle: JoinHandle<()>) {
+    pub(super) fn push(&self, handle: JoinHandle<()>) {
         self.handles.lock().push(handle);
     }
 
-    pub(crate) async fn join_all(&self) {
+    pub(super) async fn join_all(&self) {
         let handles = std::mem::take(&mut *self.handles.lock());
         for handle in handles {
             let _ = handle.await;
@@ -30,7 +30,7 @@ impl ServerTasks {
     }
 }
 
-pub(crate) fn spawn_bundle_reporter_loop(
+pub(super) fn spawn_bundle_reporter_loop(
     server: Weak<StorageServer>,
     shutdown_notify: Arc<Notify>,
 ) -> JoinHandle<()> {
@@ -55,7 +55,7 @@ pub(crate) fn spawn_bundle_reporter_loop(
     })
 }
 
-pub(crate) fn spawn_idle_file_close_loop(
+pub(super) fn spawn_idle_file_close_loop(
     server: Weak<StorageServer>,
     shutdown_notify: Arc<Notify>,
 ) -> JoinHandle<()> {
