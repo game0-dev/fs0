@@ -994,6 +994,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

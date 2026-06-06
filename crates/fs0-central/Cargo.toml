@@ -14,4 +14,5 @@ iroh-relay = { workspace = true, features = ["server"] }
 parking_lot.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
