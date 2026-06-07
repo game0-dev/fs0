@@ -1,0 +1,48 @@
+use crate::{commands::connect_client, output::print_volume_meta};
+use fs0_core::{Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY};
+use std::path::PathBuf;
+
+pub(super) async fn create(
+    cli_config: &Option<PathBuf>,
+    path: PathBuf,
+    name: String,
+    max_bytes: String,
+    central: Option<PathBuf>,
+) -> Fs0Result<()> {
+    let max_bytes = parse_bytes(&max_bytes)?;
+    fs0_volume::Volume::init_fs(&path, max_bytes)?;
+    let config = central.or_else(|| cli_config.clone());
+    let client = connect_client(&config).await?;
+    let volume_id = client.create_volume(name, max_bytes).await?;
+    client.shutdown().await?;
+    let meta = fs0_volume::Volume::init_volume_id(path, volume_id)?;
+    print_volume_meta(meta);
+    Ok(())
+}
+
+pub(super) fn meta(path: PathBuf) -> Fs0Result<()> {
+    let volume = fs0_volume::Volume::open(
+        path,
+        VOLUME_READ_CONCURRENCY as u32,
+        VOLUME_WRITE_CONCURRENCY as u32,
+    )?;
+    print_volume_meta(volume.meta());
+    Ok(())
+}
+
+fn parse_bytes(value: &str) -> Fs0Result<u64> {
+    let value = value.trim();
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024u64.pow(2)),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024u64.pow(3)),
+        Some(b't' | b'T') => (&value[..value.len() - 1], 1024u64.pow(4)),
+        _ => (value, 1),
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| Fs0Error::InvalidRequest)?;
+    number
+        .checked_mul(multiplier)
+        .ok_or(Fs0Error::InvalidRequest)
+}
