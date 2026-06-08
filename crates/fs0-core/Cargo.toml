@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Core types and storage primitives for fs0."
+readme = "../../README.md"
 
 [dependencies]
 blake3.workspace = true

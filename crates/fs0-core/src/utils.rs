@@ -27,17 +27,18 @@ pub fn split_fs0_path_dir_and_name(path: &str) -> Fs0Result<(String, String)> {
             path: path.to_owned(),
         });
     }
-    let (parent, name) = path
-        .rsplit_once('/')
-        .ok_or_else(|| Fs0Error::InvalidPath {
-            path: path.to_owned(),
-        })?;
+    let (parent, name) = path.rsplit_once('/').ok_or_else(|| Fs0Error::InvalidPath {
+        path: path.to_owned(),
+    })?;
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
         return Err(Fs0Error::InvalidPath {
             path: path.to_owned(),
         });
     }
-    if parent.split('/').any(|component| component == "." || component == "..") {
+    if parent
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
         return Err(Fs0Error::InvalidPath {
             path: path.to_owned(),
         });

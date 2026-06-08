@@ -236,14 +236,13 @@ impl Volume {
 
             db.reserve_active_volume_offset(next_active_offset, now_ms())?;
 
-            let insert = ChunkMeta {
+            ChunkMeta {
                 chunk_id,
                 compressed_hash,
                 volume_offset,
                 raw_len,
                 compressed_len,
-            };
-            insert
+            }
         };
 
         if let Err(err) = self
