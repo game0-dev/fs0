@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub(super) async fn run_central(config: PathBuf) -> Fs0Result<()> {
     let server = fs0_central::CentralServer::run(CentralConfig::load_from(config)?).await?;
     println!("central endpoint: {:?}", server.control_endpoint());
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
     server.shutdown().await;
     Ok(())
 }

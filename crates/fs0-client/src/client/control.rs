@@ -2,7 +2,7 @@ use super::{CentralStatus, Fs0Client, ListOptions, request_control, unexpected_c
 use crate::Fs0Result;
 use fs0_core::protocol::{
     AppendLease, BeginAppendRequest, CommitAppendRequest, ControlRequest, ControlResponse,
-    DirectoryEntries, FileChangeLogs, FileReadPlan,
+    DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord,
 };
 
 impl Fs0Client {
@@ -18,7 +18,6 @@ impl Fs0Client {
                     storages,
                 })
             }
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -29,7 +28,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::CreateVolume { volume_id } => Ok(volume_id),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -48,7 +46,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::ListDirectory(entries) => Ok(entries),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -61,7 +58,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::GetFileReadPlan(plan) => Ok(plan),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -72,7 +68,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::GetFileReadPlanById(plan) => Ok(plan),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -85,7 +80,76 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::DeleteFile => Ok(()),
-            ControlResponse::Error(err) => Err(err),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn delete_file_by_id(&self, file_id: u64) -> Fs0Result<()> {
+        match self
+            .request(ControlRequest::DeleteFileById { file_id })
+            .await?
+        {
+            ControlResponse::DeleteFileById => Ok(()),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn copy_file(&self, source_path: &str, target_path: &str) -> Fs0Result<FileRecord> {
+        match self
+            .request(ControlRequest::CopyFile {
+                source_path: source_path.to_owned(),
+                target_path: target_path.to_owned(),
+            })
+            .await?
+        {
+            ControlResponse::CopyFile(file) => Ok(file),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn copy_file_by_id(
+        &self,
+        source_file_id: u64,
+        target_path: &str,
+    ) -> Fs0Result<FileRecord> {
+        match self
+            .request(ControlRequest::CopyFileById {
+                source_file_id,
+                target_path: target_path.to_owned(),
+            })
+            .await?
+        {
+            ControlResponse::CopyFileById(file) => Ok(file),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn rename_file(&self, source_path: &str, target_path: &str) -> Fs0Result<FileRecord> {
+        match self
+            .request(ControlRequest::RenameFile {
+                source_path: source_path.to_owned(),
+                target_path: target_path.to_owned(),
+            })
+            .await?
+        {
+            ControlResponse::RenameFile(file) => Ok(file),
+            response => unexpected_control_response(response),
+        }
+    }
+
+    pub async fn rename_file_by_id(
+        &self,
+        file_id: u64,
+        target_path: &str,
+    ) -> Fs0Result<FileRecord> {
+        match self
+            .request(ControlRequest::RenameFileById {
+                file_id,
+                target_path: target_path.to_owned(),
+            })
+            .await?
+        {
+            ControlResponse::RenameFileById(file) => Ok(file),
             response => unexpected_control_response(response),
         }
     }
@@ -93,7 +157,6 @@ impl Fs0Client {
     pub async fn begin_append(&self, request: BeginAppendRequest) -> Fs0Result<AppendLease> {
         match self.request(ControlRequest::BeginAppend(request)).await? {
             ControlResponse::BeginAppend(lease) => Ok(lease),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -101,7 +164,6 @@ impl Fs0Client {
     pub async fn commit_append(&self, request: CommitAppendRequest) -> Fs0Result<FileReadPlan> {
         match self.request(ControlRequest::CommitAppend(request)).await? {
             ControlResponse::CommitAppend(plan) => Ok(plan),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -112,7 +174,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::AbortAppend => Ok(()),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }
@@ -130,7 +191,6 @@ impl Fs0Client {
             .await?
         {
             ControlResponse::GetFileChangeLogs(logs) => Ok(logs),
-            ControlResponse::Error(err) => Err(err),
             response => unexpected_control_response(response),
         }
     }

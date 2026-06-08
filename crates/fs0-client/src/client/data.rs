@@ -54,7 +54,6 @@ impl Fs0Client {
                 compressed_len: Some(compressed_len),
             } => Ok(Some((raw_len, compressed_len))),
             DataResponse::HasChunk { exists: false, .. } => Ok(None),
-            DataResponse::Error(err) => Err(err),
             response => unexpected_data_response(response),
         }
     }
@@ -84,7 +83,6 @@ impl Fs0Client {
 
         match response {
             DataResponse::UploadChunk { .. } => Ok(true),
-            DataResponse::Error(err) => Err(err),
             response => unexpected_data_response(response),
         }
     }
@@ -205,7 +203,6 @@ impl Fs0Client {
                 raw_len,
                 compressed_len,
             }),
-            DataResponse::Error(err) => Err(err),
             response => unexpected_data_response(response),
         }
     }
@@ -227,7 +224,6 @@ impl Fs0Client {
 
         match response {
             DataResponse::ListBundleChunks { chunks } => Ok(chunks),
-            DataResponse::Error(err) => Err(err),
             response => unexpected_data_response(response),
         }
     }
@@ -249,7 +245,6 @@ impl Fs0Client {
 
         match response {
             DataResponse::DownloadChunk { compressed_bytes } => Ok(compressed_bytes),
-            DataResponse::Error(err) => Err(err),
             response => unexpected_data_response(response),
         }
     }
@@ -330,8 +325,8 @@ async fn upload_chunk_if_missing_on_connection(
 
 async fn request_data(connection: &Connection, request: DataRequest) -> Fs0Result<DataResponse> {
     match connection.rpc(ProtocolRequest::Data(request)).await? {
+        ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => Err(err),
         ProtocolResponse::Data(response) => Ok(response),
-        ProtocolResponse::Error(err) => Err(err),
         response => unexpected_protocol_data_response(response),
     }
 }

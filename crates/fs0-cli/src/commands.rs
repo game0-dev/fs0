@@ -18,6 +18,7 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             offset,
             len,
         } => client::cat(&cli.config, remote_path, offset, len).await,
+        Command::Stat { remote_path } => client::stat(&cli.config, cli.json, remote_path).await,
         Command::Get {
             remote_path,
             local_path,
@@ -55,6 +56,27 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             .await
         }
         Command::Rm { remote_path } => client::rm(&cli.config, remote_path).await,
+        Command::RmId { file_id } => client::rm_id(&cli.config, file_id).await,
+        Command::Cp {
+            source_path,
+            target_path,
+        } => client::cp(&cli.config, cli.json, source_path, target_path).await,
+        Command::CpById {
+            source_file_id,
+            target_path,
+        } => client::cp_by_id(&cli.config, cli.json, source_file_id, target_path).await,
+        Command::Mv {
+            source_path,
+            target_path,
+        } => client::mv(&cli.config, cli.json, source_path, target_path).await,
+        Command::MvById {
+            file_id,
+            target_path,
+        } => client::mv_by_id(&cli.config, cli.json, file_id, target_path).await,
+        Command::Changes {
+            after_event_id,
+            limit,
+        } => client::changes(&cli.config, cli.json, after_event_id, limit).await,
         Command::Peers => client::peers(&cli.config, cli.json).await,
         Command::Central { command } => match command {
             CentralCommand::Run { config } => server::run_central(config).await,

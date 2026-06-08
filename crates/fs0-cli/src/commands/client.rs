@@ -1,6 +1,9 @@
 use crate::{
     commands::connect_client,
-    output::{json_error, local_file_name, print_central_status, print_directory_entries},
+    output::{
+        json_error, local_file_name, print_central_status, print_directory_entries,
+        print_file_change_logs, print_file_read_plan, print_file_record,
+    },
 };
 use fs0_client::{ListOptions, ReadRange, WriteOptions};
 use fs0_core::Fs0Result;
@@ -39,6 +42,24 @@ pub(super) async fn cat(
     client
         .download_to_writer(&remote_path, stdout, ReadRange { offset, len })
         .await?;
+    client.shutdown().await
+}
+
+pub(super) async fn stat(
+    config: &Option<PathBuf>,
+    json: bool,
+    remote_path: String,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let plan = client.get_file_read_plan(&remote_path).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).map_err(json_error)?
+        );
+    } else {
+        print_file_read_plan(plan);
+    }
     client.shutdown().await
 }
 
@@ -123,6 +144,79 @@ pub(super) async fn rm(config: &Option<PathBuf>, remote_path: String) -> Fs0Resu
     client.shutdown().await
 }
 
+pub(super) async fn rm_id(config: &Option<PathBuf>, file_id: u64) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    client.delete_file_by_id(file_id).await?;
+    client.shutdown().await
+}
+
+pub(super) async fn cp(
+    config: &Option<PathBuf>,
+    json: bool,
+    source_path: String,
+    target_path: String,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let file = client.copy_file(&source_path, &target_path).await?;
+    print_file_result(json, file)?;
+    client.shutdown().await
+}
+
+pub(super) async fn cp_by_id(
+    config: &Option<PathBuf>,
+    json: bool,
+    source_file_id: u64,
+    target_path: String,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let file = client.copy_file_by_id(source_file_id, &target_path).await?;
+    print_file_result(json, file)?;
+    client.shutdown().await
+}
+
+pub(super) async fn mv(
+    config: &Option<PathBuf>,
+    json: bool,
+    source_path: String,
+    target_path: String,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let file = client.rename_file(&source_path, &target_path).await?;
+    print_file_result(json, file)?;
+    client.shutdown().await
+}
+
+pub(super) async fn mv_by_id(
+    config: &Option<PathBuf>,
+    json: bool,
+    file_id: u64,
+    target_path: String,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let file = client.rename_file_by_id(file_id, &target_path).await?;
+    print_file_result(json, file)?;
+    client.shutdown().await
+}
+
+pub(super) async fn changes(
+    config: &Option<PathBuf>,
+    json: bool,
+    after_event_id: u64,
+    limit: u32,
+) -> Fs0Result<()> {
+    let client = connect_client(config).await?;
+    let logs = client.get_file_change_logs(after_event_id, limit).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&logs).map_err(json_error)?
+        );
+    } else {
+        print_file_change_logs(logs);
+    }
+    client.shutdown().await
+}
+
 pub(super) async fn peers(config: &Option<PathBuf>, json: bool) -> Fs0Result<()> {
     let client = connect_client(config).await?;
     let peers = client.storage_peers();
@@ -171,6 +265,19 @@ fn print_write_result(json: bool, plan: &fs0_core::protocol::FileReadPlan) -> Fs
         );
     } else {
         println!("{} {} bytes", plan.path, plan.size);
+    }
+
+    Ok(())
+}
+
+fn print_file_result(json: bool, file: fs0_core::protocol::FileRecord) -> Fs0Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&file).map_err(json_error)?
+        );
+    } else {
+        print_file_record(file);
     }
 
     Ok(())

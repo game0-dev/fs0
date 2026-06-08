@@ -113,22 +113,20 @@ impl Fs0Client {
             .await?;
         let token = config.token;
 
-        let response = control
-            .rpc(ProtocolRequest::Control(ControlRequest::RegisterClient {
+        let response = request_control(
+            &control,
+            ControlRequest::RegisterClient {
                 name: options.name.clone(),
                 token: token.clone(),
-            }))
-            .await?;
+            },
+        )
+        .await?;
         let (client_id, storages) = match response {
-            ProtocolResponse::Control(ControlResponse::RegisterClient {
+            ControlResponse::RegisterClient {
                 client_id,
                 storages,
-            }) => (client_id, storages),
-            ProtocolResponse::Control(ControlResponse::Error(err))
-            | ProtocolResponse::Error(err) => {
-                return Err(err);
-            }
-            response => return unexpected_protocol_control_response(response),
+            } => (client_id, storages),
+            response => return unexpected_control_response(response),
         };
 
         Ok(Self {
@@ -174,8 +172,10 @@ pub(super) async fn request_control(
     request: ControlRequest,
 ) -> Fs0Result<ControlResponse> {
     match connection.rpc(ProtocolRequest::Control(request)).await? {
+        ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
+            Err(err)
+        }
         ProtocolResponse::Control(response) => Ok(response),
-        ProtocolResponse::Error(err) => Err(err),
         response => unexpected_protocol_control_response(response),
     }
 }

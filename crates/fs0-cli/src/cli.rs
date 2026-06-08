@@ -29,6 +29,9 @@ pub(crate) enum Command {
         #[arg(long)]
         len: Option<u64>,
     },
+    Stat {
+        remote_path: String,
+    },
     Get {
         remote_path: String,
         local_path: Option<PathBuf>,
@@ -53,6 +56,31 @@ pub(crate) enum Command {
     },
     Rm {
         remote_path: String,
+    },
+    RmId {
+        file_id: u64,
+    },
+    Cp {
+        source_path: String,
+        target_path: String,
+    },
+    CpById {
+        source_file_id: u64,
+        target_path: String,
+    },
+    Mv {
+        source_path: String,
+        target_path: String,
+    },
+    MvById {
+        file_id: u64,
+        target_path: String,
+    },
+    Changes {
+        #[arg(long, default_value_t = 0)]
+        after_event_id: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
     },
     Peers,
     Central {
