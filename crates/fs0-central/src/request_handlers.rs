@@ -2,8 +2,8 @@ mod append;
 mod client;
 mod storage;
 
-use crate::{Fs0Error, server::CentralServer};
-use fs0_core::protocol::{ControlRequest, ControlResponse};
+use crate::{Fs0Error, Fs0Result, server::CentralServer};
+use fs0_core::protocol::{ControlRequest, ControlResponse, StoragePeerInfo};
 use fs0_transport::Connection;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -20,21 +20,17 @@ pub(crate) async fn handle_control_request(
     request: ControlRequest,
     identity: &mut ControlConnectionIdentity,
 ) -> ControlResponse {
-    match request {
+    let response = match request {
         ControlRequest::RegisterClient { name: _, token } => {
-            if !matches!(*identity, ControlConnectionIdentity::Anonymous) {
-                return ControlResponse::Error(Fs0Error::InvalidRequest);
-            }
-
             match register_client(server, token, connection.clone()) {
                 Ok((client_id, storages)) => {
                     *identity = ControlConnectionIdentity::Client(client_id);
-                    ControlResponse::RegisterClient {
+                    Ok(ControlResponse::RegisterClient {
                         client_id,
                         storages,
-                    }
+                    })
                 }
-                Err(err) => ControlResponse::Error(err),
+                Err(err) => Err(err),
             }
         }
         ControlRequest::RegisterStorage {
@@ -43,10 +39,6 @@ pub(crate) async fn handle_control_request(
             volumes,
             iroh_endpoint,
         } => {
-            if !matches!(*identity, ControlConnectionIdentity::Anonymous) {
-                return ControlResponse::Error(Fs0Error::InvalidRequest);
-            }
-
             match storage::register_storage(
                 server,
                 name,
@@ -57,220 +49,96 @@ pub(crate) async fn handle_control_request(
             ) {
                 Ok((storage_id, storages)) => {
                     *identity = ControlConnectionIdentity::Storage(storage_id);
-                    ControlResponse::RegisterStorage {
+                    Ok(ControlResponse::RegisterStorage {
                         storage_id,
                         storages,
-                    }
+                    })
                 }
-                Err(err) => ControlResponse::Error(err),
+                Err(err) => Err(err),
             }
         }
-        ControlRequest::ValidateClientAuth {
-            client_id,
-            client_token,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Storage(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
+        request => {
+            if let ControlConnectionIdentity::Client(_) = *identity {
+                handle_client_request(server, request).await
+            } else if let ControlConnectionIdentity::Storage(storage_id) = *identity {
+                handle_storage_request(server, storage_id, request).await
+            } else {
+                Err(Fs0Error::Unauthorized)
             }
+        }
+    };
 
-            match storage::validate_client_auth(server, client_id, client_token) {
-                Ok(()) => ControlResponse::ValidateClientAuth { client_id },
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+    response.unwrap_or_else(ControlResponse::Error)
+}
+
+async fn handle_client_request(
+    server: &CentralServer,
+    request: ControlRequest,
+) -> Fs0Result<ControlResponse> {
+    match request {
         ControlRequest::CreateVolume { name, max_bytes } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::create_volume(server, name, max_bytes) {
-                Ok(volume_id) => ControlResponse::CreateVolume { volume_id },
-                Err(err) => ControlResponse::Error(err),
-            }
+            client::create_volume(server, name, max_bytes)
         }
-        ControlRequest::CentralStatus => match storage::central_status(server) {
-            Ok((clients_count, storages)) => ControlResponse::CentralStatus {
-                clients_count,
-                storages,
-            },
-            Err(err) => ControlResponse::Error(err),
-        },
+        ControlRequest::CentralStatus => storage::central_status(server),
         ControlRequest::ListDirectory { dir, limit, cursor } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::list_directory(server, &dir, limit, cursor) {
-                Ok(entries) => ControlResponse::ListDirectory(entries),
-                Err(err) => ControlResponse::Error(err),
-            }
+            client::list_directory(server, &dir, limit, cursor)
         }
-        ControlRequest::GetFileReadPlan { path } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::get_file_read_plan(server, &path) {
-                Ok(plan) => ControlResponse::GetFileReadPlan(plan),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        ControlRequest::GetFileReadPlan { path } => client::get_file_read_plan(server, &path),
         ControlRequest::GetFileReadPlanById { file_id } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::get_file_read_plan_by_id(server, file_id) {
-                Ok(plan) => ControlResponse::GetFileReadPlanById(plan),
-                Err(err) => ControlResponse::Error(err),
-            }
+            client::get_file_read_plan_by_id(server, file_id)
         }
-        ControlRequest::DeleteFile { path } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::delete_file(server, &path) {
-                Ok(()) => ControlResponse::DeleteFile,
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
-        ControlRequest::DeleteFileById { file_id } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::delete_file_by_id(server, file_id) {
-                Ok(()) => ControlResponse::DeleteFileById,
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        ControlRequest::DeleteFile { path } => client::delete_file(server, &path),
+        ControlRequest::DeleteFileById { file_id } => client::delete_file_by_id(server, file_id),
         ControlRequest::CopyFile {
             source_path,
             target_path,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::copy_file(server, &source_path, &target_path) {
-                Ok(file) => ControlResponse::CopyFile(file),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        } => client::copy_file(server, &source_path, &target_path),
         ControlRequest::CopyFileById {
             source_file_id,
             target_path,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::copy_file_by_id(server, source_file_id, &target_path) {
-                Ok(file) => ControlResponse::CopyFileById(file),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        } => client::copy_file_by_id(server, source_file_id, &target_path),
         ControlRequest::RenameFile {
             source_path,
             target_path,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::rename_file(server, &source_path, &target_path) {
-                Ok(file) => ControlResponse::RenameFile(file),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        } => client::rename_file(server, &source_path, &target_path),
         ControlRequest::RenameFileById {
             file_id,
             target_path,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::rename_file_by_id(server, file_id, &target_path) {
-                Ok(file) => ControlResponse::RenameFileById(file),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        } => client::rename_file_by_id(server, file_id, &target_path),
         ControlRequest::GetFileChangeLogs {
             after_event_id,
             limit,
-        } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match client::get_file_change_logs(server, after_event_id, limit) {
-                Ok(logs) => ControlResponse::GetFileChangeLogs(logs),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
-        ControlRequest::BeginAppend(request) => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match append::begin_append(server, request).await {
-                Ok(lease) => ControlResponse::BeginAppend(lease),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
-        ControlRequest::CommitAppend(request) => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match append::commit_append(server, request).await {
-                Ok(plan) => ControlResponse::CommitAppend(plan),
-                Err(err) => ControlResponse::Error(err),
-            }
-        }
+        } => client::get_file_change_logs(server, after_event_id, limit),
+        ControlRequest::BeginAppend(request) => append::begin_append(server, request).await,
+        ControlRequest::CommitAppend(request) => append::commit_append(server, request).await,
         ControlRequest::AbortAppend { lease_id, file_id } => {
-            if !matches!(*identity, ControlConnectionIdentity::Client(_)) {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            }
-
-            match append::abort_append(server, lease_id, file_id).await {
-                Ok(()) => ControlResponse::AbortAppend,
-                Err(err) => ControlResponse::Error(err),
-            }
+            append::abort_append(server, lease_id, file_id).await
         }
-        ControlRequest::ReportBundleReplica { events } => {
-            let ControlConnectionIdentity::Storage(storage_id) = *identity else {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            };
+        _ => Err(Fs0Error::Unauthorized),
+    }
+}
 
-            match storage::report_bundle_replica(server, storage_id, events) {
-                Ok(()) => ControlResponse::ReportBundleReplica,
-                Err(err) => ControlResponse::Error(err),
-            }
+async fn handle_storage_request(
+    server: &CentralServer,
+    storage_id: u64,
+    request: ControlRequest,
+) -> Fs0Result<ControlResponse> {
+    match request {
+        ControlRequest::CentralStatus => storage::central_status(server),
+        ControlRequest::ValidateClientAuth {
+            client_id,
+            client_token,
+        } => storage::validate_client_auth(server, client_id, client_token),
+        ControlRequest::ReportBundleReplica { events } => {
+            storage::report_bundle_replica(server, storage_id, events)
         }
         ControlRequest::UpdateStorageVolumeOffset {
             volume_id,
             max_volume_offset,
         } => {
-            let ControlConnectionIdentity::Storage(storage_id) = *identity else {
-                return ControlResponse::Error(Fs0Error::Unauthorized);
-            };
-
-            match storage::update_storage_volume_offset(
-                server,
-                storage_id,
-                volume_id,
-                max_volume_offset,
-            ) {
-                Ok(()) => ControlResponse::UpdateStorageVolumeOffset,
-                Err(err) => ControlResponse::Error(err),
-            }
+            storage::update_storage_volume_offset(server, storage_id, volume_id, max_volume_offset)
         }
-        ControlRequest::GrantUploadLease(_) | ControlRequest::RevokeUploadLease { .. } => {
-            ControlResponse::Error(Fs0Error::InvalidRequest)
-        }
+        _ => Err(Fs0Error::Unauthorized),
     }
 }
 
@@ -288,7 +156,7 @@ fn register_client(
     server: &CentralServer,
     token: String,
     connection: Connection,
-) -> crate::Fs0Result<(u64, Vec<fs0_core::protocol::StoragePeerInfo>)> {
+) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
     if !server.token_allowed(&token) {
         return Err(Fs0Error::Unauthorized);
     }

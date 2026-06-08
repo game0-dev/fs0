@@ -3,7 +3,7 @@ use crate::{
     server::{CentralServer, StorageControlConnection},
 };
 use fs0_core::protocol::{
-    BundleReplicaEvent, BundleReplicaEventKind, StoragePeerInfo, StorageVolumeInfo,
+    BundleReplicaEvent, BundleReplicaEventKind, ControlResponse, StoragePeerInfo, StorageVolumeInfo,
 };
 use fs0_transport::Connection;
 
@@ -80,31 +80,31 @@ pub(super) fn validate_client_auth(
     server: &CentralServer,
     client_id: u64,
     client_token: String,
-) -> Fs0Result<()> {
+) -> Fs0Result<ControlResponse> {
     let clients = server.clients.read();
     let Some(client) = clients.get(&client_id) else {
         return Err(Fs0Error::Unauthorized);
     };
 
     if client.token == client_token {
-        Ok(())
+        Ok(ControlResponse::ValidateClientAuth { client_id })
     } else {
         Err(Fs0Error::Unauthorized)
     }
 }
 
-pub(super) fn central_status(server: &CentralServer) -> Fs0Result<(u32, Vec<StoragePeerInfo>)> {
-    Ok((
-        server.clients.read().len() as u32,
-        server.storage_peers_snapshot(),
-    ))
+pub(super) fn central_status(server: &CentralServer) -> Fs0Result<ControlResponse> {
+    Ok(ControlResponse::CentralStatus {
+        clients_count: server.clients.read().len() as u32,
+        storages: server.storage_peers_snapshot(),
+    })
 }
 
 pub(super) fn report_bundle_replica(
     server: &CentralServer,
     storage_id: u64,
     events: Vec<BundleReplicaEvent>,
-) -> Fs0Result<()> {
+) -> Fs0Result<ControlResponse> {
     let online_volumes = server.online_volumes.read();
     for event in &events {
         if online_volumes.get(&event.volume_id) != Some(&storage_id) {
@@ -129,7 +129,8 @@ pub(super) fn report_bundle_replica(
             }
         }
     }
-    tx.commit()
+    tx.commit()?;
+    Ok(ControlResponse::ReportBundleReplica)
 }
 
 pub(super) fn update_storage_volume_offset(
@@ -137,7 +138,7 @@ pub(super) fn update_storage_volume_offset(
     storage_id: u64,
     volume_id: u64,
     max_volume_offset: u64,
-) -> Fs0Result<()> {
+) -> Fs0Result<ControlResponse> {
     let registered = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
@@ -158,5 +159,5 @@ pub(super) fn update_storage_volume_offset(
     volume.max_bytes = registered.max_bytes;
     volume.max_volume_offset = registered.max_volume_offset;
 
-    Ok(())
+    Ok(ControlResponse::UpdateStorageVolumeOffset)
 }

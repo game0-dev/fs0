@@ -1,9 +1,6 @@
 use crate::{Fs0Result, db::CentralTx, server::CentralServer};
 use fs0_core::{
-    protocol::{
-        DirectoryEntries, FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord,
-        ReplicaLocation,
-    },
+    protocol::{ControlResponse, FileChangeLogKind, FileReadPlan, FileRecord, ReplicaLocation},
     utils::now_ms,
 };
 use std::collections::{HashMap, HashSet};
@@ -12,12 +9,14 @@ pub(super) fn create_volume(
     server: &CentralServer,
     name: String,
     max_bytes: u64,
-) -> Fs0Result<u64> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let volume = tx.create_volume(name, max_bytes)?;
     tx.commit()?;
-    Ok(volume.volume_id)
+    Ok(ControlResponse::CreateVolume {
+        volume_id: volume.volume_id,
+    })
 }
 
 pub(super) fn list_directory(
@@ -25,15 +24,15 @@ pub(super) fn list_directory(
     dir: &str,
     limit: u32,
     cursor: Option<u64>,
-) -> Fs0Result<DirectoryEntries> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let entries = tx.list_directory(dir, limit, cursor)?;
     tx.commit()?;
-    Ok(entries)
+    Ok(ControlResponse::ListDirectory(entries))
 }
 
-pub(super) fn get_file_read_plan(server: &CentralServer, path: &str) -> Fs0Result<FileReadPlan> {
+pub(super) fn get_file_read_plan(server: &CentralServer, path: &str) -> Fs0Result<ControlResponse> {
     let plan = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
@@ -43,13 +42,13 @@ pub(super) fn get_file_read_plan(server: &CentralServer, path: &str) -> Fs0Resul
         plan
     };
 
-    hydrate_read_plan_replicas(server, plan)
+    hydrate_read_plan_replicas(server, plan).map(ControlResponse::GetFileReadPlan)
 }
 
 pub(super) fn get_file_read_plan_by_id(
     server: &CentralServer,
     file_id: u64,
-) -> Fs0Result<FileReadPlan> {
+) -> Fs0Result<ControlResponse> {
     let plan = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
@@ -58,7 +57,7 @@ pub(super) fn get_file_read_plan_by_id(
         plan
     };
 
-    hydrate_read_plan_replicas(server, plan)
+    hydrate_read_plan_replicas(server, plan).map(ControlResponse::GetFileReadPlanById)
 }
 
 pub(super) fn hydrate_read_plan_replicas(
@@ -107,7 +106,7 @@ pub(super) fn hydrate_read_plan_replicas(
     Ok(plan)
 }
 
-pub(super) fn delete_file(server: &CentralServer, path: &str) -> Fs0Result<()> {
+pub(super) fn delete_file(server: &CentralServer, path: &str) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let now = now_ms();
@@ -123,10 +122,14 @@ pub(super) fn delete_file(server: &CentralServer, path: &str) -> Fs0Result<()> {
         Some(file.file_id),
         now,
     )?;
-    tx.commit()
+    tx.commit()?;
+    Ok(ControlResponse::DeleteFile)
 }
 
-pub(super) fn delete_file_by_id(server: &CentralServer, file_id: u64) -> Fs0Result<()> {
+pub(super) fn delete_file_by_id(
+    server: &CentralServer,
+    file_id: u64,
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let now = now_ms();
@@ -142,32 +145,33 @@ pub(super) fn delete_file_by_id(server: &CentralServer, file_id: u64) -> Fs0Resu
         Some(file_id),
         now,
     )?;
-    tx.commit()
+    tx.commit()?;
+    Ok(ControlResponse::DeleteFileById)
 }
 
 pub(super) fn copy_file(
     server: &CentralServer,
     source_path: &str,
     target_path: &str,
-) -> Fs0Result<FileRecord> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let source = tx.get_file_by_path(source_path)?;
     let file = copy_file_tx(&tx, source.file_id, target_path)?;
     tx.commit()?;
-    Ok(file)
+    Ok(ControlResponse::CopyFile(file))
 }
 
 pub(super) fn copy_file_by_id(
     server: &CentralServer,
     source_file_id: u64,
     target_path: &str,
-) -> Fs0Result<FileRecord> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let file = copy_file_tx(&tx, source_file_id, target_path)?;
     tx.commit()?;
-    Ok(file)
+    Ok(ControlResponse::CopyFileById(file))
 }
 
 fn copy_file_tx(
@@ -193,25 +197,25 @@ pub(super) fn rename_file(
     server: &CentralServer,
     source_path: &str,
     target_path: &str,
-) -> Fs0Result<FileRecord> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let source = tx.get_file_by_path(source_path)?;
     let file = rename_file_tx(&tx, source.file_id, target_path)?;
     tx.commit()?;
-    Ok(file)
+    Ok(ControlResponse::RenameFile(file))
 }
 
 pub(super) fn rename_file_by_id(
     server: &CentralServer,
     file_id: u64,
     target_path: &str,
-) -> Fs0Result<FileRecord> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let file = rename_file_tx(&tx, file_id, target_path)?;
     tx.commit()?;
-    Ok(file)
+    Ok(ControlResponse::RenameFileById(file))
 }
 
 fn rename_file_tx(tx: &CentralTx<'_>, file_id: u64, target_path: &str) -> Fs0Result<FileRecord> {
@@ -235,10 +239,10 @@ pub(super) fn get_file_change_logs(
     server: &CentralServer,
     after_event_id: u64,
     limit: u32,
-) -> Fs0Result<FileChangeLogs> {
+) -> Fs0Result<ControlResponse> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
     let logs = tx.get_file_change_logs(after_event_id, limit)?;
     tx.commit()?;
-    Ok(logs)
+    Ok(ControlResponse::GetFileChangeLogs(logs))
 }
