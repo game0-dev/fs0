@@ -113,6 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: fs0-*
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -122,7 +123,7 @@ jobs:
 
   docker-image:
     name: Publish Docker image
-    needs: verify
+    needs: github-release
     runs-on: ubuntu-latest
 
     steps:
@@ -151,9 +152,14 @@ jobs:
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           platforms: linux/amd64
           push: true
+          build-args: |
+            FS0_REPOSITORY=${{ github.repository }}
+            FS0_TAG=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
