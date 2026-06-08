@@ -18,15 +18,6 @@ pub(super) async fn begin_append(
     server: &CentralServer,
     request: BeginAppendRequest,
 ) -> Fs0Result<ControlResponse> {
-    begin_append_inner(server, request)
-        .await
-        .map(ControlResponse::BeginAppend)
-}
-
-async fn begin_append_inner(
-    server: &CentralServer,
-    request: BeginAppendRequest,
-) -> Fs0Result<AppendLease> {
     let volume_id = select_append_volume(
         server,
         request.prefer_volume_name.as_deref(),
@@ -78,7 +69,7 @@ async fn begin_append_inner(
     };
 
     match grant_upload_lease_to_specific_storage(server, storage_id, &lease).await {
-        Ok(()) => Ok(lease),
+        Ok(()) => Ok(ControlResponse::BeginAppend(lease)),
         Err(err) => {
             let _ = abort_append_db_only(server, lease.lease_id, lease.file_id);
             Err(err)
@@ -90,15 +81,6 @@ pub(super) async fn commit_append(
     server: &CentralServer,
     request: CommitAppendRequest,
 ) -> Fs0Result<ControlResponse> {
-    commit_append_inner(server, request)
-        .await
-        .map(ControlResponse::CommitAppend)
-}
-
-async fn commit_append_inner(
-    server: &CentralServer,
-    request: CommitAppendRequest,
-) -> Fs0Result<FileReadPlan> {
     let lease_id = request.lease_id;
     let file_id = request.file_id;
     let storage_id = storage_id_for_append_lease(server, lease_id, file_id).ok();
@@ -115,7 +97,7 @@ async fn commit_append_inner(
         revoke_storage_upload_lease(server, storage_id, lease_id).await;
     }
 
-    result
+    result.map(ControlResponse::CommitAppend)
 }
 
 pub(super) async fn abort_append(
@@ -123,18 +105,13 @@ pub(super) async fn abort_append(
     lease_id: u64,
     file_id: u64,
 ) -> Fs0Result<ControlResponse> {
-    abort_append_inner(server, lease_id, file_id).await?;
-    Ok(ControlResponse::AbortAppend)
-}
-
-async fn abort_append_inner(server: &CentralServer, lease_id: u64, file_id: u64) -> Fs0Result<()> {
     let storage_id = storage_id_for_append_lease(server, lease_id, file_id).ok();
     abort_append_db_only(server, lease_id, file_id)?;
     if let Some(storage_id) = storage_id {
         revoke_storage_upload_lease(server, storage_id, lease_id).await;
     }
 
-    Ok(())
+    Ok(ControlResponse::AbortAppend)
 }
 
 fn select_append_volume(
