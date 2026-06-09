@@ -108,7 +108,7 @@ pub(super) async fn put(
     client.shutdown().await
 }
 
-pub(super) async fn append(
+pub(super) async fn update(
     config: &Option<PathBuf>,
     json: bool,
     remote_path: String,
@@ -127,11 +127,11 @@ pub(super) async fn append(
     };
     let plan = if local_path == "-" {
         client
-            .append_from_reader(&remote_path, tokio::io::stdin(), options)
+            .update_from_reader(&remote_path, tokio::io::stdin(), options)
             .await?
     } else {
         client
-            .append_path(&remote_path, local_path, options)
+            .update_path(&remote_path, local_path, options)
             .await?
     };
     print_write_result(json, &plan)?;
@@ -144,12 +144,6 @@ pub(super) async fn rm(config: &Option<PathBuf>, remote_path: String) -> Fs0Resu
     client.shutdown().await
 }
 
-pub(super) async fn rm_id(config: &Option<PathBuf>, file_id: u64) -> Fs0Result<()> {
-    let client = connect_client(config).await?;
-    client.delete_file_by_id(file_id).await?;
-    client.shutdown().await
-}
-
 pub(super) async fn cp(
     config: &Option<PathBuf>,
     json: bool,
@@ -158,18 +152,6 @@ pub(super) async fn cp(
 ) -> Fs0Result<()> {
     let client = connect_client(config).await?;
     let file = client.copy_file(&source_path, &target_path).await?;
-    print_file_result(json, file)?;
-    client.shutdown().await
-}
-
-pub(super) async fn cp_by_id(
-    config: &Option<PathBuf>,
-    json: bool,
-    source_file_id: u64,
-    target_path: String,
-) -> Fs0Result<()> {
-    let client = connect_client(config).await?;
-    let file = client.copy_file_by_id(source_file_id, &target_path).await?;
     print_file_result(json, file)?;
     client.shutdown().await
 }
@@ -186,26 +168,14 @@ pub(super) async fn mv(
     client.shutdown().await
 }
 
-pub(super) async fn mv_by_id(
-    config: &Option<PathBuf>,
-    json: bool,
-    file_id: u64,
-    target_path: String,
-) -> Fs0Result<()> {
-    let client = connect_client(config).await?;
-    let file = client.rename_file_by_id(file_id, &target_path).await?;
-    print_file_result(json, file)?;
-    client.shutdown().await
-}
-
 pub(super) async fn changes(
     config: &Option<PathBuf>,
     json: bool,
-    after_event_id: u64,
+    cursor: u64,
     limit: u32,
 ) -> Fs0Result<()> {
     let client = connect_client(config).await?;
-    let logs = client.get_file_change_logs(after_event_id, limit).await?;
+    let logs = client.get_file_change_logs(cursor, limit).await?;
     if json {
         println!(
             "{}",

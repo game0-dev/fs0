@@ -3,40 +3,20 @@
 </p>
 
 <p align="center">
-  Experimental append-only distributed storage written in Rust.
+  Production-ready distributed storage written in Rust.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/status-experimental-yellow.svg" alt="Status">
+  <img src="https://img.shields.io/badge/status-ready-brightgreen.svg" alt="Status">
   <img src="https://img.shields.io/badge/rust-2024-orange.svg" alt="Rust 2024">
 </p>
 
-
-## What is fs0?
-
-**fs0** is an experimental distributed storage system built around append-only file writes, chunked storage, compressed data blocks, and a small command-line interface.
-
-The current MVP is an append-only distributed file/object store. It is not a full POSIX filesystem yet. Future FUSE support will need a dedicated inode, directory, and attribute model before fs0 should be treated as a mounted filesystem.
-
-It provides:
-
-- a **central server** for metadata and coordination
-- **storage nodes** for storing file chunks
-- a **CLI client** for file operations
-- local **volume** management
-- an early foundation for future FUSE support
-
-fs0 is currently intended for development, experimentation, and storage-system research.
-
-> fs0 is not production-ready yet. The storage format, network protocol, and command-line interface may change.
-
----
+**fs0** is a distributed storage system with a central metadata service, storage nodes, local volumes, compressed chunks, content hashing, and a single command-line interface for operating the cluster and files.
 
 ## Features
 
-- Append-only file writes
-- Upload, append, list, read, download, and delete files
+- Upload, update, list, read, download, copy, move, and delete files
 - Chunked file storage
 - Zstandard compression
 - BLAKE3 content hashing
@@ -51,16 +31,10 @@ fs0 is currently intended for development, experimentation, and storage-system r
 
 ## Installation
 
-### Requirements
-
-- Rust toolchain with Rust 2024 edition support
-- Cargo
-- Git
-
 ### Build from source
 
 ```bash
-git clone https://github.com/studio-0/fs0.git
+git clone https://github.com/game0-dev/fs0.git
 cd fs0
 cargo build --release -p fs0-cli
 ```
@@ -89,15 +63,15 @@ Then check:
 fs0 --help
 ```
 
----
+## How to use
 
-## Quickstart
+### Create a config
 
-This section shows the basic local workflow.
+```bash
+mkdir -p ~/.fs0 .local
+```
 
-### 1. Create a local config
-
-Create `.local/fs0.local.toml`:
+Create `~/.fs0/config.toml`:
 
 ```toml
 [central]
@@ -114,46 +88,7 @@ https_bind_port = 7801
 cert_path = ".local/relay-cert.pem"
 key_path = ".local/relay-key.pem"
 quic_bind_port = 7802
-```
 
-Run the central server:
-
-```bash
-fs0 central run --config .local/fs0.local.toml
-```
-
-Or with Cargo:
-
-```bash
-cargo run -p fs0-cli -- central run --config .local/fs0.local.toml
-```
-
-The server prints a central endpoint. Use that endpoint in your client and storage configuration.
-
----
-
-### 2. Create a central-backed local volume
-
-```bash
-mkdir -p .local/volume-1
-fs0 --config .local/fs0.local.toml volume create .local/volume-1 \
-  --name local-volume-1 \
-  --max-bytes 10G
-```
-
-Inspect the volume:
-
-```bash
-fs0 volume meta .local/volume-1
-```
-
----
-
-### 3. Fill client and storage config
-
-Add the endpoint printed by `fs0 central run`:
-
-```toml
 [client]
 token = "dev-token"
 central_endpoint_id = "central-endpoint-id"
@@ -191,355 +126,152 @@ path = ".local/volume-1"
 name = "local-volume-1"
 ```
 
----
+`fs0` reads this file by default. Use `--config <PATH>` only when you want to load a different config file.
 
-### 4. Run a storage node
-
-```bash
-fs0 storage run --config .local/fs0.local.toml
-```
-
----
-
-### 5. Use the client
-
-List files:
+### Start central
 
 ```bash
-fs0 --config .local/fs0.local.toml ls /
+fs0 central run
 ```
 
-Upload a file:
+The server prints a central endpoint. Use that endpoint in `central_endpoint_id`.
+
+### Create a volume
+
+```bash
+mkdir -p .local/volume-1
+fs0 storage create-volume .local/volume-1 \
+  --name local-volume-1 \
+  --max-bytes 10G
+```
+
+Inspect the volume:
+
+```bash
+fs0 storage inspect-volume .local/volume-1
+```
+
+### Run storage
+
+```bash
+fs0 storage run
+```
+
+### Upload and read files
 
 ```bash
 echo "hello fs0" > hello.txt
-fs0 --config .local/fs0.local.toml put /hello.txt hello.txt
+fs0 ls /
+fs0 put /hello.txt hello.txt
+fs0 cat /hello.txt
+fs0 get /hello.txt hello.downloaded.txt
 ```
 
-Print a remote file:
+### Update a file
 
 ```bash
-fs0 --config .local/fs0.local.toml cat /hello.txt
+echo "new data" > updated.txt
+fs0 update /hello.txt updated.txt
+fs0 update /hello.txt updated.txt --offset 1024
 ```
 
-Append to a file:
+### Copy, move, and delete files
 
 ```bash
-echo "more data" > more.txt
-fs0 --config .local/fs0.local.toml append /hello.txt more.txt
+fs0 cp /hello.txt /copy.txt
+fs0 mv /copy.txt /renamed.txt
+fs0 rm /renamed.txt
 ```
 
-Download a file:
-
-```bash
-fs0 --config .local/fs0.local.toml get /hello.txt hello.downloaded.txt
-```
-
-Delete a file:
-
-```bash
-fs0 --config .local/fs0.local.toml rm /hello.txt
-```
-
----
-
-## Command Line Usage
-
-```bash
-fs0 [OPTIONS] <COMMAND>
-```
-
-### Global options
-
-| Option | Description |
-|---|---|
-| `--config <PATH>` | Path to the fs0 config file. Defaults to `~/.fs0rc`. |
-| `--json` | Print JSON output where supported. |
-| `--help` | Print help information. |
-| `--version` | Print version information. |
-
----
-
-## Commands
-
-### `ls`
-
-List files under a remote directory.
-
-```bash
-fs0 ls [DIR] [OPTIONS]
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml ls /
-fs0 --config .local/fs0.local.toml ls /logs --limit 50
-fs0 --config .local/fs0.local.toml --json ls /
-```
-
-Options:
-
-| Option | Description | Default |
-|---|---|---|
-| `--limit <LIMIT>` | Maximum number of entries to return. | `100` |
-| `--cursor <CURSOR>` | Continue listing from a cursor. | none |
-
----
-
-### `cat`
-
-Print a remote file to stdout.
-
-```bash
-fs0 cat <REMOTE_PATH> [OPTIONS]
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml cat /hello.txt
-fs0 --config .local/fs0.local.toml cat /hello.txt --offset 1024
-fs0 --config .local/fs0.local.toml cat /hello.txt --offset 0 --len 4096
-```
-
-Options:
-
-| Option | Description | Default |
-|---|---|---|
-| `--offset <OFFSET>` | Start reading from byte offset. | `0` |
-| `--len <LEN>` | Maximum number of bytes to read. | full file |
-
----
-
-### `get`
-
-Download a remote file.
-
-```bash
-fs0 get <REMOTE_PATH> [LOCAL_PATH] [OPTIONS]
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml get /hello.txt
-fs0 --config .local/fs0.local.toml get /hello.txt ./hello.txt
-fs0 --config .local/fs0.local.toml get /hello.txt - --offset 0 --len 1024
-```
-
-If `LOCAL_PATH` is omitted, fs0 uses the file name from the remote path.
-
-Use `-` as `LOCAL_PATH` to write to stdout.
-
-Options:
-
-| Option | Description | Default |
-|---|---|---|
-| `--offset <OFFSET>` | Start reading from byte offset. | `0` |
-| `--len <LEN>` | Maximum number of bytes to read. | full file |
-
----
-
-### `put`
-
-Upload a local file as a new remote file.
-
-```bash
-fs0 put <REMOTE_PATH> <LOCAL_PATH> [OPTIONS]
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml put /hello.txt ./hello.txt
-fs0 --config .local/fs0.local.toml put /logs/app.log ./app.log --prefer-volume local-volume
-fs0 --config .local/fs0.local.toml put /stdin.txt -
-```
-
-Use `-` as `LOCAL_PATH` to read from stdin.
-
-Options:
-
-| Option | Description |
-|---|---|
-| `--prefer-volume <NAME>` | Prefer writing to a specific volume name. |
-
----
-
-### `append`
-
-Append local data to an existing remote file.
-
-```bash
-fs0 append <REMOTE_PATH> <LOCAL_PATH> [OPTIONS]
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml append /hello.txt ./more.txt
-fs0 --config .local/fs0.local.toml append /hello.txt ./replacement.txt --offset 1024
-echo "line" | fs0 --config .local/fs0.local.toml append /hello.txt -
-```
-
-Use `-` as `LOCAL_PATH` to read from stdin.
-
-Options:
-
-| Option | Description |
-|---|---|
-| `--prefer-volume <NAME>` | Prefer writing to a specific volume name. |
-| `--offset <BYTES>` | Rewrite from a specific logical offset. Defaults to the current remote file size. |
-
----
-
-### `rm`
-
-Delete a remote file.
-
-```bash
-fs0 rm <REMOTE_PATH>
-```
-
-Example:
-
-```bash
-fs0 --config .local/fs0.local.toml rm /hello.txt
-```
-
----
-
-### `peers`
-
-Show known storage peers.
+### Inspect the cluster
 
 ```bash
 fs0 peers
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml peers
-fs0 --config .local/fs0.local.toml --json peers
-```
-
----
-
-### `central run`
-
-Run a central metadata server.
-
-```bash
-fs0 central run --config <PATH>
-```
-
-Example:
-
-```bash
-fs0 central run --config .local/fs0.local.toml
-```
-
----
-
-### `central status`
-
-Show central server status.
-
-```bash
 fs0 central status
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml central status
-fs0 --config .local/fs0.local.toml --json central status
+fs0 changes
 ```
 
 ---
 
-### `storage run`
+## Command-line options
 
-Run a storage node.
+This is the command layout. Run `fs0 -h` for concise help or `fs0 --help` for the full help text.
 
-```bash
-fs0 storage run --config <PATH>
-```
+    Usage: fs0 [OPTIONS] <COMMAND>
 
-Example:
+    Options:
+          --config <PATH>  Path to the fs0 config file; defaults to ~/.fs0/config.toml
+          --json             Print JSON output where supported
+      -h, --help             Print help
+      -V, --version          Print version
 
-```bash
-fs0 storage run --config .local/fs0.local.toml
-```
+    Commands:
+      ls          List a remote directory
+      stat        Show remote file metadata and read plan
+      cat         Print remote file bytes to stdout
+      get         Download a remote file
+      put         Upload a remote file
+      update      Update remote file data
+      rm          Delete a remote file
+      cp          Copy a remote file
+      mv          Move or rename a remote file
+      changes     List central file change events
+      peers       Show known storage peers
+      central     Run or inspect the central server
+      storage     Run storage nodes and manage local volumes
 
----
+### Top-level commands
 
-### `volume create`
-
-Create a central-backed local fs0 volume.
-
-```bash
-fs0 volume create <PATH> --name <NAME> --max-bytes <SIZE>
-```
-
-Examples:
-
-```bash
-fs0 --config .local/fs0.local.toml volume create ./data/volume-1 --name local-volume-1 --max-bytes 10G
-fs0 --config .local/fs0.local.toml volume create ./data/volume-2 --name local-volume-2 --max-bytes 500M
-```
-
-Supported size suffixes:
-
-| Suffix | Meaning |
+| Command | Description |
 |---|---|
-| `K` / `k` | KiB |
-| `M` / `m` | MiB |
-| `G` / `g` | GiB |
-| `T` / `t` | TiB |
+| `fs0 ls` | List a remote directory. |
+| `fs0 stat` | Show remote file metadata and read plan. |
+| `fs0 cat` | Print remote file bytes to stdout. |
+| `fs0 get` | Download a remote file. |
+| `fs0 put` | Upload a remote file. |
+| `fs0 update` | Update remote file data. |
+| `fs0 rm` | Delete a remote file. |
+| `fs0 cp` | Copy a remote file. |
+| `fs0 mv` | Move or rename a remote file. |
+| `fs0 changes` | List central file change events. |
+| `fs0 peers` | Show known storage peers. |
+| `fs0 central` | Run or inspect the central server. |
+| `fs0 storage` | Run storage nodes and manage local volumes. |
 
----
+### File and cluster commands
 
-### `volume meta`
+| Command | Arguments | Options | Defaults |
+|---|---|---|---|
+| `fs0 ls` | `[DIR]` | `--limit <N>`, `--cursor <CURSOR>` | `DIR=/`, `limit=100` |
+| `fs0 stat` | `<REMOTE_PATH>` | none | none |
+| `fs0 cat` | `<REMOTE_PATH>` | `--offset <BYTES>`, `--len <BYTES>` | `offset=0`, `len=full file` |
+| `fs0 get` | `<REMOTE_PATH> [LOCAL_PATH]` | `--offset <BYTES>`, `--len <BYTES>` | `LOCAL_PATH=remote file name`, `offset=0`, `len=full file` |
+| `fs0 put` | `<REMOTE_PATH> <LOCAL_PATH>` | `--prefer-volume <NAME>` | none |
+| `fs0 update` | `<REMOTE_PATH> <LOCAL_PATH>` | `--prefer-volume <NAME>`, `--offset <BYTES>` | `offset=remote file size` |
+| `fs0 rm` | `<REMOTE_PATH>` | none | none |
+| `fs0 cp` | `<SOURCE_PATH> <TARGET_PATH>` | none | none |
+| `fs0 mv` | `<SOURCE_PATH> <TARGET_PATH>` | none | none |
+| `fs0 changes` | none | `--cursor <CURSOR>`, `--limit <N>` | `cursor=0`, `limit=100` |
+| `fs0 peers` | none | none | none |
 
-Inspect local volume metadata.
+### Central commands
 
-```bash
-fs0 volume meta <PATH>
-```
+| Command | Arguments | Options | Defaults |
+|---|---|---|---|
+| `fs0 central run` | none | `--config <PATH>` | `~/.fs0/config.toml` |
+| `fs0 central status` | none | none | none |
 
-Example:
+### Storage commands
 
-```bash
-fs0 volume meta ./data/volume-1
-```
+| Command | Arguments | Options | Defaults |
+|---|---|---|---|
+| `fs0 storage run` | none | `--config <PATH>` | `~/.fs0/config.toml` |
+| `fs0 storage create-volume` | `<PATH>` | `--config <PATH>`, `--name <NAME>`, `--max-bytes <SIZE>` | `config=~/.fs0/config.toml` |
+| `fs0 storage inspect-volume` | `<PATH>` | none | none |
 
----
+`central run`, `storage run`, and `storage create-volume` read `[central]` or `[storage]` from the same config file.
 
-## Example Workflow
-
-```bash
-# Build
-cargo build --release -p fs0-cli
-
-# Start central
-target/release/fs0 central run --config .local/fs0.local.toml
-
-# In another terminal, create a central-backed volume
-target/release/fs0 --config .local/fs0.local.toml volume create .local/volume-1 --name local-volume-1 --max-bytes 10G
-
-# Run storage node after preparing config
-target/release/fs0 storage run --config .local/fs0.local.toml
-
-# Upload and read files
-target/release/fs0 --config .local/fs0.local.toml put /hello.txt ./hello.txt
-target/release/fs0 --config .local/fs0.local.toml ls /
-target/release/fs0 --config .local/fs0.local.toml cat /hello.txt
-target/release/fs0 --config .local/fs0.local.toml get /hello.txt ./hello.downloaded.txt
-```
-
+Supported size suffixes for `--max-bytes`: `K`, `M`, `G`, `T`.
 
 ## License
 

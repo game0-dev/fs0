@@ -41,6 +41,15 @@ impl Fs0Client {
             .await
     }
 
+    pub async fn update_path(
+        &self,
+        remote_path: &str,
+        local_path: impl AsRef<Path>,
+        options: WriteOptions,
+    ) -> Fs0Result<FileReadPlan> {
+        self.append_path(remote_path, local_path, options).await
+    }
+
     pub async fn put_from_reader<R>(
         &self,
         remote_path: &str,
@@ -79,6 +88,18 @@ impl Fs0Client {
     {
         self.append_from_reader_with_size_hint(remote_path, reader, options, None)
             .await
+    }
+
+    pub async fn update_from_reader<R>(
+        &self,
+        remote_path: &str,
+        reader: R,
+        options: WriteOptions,
+    ) -> Fs0Result<FileReadPlan>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.append_from_reader(remote_path, reader, options).await
     }
 
     pub async fn append_from_reader_with_size_hint<R>(

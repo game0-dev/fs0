@@ -161,24 +161,6 @@ impl Fs0Config {
     }
 }
 
-impl CentralConfig {
-    pub fn load_from(path: impl AsRef<Path>) -> Fs0Result<Self> {
-        load_toml(path)
-    }
-}
-
-impl StorageConfig {
-    pub fn load_from(path: impl AsRef<Path>) -> Fs0Result<Self> {
-        load_toml(path)
-    }
-}
-
-impl ClientConfig {
-    pub fn load_from(path: impl AsRef<Path>) -> Fs0Result<Self> {
-        load_toml(path)
-    }
-}
-
 fn load_toml<T>(path: impl AsRef<Path>) -> Fs0Result<T>
 where
     T: for<'de> Deserialize<'de>,

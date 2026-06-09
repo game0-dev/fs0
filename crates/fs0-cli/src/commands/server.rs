@@ -1,17 +1,22 @@
-use fs0_config::{CentralConfig, StorageConfig};
+use crate::commands::config_path;
+use fs0_config::Fs0Config;
 use fs0_core::Fs0Result;
 use std::path::PathBuf;
 
-pub(super) async fn run_central(config: PathBuf) -> Fs0Result<()> {
-    let server = fs0_central::CentralServer::run(CentralConfig::load_from(config)?).await?;
+pub(super) async fn run_central(config: &Option<PathBuf>) -> Fs0Result<()> {
+    let server =
+        fs0_central::CentralServer::run(Fs0Config::load_from(config_path(config))?.central()?)
+            .await?;
     println!("central endpoint: {:?}", server.control_endpoint());
     wait_for_shutdown_signal().await?;
     server.shutdown().await;
     Ok(())
 }
 
-pub(super) async fn run_storage(config: PathBuf) -> Fs0Result<()> {
-    let server = fs0_storage::StorageServer::run(StorageConfig::load_from(config)?).await?;
+pub(super) async fn run_storage(config: &Option<PathBuf>) -> Fs0Result<()> {
+    let server =
+        fs0_storage::StorageServer::run(Fs0Config::load_from(config_path(config))?.storage()?)
+            .await?;
     wait_for_shutdown_signal().await?;
     server.shutdown().await;
     Ok(())

@@ -1,18 +1,18 @@
-use crate::{commands::connect_client, output::print_volume_meta};
+use crate::{commands::config_path, output::print_volume_meta};
+use fs0_client::{ClientOptions, Fs0Client};
+use fs0_config::{ClientConfig, Fs0Config};
 use fs0_core::{Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY};
 use std::path::PathBuf;
 
 pub(super) async fn create(
-    cli_config: &Option<PathBuf>,
+    config: &Option<PathBuf>,
     path: PathBuf,
     name: String,
     max_bytes: String,
-    central: Option<PathBuf>,
 ) -> Fs0Result<()> {
     let max_bytes = parse_bytes(&max_bytes)?;
     fs0_volume::Volume::init_fs(&path, max_bytes)?;
-    let config = central.or_else(|| cli_config.clone());
-    let client = connect_client(&config).await?;
+    let client = connect_storage_control(config_path(config)).await?;
     let volume_id = client.create_volume(name, max_bytes).await?;
     client.shutdown().await?;
     let meta = fs0_volume::Volume::init_volume_id(path, volume_id)?;
@@ -20,7 +20,7 @@ pub(super) async fn create(
     Ok(())
 }
 
-pub(super) fn meta(path: PathBuf) -> Fs0Result<()> {
+pub(super) fn inspect(path: PathBuf) -> Fs0Result<()> {
     let volume = fs0_volume::Volume::open(
         path,
         VOLUME_READ_CONCURRENCY as u32,
@@ -28,6 +28,20 @@ pub(super) fn meta(path: PathBuf) -> Fs0Result<()> {
     )?;
     print_volume_meta(volume.meta());
     Ok(())
+}
+
+async fn connect_storage_control(config: PathBuf) -> Fs0Result<Fs0Client> {
+    let config = Fs0Config::load_from(config)?.storage()?;
+    Fs0Client::connect(
+        ClientConfig {
+            token: config.token,
+            central_endpoint_id: config.central_endpoint_id,
+            central_addr: config.central_addr,
+            relay: config.relay,
+        },
+        ClientOptions::default(),
+    )
+    .await
 }
 
 fn parse_bytes(value: &str) -> Fs0Result<u64> {

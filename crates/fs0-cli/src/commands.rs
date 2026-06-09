@@ -2,7 +2,7 @@ mod client;
 mod server;
 mod volume;
 
-use crate::cli::{CentralCommand, Cli, Command, StorageCommand, VolumeCommand};
+use crate::cli::{CentralCommand, Cli, Command, StorageCommand};
 use fs0_client::{ClientOptions, Fs0Client};
 use fs0_config::Fs0Config;
 use fs0_core::Fs0Result;
@@ -39,13 +39,13 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             )
             .await
         }
-        Command::Append {
+        Command::Update {
             remote_path,
             local_path,
             prefer_volume,
             offset,
         } => {
-            client::append(
+            client::update(
                 &cli.config,
                 cli.json,
                 remote_path,
@@ -56,43 +56,30 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             .await
         }
         Command::Rm { remote_path } => client::rm(&cli.config, remote_path).await,
-        Command::RmId { file_id } => client::rm_id(&cli.config, file_id).await,
         Command::Cp {
             source_path,
             target_path,
         } => client::cp(&cli.config, cli.json, source_path, target_path).await,
-        Command::CpById {
-            source_file_id,
-            target_path,
-        } => client::cp_by_id(&cli.config, cli.json, source_file_id, target_path).await,
         Command::Mv {
             source_path,
             target_path,
         } => client::mv(&cli.config, cli.json, source_path, target_path).await,
-        Command::MvById {
-            file_id,
-            target_path,
-        } => client::mv_by_id(&cli.config, cli.json, file_id, target_path).await,
-        Command::Changes {
-            after_event_id,
-            limit,
-        } => client::changes(&cli.config, cli.json, after_event_id, limit).await,
+        Command::Changes { cursor, limit } => {
+            client::changes(&cli.config, cli.json, cursor, limit).await
+        }
         Command::Peers => client::peers(&cli.config, cli.json).await,
         Command::Central { command } => match command {
-            CentralCommand::Run { config } => server::run_central(config).await,
+            CentralCommand::Run => server::run_central(&cli.config).await,
             CentralCommand::Status => client::central_status(&cli.config, cli.json).await,
         },
         Command::Storage { command } => match command {
-            StorageCommand::Run { config } => server::run_storage(config).await,
-        },
-        Command::Volume { command } => match command {
-            VolumeCommand::Create {
+            StorageCommand::Run => server::run_storage(&cli.config).await,
+            StorageCommand::CreateVolume {
                 path,
                 name,
                 max_bytes,
-                central,
-            } => volume::create(&cli.config, path, name, max_bytes, central).await,
-            VolumeCommand::Meta { path } => volume::meta(path),
+            } => volume::create(&cli.config, path, name, max_bytes).await,
+            StorageCommand::InspectVolume { path } => volume::inspect(path),
         },
     }
 }
@@ -113,5 +100,6 @@ fn default_config_path() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".fs0rc")
+        .join(".fs0")
+        .join("config.toml")
 }

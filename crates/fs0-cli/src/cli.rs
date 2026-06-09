@@ -2,9 +2,14 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "fs0", version, about = "append-only distributed storage")]
+#[command(name = "fs0", version, about = "distributed storage")]
 pub(crate) struct Cli {
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Path to the fs0 config file; defaults to ~/.fs0/config.toml"
+    )]
     pub(crate) config: Option<PathBuf>,
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -14,6 +19,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    #[command(about = "List a remote directory")]
     Ls {
         #[arg(default_value = "/")]
         dir: String,
@@ -22,6 +28,7 @@ pub(crate) enum Command {
         #[arg(long)]
         cursor: Option<u64>,
     },
+    #[command(about = "Print remote file bytes to stdout")]
     Cat {
         remote_path: String,
         #[arg(long, default_value_t = 0)]
@@ -29,9 +36,9 @@ pub(crate) enum Command {
         #[arg(long)]
         len: Option<u64>,
     },
-    Stat {
-        remote_path: String,
-    },
+    #[command(about = "Show remote file metadata and read plan")]
+    Stat { remote_path: String },
+    #[command(about = "Download a remote file")]
     Get {
         remote_path: String,
         local_path: Option<PathBuf>,
@@ -40,13 +47,15 @@ pub(crate) enum Command {
         #[arg(long)]
         len: Option<u64>,
     },
+    #[command(about = "Upload a remote file")]
     Put {
         remote_path: String,
         local_path: String,
         #[arg(long)]
         prefer_volume: Option<String>,
     },
-    Append {
+    #[command(about = "Update remote file data")]
+    Update {
         remote_path: String,
         local_path: String,
         #[arg(long)]
@@ -54,78 +63,59 @@ pub(crate) enum Command {
         #[arg(long)]
         offset: Option<u64>,
     },
-    Rm {
-        remote_path: String,
-    },
-    RmId {
-        file_id: u64,
-    },
+    #[command(about = "Delete a remote file")]
+    Rm { remote_path: String },
+    #[command(about = "Copy a remote file")]
     Cp {
         source_path: String,
         target_path: String,
     },
-    CpById {
-        source_file_id: u64,
-        target_path: String,
-    },
+    #[command(about = "Move or rename a remote file")]
     Mv {
         source_path: String,
         target_path: String,
     },
-    MvById {
-        file_id: u64,
-        target_path: String,
-    },
+    #[command(about = "List central file change events")]
     Changes {
-        #[arg(long, default_value_t = 0)]
-        after_event_id: u64,
+        #[arg(long = "cursor", default_value_t = 0)]
+        cursor: u64,
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    #[command(about = "Show known storage peers")]
     Peers,
+    #[command(about = "Run or inspect the central server")]
     Central {
         #[command(subcommand)]
         command: CentralCommand,
     },
+    #[command(about = "Run storage nodes and manage local volumes")]
     Storage {
         #[command(subcommand)]
         command: StorageCommand,
-    },
-    Volume {
-        #[command(subcommand)]
-        command: VolumeCommand,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum CentralCommand {
-    Run {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    #[command(about = "Run a central metadata server")]
+    Run,
+    #[command(about = "Show central server status")]
     Status,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum StorageCommand {
-    Run {
-        #[arg(long)]
-        config: PathBuf,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum VolumeCommand {
-    Create {
+    #[command(about = "Run a storage node")]
+    Run,
+    #[command(about = "Create and register a local volume")]
+    CreateVolume {
         path: PathBuf,
         #[arg(long)]
         name: String,
         #[arg(long)]
         max_bytes: String,
-        #[arg(long)]
-        central: Option<PathBuf>,
     },
-    Meta {
-        path: PathBuf,
-    },
+    #[command(about = "Inspect local volume metadata")]
+    InspectVolume { path: PathBuf },
 }
