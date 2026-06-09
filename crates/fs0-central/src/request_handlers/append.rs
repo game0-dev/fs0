@@ -260,7 +260,7 @@ fn commit_append_tx(tx: &CentralTx<'_>, request: CommitAppendRequest) -> Fs0Resu
 
     let file = tx.get_file_by_id(lease.file_id)?;
     if file.size_bytes != request.base_size {
-        return Err(Fs0Error::VersionConflict);
+        return Err(file_version_conflict());
     }
 
     let first_bundle_index = lease.offset_bytes / VOLUME_BUNDLE_RAW_SIZE;
@@ -439,13 +439,19 @@ fn validate_append_base(
     new_size: u64,
 ) -> Fs0Result<()> {
     if lease.base_size_bytes != base_size {
-        return Err(Fs0Error::VersionConflict);
+        return Err(file_version_conflict());
     }
     if new_size < lease.offset_bytes {
         return Err(Fs0Error::InvalidRequest);
     }
 
     Ok(())
+}
+
+fn file_version_conflict() -> Fs0Error {
+    Fs0Error::VersionConflict {
+        message: "file changed while append lease was active".to_owned(),
+    }
 }
 
 #[cfg(test)]

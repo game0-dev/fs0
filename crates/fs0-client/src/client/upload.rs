@@ -203,7 +203,9 @@ impl Fs0Client {
 
         let plan = self.get_file_read_plan_by_id(lease.file_id).await?;
         if plan.size != lease.base_size {
-            return Err(Fs0Error::VersionConflict);
+            return Err(Fs0Error::VersionConflict {
+                message: "file changed while append lease was active".to_owned(),
+            });
         }
 
         rewrite_offset_for_plan(&plan, lease.offset)

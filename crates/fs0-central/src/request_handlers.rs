@@ -3,7 +3,10 @@ mod client;
 mod storage;
 
 use crate::{Fs0Error, Fs0Result, server::CentralServer};
-use fs0_core::protocol::{ControlRequest, ControlResponse, StoragePeerInfo};
+use fs0_core::{
+    FS0_VERSION,
+    protocol::{ControlRequest, ControlResponse, StoragePeerInfo},
+};
 use fs0_transport::Connection;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -21,8 +24,14 @@ pub(crate) async fn handle_control_request(
     identity: &mut ControlConnectionIdentity,
 ) -> ControlResponse {
     let response = match request {
-        ControlRequest::RegisterClient { name: _, token } => {
-            match register_client(server, token, connection.clone()) {
+        ControlRequest::RegisterClient {
+            name: _,
+            token,
+            version,
+        } => {
+            match validate_registration_version(&version)
+                .and_then(|_| register_client(server, token, connection.clone()))
+            {
                 Ok((client_id, storages)) => {
                     *identity = ControlConnectionIdentity::Client(client_id);
                     Ok(ControlResponse::RegisterClient {
@@ -36,17 +45,20 @@ pub(crate) async fn handle_control_request(
         ControlRequest::RegisterStorage {
             name,
             token,
+            version,
             volumes,
             iroh_endpoint,
         } => {
-            match storage::register_storage(
-                server,
-                name,
-                token,
-                volumes,
-                iroh_endpoint,
-                connection.clone(),
-            ) {
+            match validate_registration_version(&version).and_then(|_| {
+                storage::register_storage(
+                    server,
+                    name,
+                    token,
+                    volumes,
+                    iroh_endpoint,
+                    connection.clone(),
+                )
+            }) {
                 Ok((storage_id, storages)) => {
                     *identity = ControlConnectionIdentity::Storage(storage_id);
                     Ok(ControlResponse::RegisterStorage {
@@ -69,6 +81,18 @@ pub(crate) async fn handle_control_request(
     };
 
     response.unwrap_or_else(ControlResponse::Error)
+}
+
+fn validate_registration_version(version: &str) -> Fs0Result<()> {
+    if version == FS0_VERSION {
+        return Ok(());
+    }
+
+    Err(Fs0Error::VersionConflict {
+        message: format!(
+            "fs0 version mismatch: expected {FS0_VERSION}, got {version}; please update fs0 client and storage binaries"
+        ),
+    })
 }
 
 async fn handle_client_request(
@@ -173,5 +197,29 @@ fn register_client(
 fn unregister_client(server: &CentralServer, client_id: u64) {
     if let Some(client) = server.clients.write().remove(&client_id) {
         client.connection.close(b"central client unregistered");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_matching_registration_version() {
+        assert_eq!(validate_registration_version(FS0_VERSION), Ok(()));
+    }
+
+    #[test]
+    fn rejects_mismatched_registration_version() {
+        let err = validate_registration_version("0.0.1").unwrap_err();
+
+        match err {
+            Fs0Error::VersionConflict { message } => {
+                assert!(message.contains(FS0_VERSION));
+                assert!(message.contains("0.0.1"));
+                assert!(message.contains("update"));
+            }
+            err => panic!("unexpected error: {err:?}"),
+        }
     }
 }

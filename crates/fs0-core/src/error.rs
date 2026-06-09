@@ -43,8 +43,8 @@ pub enum Fs0Error {
     NotFound,
     #[error("volume already mounted")]
     VolumeAlreadyMounted,
-    #[error("version conflict")]
-    VersionConflict,
+    #[error("version conflict: {message}")]
+    VersionConflict { message: String },
     #[error("chunk not ready")]
     ChunkNotReady,
     #[error("invalid request")]

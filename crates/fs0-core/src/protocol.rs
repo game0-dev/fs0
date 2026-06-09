@@ -63,10 +63,12 @@ pub enum ControlRequest {
     RegisterClient {
         name: Option<String>,
         token: String,
+        version: String,
     },
     RegisterStorage {
         name: String,
         token: String,
+        version: String,
         volumes: Vec<StorageVolumeInfo>,
         iroh_endpoint: Vec<u8>,
     },

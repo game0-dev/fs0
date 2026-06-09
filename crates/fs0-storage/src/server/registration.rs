@@ -1,7 +1,10 @@
 use crate::{Fs0Error, Fs0Result, StorageConfig};
-use fs0_core::protocol::{
-    ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
-    StorageVolumeInfo,
+use fs0_core::{
+    FS0_VERSION,
+    protocol::{
+        ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
+        StorageVolumeInfo,
+    },
 };
 use fs0_transport::{Connection, EndpointAddr, EndpointId};
 use fs0_volume::Volume;
@@ -119,6 +122,7 @@ pub(super) async fn register_storage(
         .rpc(ProtocolRequest::Control(ControlRequest::RegisterStorage {
             name: config.name.clone(),
             token: config.token.clone(),
+            version: FS0_VERSION.to_owned(),
             volumes,
             iroh_endpoint: data_endpoint,
         }))

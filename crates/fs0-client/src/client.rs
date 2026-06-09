@@ -7,7 +7,8 @@ mod upload;
 pub use fs0_config::ClientConfig;
 use fs0_config::Fs0Config;
 use fs0_core::{
-    DEFAULT_CLIENT_DATA_CONCURRENCY, Fs0Error, Fs0Result, HashId, TRANSPORT_CONTROL_ALPN,
+    DEFAULT_CLIENT_DATA_CONCURRENCY, FS0_VERSION, Fs0Error, Fs0Result, HashId,
+    TRANSPORT_CONTROL_ALPN,
     protocol::{
         ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
     },
@@ -130,6 +131,7 @@ impl Fs0Client {
             ControlRequest::RegisterClient {
                 name: options.name.clone(),
                 token: token.clone(),
+                version: FS0_VERSION.to_owned(),
             },
         )
         .await?;

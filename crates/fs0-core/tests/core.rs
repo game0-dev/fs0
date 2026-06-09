@@ -1,5 +1,5 @@
 use fs0_core::{
-    DEFAULT_ZSTD_LEVEL, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
+    DEFAULT_ZSTD_LEVEL, FS0_VERSION, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
     protocol::{
         AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent,
         BundleReplicaEventKind, CentralAdminRequest, CentralAdminResponse, CentralAdminStatus,
@@ -139,7 +139,9 @@ fn protocol_requests_roundtrip() {
 #[test]
 fn protocol_responses_roundtrip() {
     let storage = storage_peer();
-    assert_postcard_roundtrip(&ProtocolResponse::Error(Fs0Error::VersionConflict));
+    assert_postcard_roundtrip(&ProtocolResponse::Error(Fs0Error::VersionConflict {
+        message: "please update fs0".to_owned(),
+    }));
     assert_postcard_roundtrip(&ProtocolResponse::Control(ControlResponse::CentralStatus {
         clients_count: 1,
         storages: vec![storage.clone()],
@@ -167,10 +169,12 @@ fn control_requests_roundtrip() {
     assert_postcard_roundtrip(&ControlRequest::RegisterClient {
         name: Some("client-a".to_owned()),
         token: "client-token".to_owned(),
+        version: FS0_VERSION.to_owned(),
     });
     assert_postcard_roundtrip(&ControlRequest::RegisterStorage {
         name: "storage-a".to_owned(),
         token: "storage-token".to_owned(),
+        version: FS0_VERSION.to_owned(),
         volumes: storage_peer().volumes,
         iroh_endpoint: vec![1, 2, 3],
     });
@@ -249,7 +253,9 @@ fn control_requests_roundtrip() {
 #[test]
 fn control_responses_roundtrip() {
     let storage = storage_peer();
-    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict));
+    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict {
+        message: "please update fs0".to_owned(),
+    }));
     assert_postcard_roundtrip(&ControlResponse::RegisterClient {
         client_id: 42,
         storages: vec![storage.clone()],
