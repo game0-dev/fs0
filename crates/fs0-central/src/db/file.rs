@@ -133,7 +133,7 @@ impl CentralTx<'_> {
         self.get_file_by_id(file_id)
     }
 
-    pub(crate) fn update_file_after_append(
+    pub(crate) fn update_file_after_update(
         &self,
         file_id: u64,
         new_size: u64,

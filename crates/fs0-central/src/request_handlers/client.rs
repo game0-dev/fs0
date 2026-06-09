@@ -37,7 +37,7 @@ pub(super) fn get_file_read_plan(server: &CentralServer, path: &str) -> Fs0Resul
         let mut db = server.db.lock();
         let tx = db.tx()?;
         let file = tx.get_file_by_path(path)?;
-        let plan = super::append::get_file_read_plan_tx(&tx, file.file_id)?;
+        let plan = super::update::get_file_read_plan_tx(&tx, file.file_id)?;
         tx.commit()?;
         plan
     };
@@ -52,7 +52,7 @@ pub(super) fn get_file_read_plan_by_id(
     let plan = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
-        let plan = super::append::get_file_read_plan_tx(&tx, file_id)?;
+        let plan = super::update::get_file_read_plan_tx(&tx, file_id)?;
         tx.commit()?;
         plan
     };

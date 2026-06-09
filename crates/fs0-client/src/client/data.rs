@@ -268,22 +268,21 @@ impl Fs0Client {
         data_endpoint: &[u8],
     ) -> Fs0Result<Connection> {
         let data_endpoint = decode_endpoint_addr(data_endpoint)?;
+        let client_id = self.client_id();
         let connection = self
             .endpoint
             .connect(data_endpoint, TRANSPORT_DATA_ALPN)
             .await?;
         match connection
             .rpc(ProtocolRequest::Data(DataRequest::Authenticate {
-                client_id: self.client_id,
+                client_id,
                 client_token: self.token.clone(),
             }))
             .await?
         {
-            ProtocolResponse::Data(DataResponse::Authenticate { client_id })
-                if client_id == self.client_id =>
-            {
-                Ok(connection)
-            }
+            ProtocolResponse::Data(DataResponse::Authenticate {
+                client_id: authenticated_client_id,
+            }) if authenticated_client_id == client_id => Ok(connection),
             ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => {
                 Err(err)
             }

@@ -114,9 +114,9 @@ pub enum ControlRequest {
         after_event_id: u64,
         limit: u32,
     },
-    BeginAppend(BeginAppendRequest),
-    CommitAppend(CommitAppendRequest),
-    AbortAppend {
+    BeginUpdate(BeginUpdateRequest),
+    CommitUpdate(CommitUpdateRequest),
+    AbortUpdate {
         lease_id: u64,
         file_id: u64,
     },
@@ -165,9 +165,9 @@ pub enum ControlResponse {
     RenameFile(FileRecord),
     RenameFileById(FileRecord),
     GetFileChangeLogs(FileChangeLogs),
-    BeginAppend(AppendLease),
-    CommitAppend(FileReadPlan),
-    AbortAppend,
+    BeginUpdate(UpdateLease),
+    CommitUpdate(FileReadPlan),
+    AbortUpdate,
     GrantUploadLease {
         lease_id: u64,
     },
@@ -326,11 +326,11 @@ pub struct DirectoryEntries {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BeginAppendRequest {
+pub struct BeginUpdateRequest {
     pub path: String,
     pub offset: u64,
     pub prefer_volume_name: Option<String>,
-    pub append_size_hint: Option<u64>,
+    pub update_size_hint: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,7 +344,7 @@ pub struct GrantUploadLeaseRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendLease {
+pub struct UpdateLease {
     pub lease_id: u64,
     pub file_id: u64,
     pub volume_id: u64,
@@ -355,7 +355,7 @@ pub struct AppendLease {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitAppendRequest {
+pub struct CommitUpdateRequest {
     pub lease_id: u64,
     pub file_id: u64,
     pub base_size: u64,

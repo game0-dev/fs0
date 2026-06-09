@@ -1,7 +1,7 @@
 use crate::Fs0Result;
 use fs0_core::{
     Fs0Error, SqliteRowExt,
-    protocol::AppendLease,
+    protocol::UpdateLease,
     utils::{i64_to_u64, now_ms, u64_to_i64},
 };
 use rusqlite::{OptionalExtension, params};
@@ -16,7 +16,7 @@ pub(crate) struct LeaseRecord {
 }
 
 #[derive(Debug)]
-pub(crate) struct CreateAppendLease {
+pub(crate) struct CreateUpdateLease {
     pub(crate) file_id: u64,
     pub(crate) volume_id: u64,
     pub(crate) base_size_bytes: u64,
@@ -27,21 +27,21 @@ pub(crate) struct CreateAppendLease {
 }
 
 impl CentralTx<'_> {
-    pub(crate) fn delete_expired_append_leases(&self, now_ms: u64) -> Fs0Result<()> {
+    pub(crate) fn delete_expired_update_leases(&self, now_ms: u64) -> Fs0Result<()> {
         self.inner.execute(
-            "DELETE FROM append_leases
+            "DELETE FROM update_leases
              WHERE expires_at_ms <= ?1",
             params![u64_to_i64(now_ms, "expires_at_ms")?],
         )?;
         Ok(())
     }
 
-    pub(crate) fn file_has_active_append_lease(&self, file_id: u64) -> Fs0Result<bool> {
+    pub(crate) fn file_has_active_update_lease(&self, file_id: u64) -> Fs0Result<bool> {
         let active_lease = self
             .inner
             .query_row(
                 "SELECT lease_id
-                 FROM append_leases
+                 FROM update_leases
                  WHERE file_id = ?1
                  LIMIT 1",
                 params![u64_to_i64(file_id, "file_id")?],
@@ -51,9 +51,9 @@ impl CentralTx<'_> {
         Ok(active_lease.is_some())
     }
 
-    pub(crate) fn create_append_lease(&self, lease: CreateAppendLease) -> Fs0Result<AppendLease> {
+    pub(crate) fn create_update_lease(&self, lease: CreateUpdateLease) -> Fs0Result<UpdateLease> {
         self.inner.execute(
-            "INSERT INTO append_leases (
+            "INSERT INTO update_leases (
                 file_id, volume_id, base_size_bytes,
                 offset_bytes, prefer_volume_name, expires_at_ms, created_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -69,7 +69,7 @@ impl CentralTx<'_> {
         )?;
         let lease_id = i64_to_u64(self.inner.last_insert_rowid(), "lease_id")?;
 
-        Ok(AppendLease {
+        Ok(UpdateLease {
             lease_id,
             file_id: lease.file_id,
             volume_id: lease.volume_id,
@@ -80,7 +80,7 @@ impl CentralTx<'_> {
         })
     }
 
-    pub(crate) fn load_active_append_lease(
+    pub(crate) fn load_active_update_lease(
         &self,
         lease_id: u64,
         file_id: u64,
@@ -88,7 +88,7 @@ impl CentralTx<'_> {
         self.inner
             .query_row(
                 "SELECT file_id, base_size_bytes, offset_bytes
-                 FROM append_leases
+                 FROM update_leases
                  WHERE lease_id = ?1
                    AND file_id = ?2
                    AND expires_at_ms > ?3",
@@ -109,11 +109,11 @@ impl CentralTx<'_> {
             .ok_or(Fs0Error::NotFound)
     }
 
-    pub(crate) fn active_append_lease_volume(&self, lease_id: u64, file_id: u64) -> Fs0Result<u64> {
+    pub(crate) fn active_update_lease_volume(&self, lease_id: u64, file_id: u64) -> Fs0Result<u64> {
         self.inner
             .query_row(
                 "SELECT volume_id
-                 FROM append_leases
+                 FROM update_leases
                  WHERE lease_id = ?1
                    AND file_id = ?2
                    AND expires_at_ms > ?3",
@@ -128,9 +128,9 @@ impl CentralTx<'_> {
             .ok_or(Fs0Error::NotFound)
     }
 
-    pub(crate) fn delete_append_lease(&self, lease_id: u64) -> Fs0Result<()> {
+    pub(crate) fn delete_update_lease(&self, lease_id: u64) -> Fs0Result<()> {
         self.inner.execute(
-            "DELETE FROM append_leases
+            "DELETE FROM update_leases
              WHERE lease_id = ?1",
             params![u64_to_i64(lease_id, "lease_id")?],
         )?;

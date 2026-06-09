@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS bundle_replicas (
 CREATE INDEX IF NOT EXISTS idx_bundle_replicas_volume
   ON bundle_replicas(volume_id);
 
-CREATE TABLE IF NOT EXISTS append_leases (
+CREATE TABLE IF NOT EXISTS update_leases (
   lease_id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_id INTEGER NOT NULL,
   volume_id INTEGER NOT NULL,
@@ -77,8 +77,8 @@ CREATE TABLE IF NOT EXISTS append_leases (
   FOREIGN KEY (volume_id) REFERENCES volumes(volume_id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_append_leases_file
-  ON append_leases(file_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_update_leases_file
+  ON update_leases(file_id);
 
 CREATE TABLE IF NOT EXISTS file_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,

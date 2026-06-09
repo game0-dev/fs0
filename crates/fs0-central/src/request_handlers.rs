@@ -1,6 +1,6 @@
-mod append;
 mod client;
 mod storage;
+mod update;
 
 use crate::{Fs0Error, Fs0Result, server::CentralServer};
 use fs0_core::{
@@ -88,10 +88,9 @@ fn validate_registration_version(version: &str) -> Fs0Result<()> {
         return Ok(());
     }
 
-    Err(Fs0Error::VersionConflict {
-        message: format!(
-            "fs0 version mismatch: expected {FS0_VERSION}, got {version}; please update fs0 client and storage binaries"
-        ),
+    Err(Fs0Error::Fs0Version {
+        required: FS0_VERSION.to_owned(),
+        actual: version.to_owned(),
     })
 }
 
@@ -133,10 +132,10 @@ async fn handle_client_request(
             after_event_id,
             limit,
         } => client::get_file_change_logs(server, after_event_id, limit),
-        ControlRequest::BeginAppend(request) => append::begin_append(server, request).await,
-        ControlRequest::CommitAppend(request) => append::commit_append(server, request).await,
-        ControlRequest::AbortAppend { lease_id, file_id } => {
-            append::abort_append(server, lease_id, file_id).await
+        ControlRequest::BeginUpdate(request) => update::begin_update(server, request).await,
+        ControlRequest::CommitUpdate(request) => update::commit_update(server, request).await,
+        ControlRequest::AbortUpdate { lease_id, file_id } => {
+            update::abort_update(server, lease_id, file_id).await
         }
         _ => Err(Fs0Error::Unauthorized),
     }
@@ -214,10 +213,9 @@ mod tests {
         let err = validate_registration_version("0.0.1").unwrap_err();
 
         match err {
-            Fs0Error::VersionConflict { message } => {
-                assert!(message.contains(FS0_VERSION));
-                assert!(message.contains("0.0.1"));
-                assert!(message.contains("update"));
+            Fs0Error::Fs0Version { required, actual } => {
+                assert_eq!(required, FS0_VERSION);
+                assert_eq!(actual, "0.0.1");
             }
             err => panic!("unexpected error: {err:?}"),
         }

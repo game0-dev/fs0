@@ -44,10 +44,10 @@ pub const VOLUME_WRITE_CONCURRENCY: usize = 1;
 pub const VOLUME_MAX_OPEN_DATA_FILES: usize = 2048;
 /// Idle time before an unused backing data file handle is closed.
 pub const VOLUME_DATA_FILE_IDLE_TTL_MS: u64 = 60_000; // 60s
-/// Lifetime for append leases issued by central.
-pub const APPEND_LEASE_TTL_MS: u64 = 60_000;
-/// Maximum volume usage ratio accepted for new append placement.
-pub const APPEND_VOLUME_USAGE_THRESHOLD: f64 = 0.95;
+/// Lifetime for update leases issued by central.
+pub const UPDATE_LEASE_TTL_MS: u64 = 60_000;
+/// Maximum volume usage ratio accepted for new update placement.
+pub const UPDATE_VOLUME_USAGE_THRESHOLD: f64 = 0.95;
 /// Default number of concurrent chunk uploads from the client.
 pub const DEFAULT_CLIENT_DATA_CONCURRENCY: usize = 32;
 /// Default desired replica count for newly written data.

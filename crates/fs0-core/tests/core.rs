@@ -1,13 +1,13 @@
 use fs0_core::{
     DEFAULT_ZSTD_LEVEL, FS0_VERSION, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
     protocol::{
-        AppendLease, BeginAppendRequest, BundleChunkRef, BundleReplicaEvent,
-        BundleReplicaEventKind, CentralAdminRequest, CentralAdminResponse, CentralAdminStatus,
-        CommitAppendRequest, CommittedBundle, ControlRequest, ControlResponse, DataRequest,
-        DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind,
-        FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest, ProtocolEvent,
-        ProtocolRequest, ProtocolResponse, ReplicaLocation, StorageAdminRequest,
-        StorageAdminResponse, StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo,
+        BeginUpdateRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
+        CentralAdminRequest, CentralAdminResponse, CentralAdminStatus, CommitUpdateRequest,
+        CommittedBundle, ControlRequest, ControlResponse, DataRequest, DataResponse,
+        DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind, FileChangeLogs,
+        FileReadPlan, FileRecord, GrantUploadLeaseRequest, ProtocolEvent, ProtocolRequest,
+        ProtocolResponse, ReplicaLocation, StorageAdminRequest, StorageAdminResponse,
+        StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo, UpdateLease,
     },
     zstd_compress, zstd_decompress,
 };
@@ -139,8 +139,9 @@ fn protocol_requests_roundtrip() {
 #[test]
 fn protocol_responses_roundtrip() {
     let storage = storage_peer();
-    assert_postcard_roundtrip(&ProtocolResponse::Error(Fs0Error::VersionConflict {
-        message: "please update fs0".to_owned(),
+    assert_postcard_roundtrip(&ProtocolResponse::Error(Fs0Error::Fs0Version {
+        required: FS0_VERSION.to_owned(),
+        actual: "0.0.1".to_owned(),
     }));
     assert_postcard_roundtrip(&ProtocolResponse::Control(ControlResponse::CentralStatus {
         clients_count: 1,
@@ -216,20 +217,20 @@ fn control_requests_roundtrip() {
         after_event_id: 11,
         limit: 200,
     });
-    assert_postcard_roundtrip(&ControlRequest::BeginAppend(BeginAppendRequest {
+    assert_postcard_roundtrip(&ControlRequest::BeginUpdate(BeginUpdateRequest {
         path: "/a.txt".to_owned(),
         offset: 0,
         prefer_volume_name: Some("hot".to_owned()),
-        append_size_hint: Some(512),
+        update_size_hint: Some(512),
     }));
-    assert_postcard_roundtrip(&ControlRequest::CommitAppend(CommitAppendRequest {
+    assert_postcard_roundtrip(&ControlRequest::CommitUpdate(CommitUpdateRequest {
         lease_id: 9,
         file_id: 11,
         base_size: 0,
         new_size: 512,
         bundles: vec![committed_bundle()],
     }));
-    assert_postcard_roundtrip(&ControlRequest::AbortAppend {
+    assert_postcard_roundtrip(&ControlRequest::AbortUpdate {
         lease_id: 9,
         file_id: 11,
     });
@@ -254,7 +255,11 @@ fn control_requests_roundtrip() {
 fn control_responses_roundtrip() {
     let storage = storage_peer();
     assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict {
-        message: "please update fs0".to_owned(),
+        message: "file changed while update lease was active".to_owned(),
+    }));
+    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::Fs0Version {
+        required: FS0_VERSION.to_owned(),
+        actual: "0.0.1".to_owned(),
     }));
     assert_postcard_roundtrip(&ControlResponse::RegisterClient {
         client_id: 42,
@@ -284,7 +289,7 @@ fn control_responses_roundtrip() {
         }],
         next_event_id: Some(2),
     }));
-    assert_postcard_roundtrip(&ControlResponse::BeginAppend(AppendLease {
+    assert_postcard_roundtrip(&ControlResponse::BeginUpdate(UpdateLease {
         lease_id: 9,
         file_id: 3,
         volume_id: 4,
@@ -293,8 +298,8 @@ fn control_responses_roundtrip() {
         expires_at_ms: 2000,
         prefer_volume_name: Some("hot".to_owned()),
     }));
-    assert_postcard_roundtrip(&ControlResponse::CommitAppend(file_read_plan()));
-    assert_postcard_roundtrip(&ControlResponse::AbortAppend);
+    assert_postcard_roundtrip(&ControlResponse::CommitUpdate(file_read_plan()));
+    assert_postcard_roundtrip(&ControlResponse::AbortUpdate);
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlan(file_read_plan()));
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlanById(file_read_plan()));
     assert_postcard_roundtrip(&ControlResponse::DeleteFile);

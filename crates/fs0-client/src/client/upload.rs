@@ -4,8 +4,8 @@ use fs0_core::{
     DEFAULT_ZSTD_LEVEL, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE, blake3_hash,
     bundle_hash_from_chunks,
     protocol::{
-        AppendLease, BeginAppendRequest, BundleChunkRef, CommitAppendRequest, CommittedBundle,
-        FileReadPlan,
+        BeginUpdateRequest, BundleChunkRef, CommitUpdateRequest, CommittedBundle, FileReadPlan,
+        UpdateLease,
     },
     zstd_compress,
 };
@@ -20,24 +20,10 @@ impl Fs0Client {
         options: WriteOptions,
     ) -> Fs0Result<FileReadPlan> {
         let local_path = local_path.as_ref();
-        let append_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
+        let update_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
         let file = tokio::fs::File::open(local_path).await?;
 
-        self.put_from_reader_with_size_hint(remote_path, file, options, append_size_hint)
-            .await
-    }
-
-    pub async fn append_path(
-        &self,
-        remote_path: &str,
-        local_path: impl AsRef<Path>,
-        options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan> {
-        let local_path = local_path.as_ref();
-        let append_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
-        let file = tokio::fs::File::open(local_path).await?;
-
-        self.append_from_reader_with_size_hint(remote_path, file, options, append_size_hint)
+        self.put_from_reader_with_size_hint(remote_path, file, options, update_size_hint)
             .await
     }
 
@@ -47,7 +33,12 @@ impl Fs0Client {
         local_path: impl AsRef<Path>,
         options: WriteOptions,
     ) -> Fs0Result<FileReadPlan> {
-        self.append_path(remote_path, local_path, options).await
+        let local_path = local_path.as_ref();
+        let update_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
+        let file = tokio::fs::File::open(local_path).await?;
+
+        self.update_from_reader_with_size_hint(remote_path, file, options, update_size_hint)
+            .await
     }
 
     pub async fn put_from_reader<R>(
@@ -68,25 +59,12 @@ impl Fs0Client {
         remote_path: &str,
         reader: R,
         options: WriteOptions,
-        append_size_hint: Option<u64>,
+        update_size_hint: Option<u64>,
     ) -> Fs0Result<FileReadPlan>
     where
         R: AsyncRead + Unpin,
     {
-        self.write_from_reader(remote_path, reader, options, 0, append_size_hint)
-            .await
-    }
-
-    pub async fn append_from_reader<R>(
-        &self,
-        remote_path: &str,
-        reader: R,
-        options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan>
-    where
-        R: AsyncRead + Unpin,
-    {
-        self.append_from_reader_with_size_hint(remote_path, reader, options, None)
+        self.write_from_reader(remote_path, reader, options, 0, update_size_hint)
             .await
     }
 
@@ -99,15 +77,16 @@ impl Fs0Client {
     where
         R: AsyncRead + Unpin,
     {
-        self.append_from_reader(remote_path, reader, options).await
+        self.update_from_reader_with_size_hint(remote_path, reader, options, None)
+            .await
     }
 
-    pub async fn append_from_reader_with_size_hint<R>(
+    pub async fn update_from_reader_with_size_hint<R>(
         &self,
         remote_path: &str,
         reader: R,
         options: WriteOptions,
-        append_size_hint: Option<u64>,
+        update_size_hint: Option<u64>,
     ) -> Fs0Result<FileReadPlan>
     where
         R: AsyncRead + Unpin,
@@ -117,7 +96,7 @@ impl Fs0Client {
             None => self.get_file_read_plan(remote_path).await?.size,
         };
 
-        self.write_from_reader(remote_path, reader, options, offset, append_size_hint)
+        self.write_from_reader(remote_path, reader, options, offset, update_size_hint)
             .await
     }
 
@@ -127,23 +106,23 @@ impl Fs0Client {
         reader: R,
         options: WriteOptions,
         offset: u64,
-        append_size_hint: Option<u64>,
+        update_size_hint: Option<u64>,
     ) -> Fs0Result<FileReadPlan>
     where
         R: AsyncRead + Unpin,
     {
         let lease = self
-            .begin_append(BeginAppendRequest {
+            .begin_update(BeginUpdateRequest {
                 path: remote_path.to_owned(),
                 offset,
                 prefer_volume_name: options.prefer_volume_name,
-                append_size_hint,
+                update_size_hint,
             })
             .await?;
         let rewrite_offset = match self.rewrite_offset_for_lease(&lease).await {
             Ok(rewrite_offset) => rewrite_offset,
             Err(err) => {
-                let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                let _ = self.abort_update(lease.lease_id, lease.file_id).await;
                 return Err(err);
             }
         };
@@ -160,7 +139,7 @@ impl Fs0Client {
             {
                 Ok(prefix) => prefix,
                 Err(err) => {
-                    let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                    let _ = self.abort_update(lease.lease_id, lease.file_id).await;
                     return Err(err);
                 }
             }
@@ -175,7 +154,7 @@ impl Fs0Client {
         {
             Ok((new_size, bundles)) => {
                 let commit = self
-                    .commit_append(CommitAppendRequest {
+                    .commit_update(CommitUpdateRequest {
                         lease_id: lease.lease_id,
                         file_id: lease.file_id,
                         base_size: lease.base_size,
@@ -184,19 +163,19 @@ impl Fs0Client {
                     })
                     .await;
                 if commit.is_err() {
-                    let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                    let _ = self.abort_update(lease.lease_id, lease.file_id).await;
                 }
 
                 commit
             }
             Err(err) => {
-                let _ = self.abort_append(lease.lease_id, lease.file_id).await;
+                let _ = self.abort_update(lease.lease_id, lease.file_id).await;
                 Err(err)
             }
         }
     }
 
-    async fn rewrite_offset_for_lease(&self, lease: &AppendLease) -> Fs0Result<u64> {
+    async fn rewrite_offset_for_lease(&self, lease: &UpdateLease) -> Fs0Result<u64> {
         if lease.base_size == 0 {
             return Ok(0);
         }
@@ -204,7 +183,7 @@ impl Fs0Client {
         let plan = self.get_file_read_plan_by_id(lease.file_id).await?;
         if plan.size != lease.base_size {
             return Err(Fs0Error::VersionConflict {
-                message: "file changed while append lease was active".to_owned(),
+                message: "file changed while update lease was active".to_owned(),
             });
         }
 
@@ -213,7 +192,7 @@ impl Fs0Client {
 
     async fn write_lease_from_reader<R>(
         &self,
-        lease: AppendLease,
+        lease: UpdateLease,
         rewrite_offset: u64,
         mut reader: R,
     ) -> Fs0Result<(u64, Vec<CommittedBundle>)>
@@ -303,7 +282,7 @@ impl Fs0Client {
         Ok((next_size, committed))
     }
 
-    fn upload_target(&self, lease: &AppendLease) -> Fs0Result<StorageTarget> {
+    fn upload_target(&self, lease: &UpdateLease) -> Fs0Result<StorageTarget> {
         self.storages
             .read()
             .iter()

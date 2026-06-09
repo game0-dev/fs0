@@ -59,6 +59,11 @@ impl Connection {
         read_frame(&mut recv).await
     }
 
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.iroh_connection.close_reason().is_some()
+    }
+
     pub async fn serve<F, Fut>(&self, handler: F) -> Fs0Result<()>
     where
         F: Fn(ProtocolRequest) -> Fut + Clone + Send + 'static,

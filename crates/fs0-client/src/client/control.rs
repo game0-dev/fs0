@@ -1,8 +1,11 @@
-use super::{CentralStatus, Fs0Client, ListOptions, request_control, unexpected_control_response};
+use super::{
+    CentralStatus, ControlRequestError, Fs0Client, ListOptions, request_control_result,
+    unexpected_control_response,
+};
 use crate::Fs0Result;
 use fs0_core::protocol::{
-    AppendLease, BeginAppendRequest, CommitAppendRequest, ControlRequest, ControlResponse,
-    DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord,
+    BeginUpdateRequest, CommitUpdateRequest, ControlRequest, ControlResponse, DirectoryEntries,
+    FileChangeLogs, FileReadPlan, FileRecord, UpdateLease,
 };
 
 impl Fs0Client {
@@ -154,26 +157,26 @@ impl Fs0Client {
         }
     }
 
-    pub async fn begin_append(&self, request: BeginAppendRequest) -> Fs0Result<AppendLease> {
-        match self.request(ControlRequest::BeginAppend(request)).await? {
-            ControlResponse::BeginAppend(lease) => Ok(lease),
+    pub async fn begin_update(&self, request: BeginUpdateRequest) -> Fs0Result<UpdateLease> {
+        match self.request(ControlRequest::BeginUpdate(request)).await? {
+            ControlResponse::BeginUpdate(lease) => Ok(lease),
             response => unexpected_control_response(response),
         }
     }
 
-    pub async fn commit_append(&self, request: CommitAppendRequest) -> Fs0Result<FileReadPlan> {
-        match self.request(ControlRequest::CommitAppend(request)).await? {
-            ControlResponse::CommitAppend(plan) => Ok(plan),
+    pub async fn commit_update(&self, request: CommitUpdateRequest) -> Fs0Result<FileReadPlan> {
+        match self.request(ControlRequest::CommitUpdate(request)).await? {
+            ControlResponse::CommitUpdate(plan) => Ok(plan),
             response => unexpected_control_response(response),
         }
     }
 
-    pub async fn abort_append(&self, lease_id: u64, file_id: u64) -> Fs0Result<()> {
+    pub async fn abort_update(&self, lease_id: u64, file_id: u64) -> Fs0Result<()> {
         match self
-            .request(ControlRequest::AbortAppend { lease_id, file_id })
+            .request(ControlRequest::AbortUpdate { lease_id, file_id })
             .await?
         {
-            ControlResponse::AbortAppend => Ok(()),
+            ControlResponse::AbortUpdate => Ok(()),
             response => unexpected_control_response(response),
         }
     }
@@ -196,6 +199,51 @@ impl Fs0Client {
     }
 
     pub(super) async fn request(&self, request: ControlRequest) -> Fs0Result<ControlResponse> {
-        request_control(&self.control, request).await
+        let mut control = self.control.lock().await;
+        if control.is_closed() {
+            self.reconnect_control(&mut control).await?;
+        }
+
+        match request_control_result(&control, request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(ControlRequestError::Response(err)) => Err(err),
+            Err(ControlRequestError::Rpc(err)) => {
+                self.reconnect_control(&mut control).await?;
+                if retry_control_request_after_rpc_error(&request) {
+                    return request_control_result(&control, request)
+                        .await
+                        .map_err(ControlRequestError::into_error);
+                }
+
+                Err(err)
+            }
+        }
+    }
+}
+
+fn retry_control_request_after_rpc_error(request: &ControlRequest) -> bool {
+    match request {
+        ControlRequest::CentralStatus
+        | ControlRequest::ListDirectory { .. }
+        | ControlRequest::GetFileReadPlan { .. }
+        | ControlRequest::GetFileReadPlanById { .. }
+        | ControlRequest::GetFileChangeLogs { .. } => true,
+        ControlRequest::RegisterClient { .. }
+        | ControlRequest::RegisterStorage { .. }
+        | ControlRequest::CreateVolume { .. }
+        | ControlRequest::DeleteFile { .. }
+        | ControlRequest::DeleteFileById { .. }
+        | ControlRequest::CopyFile { .. }
+        | ControlRequest::CopyFileById { .. }
+        | ControlRequest::RenameFile { .. }
+        | ControlRequest::RenameFileById { .. }
+        | ControlRequest::BeginUpdate(_)
+        | ControlRequest::CommitUpdate(_)
+        | ControlRequest::AbortUpdate { .. }
+        | ControlRequest::GrantUploadLease(_)
+        | ControlRequest::RevokeUploadLease { .. }
+        | ControlRequest::ReportBundleReplica { .. }
+        | ControlRequest::UpdateStorageVolumeOffset { .. }
+        | ControlRequest::ValidateClientAuth { .. } => false,
     }
 }

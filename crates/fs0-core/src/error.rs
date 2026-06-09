@@ -55,6 +55,10 @@ pub enum Fs0Error {
     UnknownVolume,
     #[error("internal: {message}")]
     Internal { message: String },
+    #[error(
+        "fs0 version mismatch: required {required}, actual {actual}; update fs0 client and storage binaries"
+    )]
+    Fs0Version { required: String, actual: String },
 }
 
 impl From<std::io::Error> for Fs0Error {

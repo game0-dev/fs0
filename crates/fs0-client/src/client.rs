@@ -13,13 +13,14 @@ use fs0_core::{
         ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
     },
 };
-use fs0_transport::{Connection, Transport};
+use fs0_transport::{Connection, EndpointAddr, Transport};
 use parking_lot::RwLock;
 use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientOptions {
@@ -111,8 +112,9 @@ pub struct ChunkUploadResult {
 pub struct Fs0Client {
     pub(super) options: ClientOptions,
     pub(super) token: String,
-    pub(super) client_id: u64,
-    pub(super) control: Connection,
+    pub(super) client_id: Arc<RwLock<u64>>,
+    pub(super) central_endpoint: EndpointAddr,
+    pub(super) control: Arc<Mutex<Connection>>,
     pub(super) endpoint: Transport,
     pub(super) storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
 }
@@ -121,33 +123,17 @@ impl Fs0Client {
     pub async fn connect(config: ClientConfig, options: ClientOptions) -> Fs0Result<Self> {
         let endpoint = Transport::bind(Vec::new(), None, None, config.relay.clone()).await?;
         let central_endpoint = endpoint::central_endpoint_addr(&config)?;
-        let control = endpoint
-            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
-            .await?;
         let token = config.token;
-
-        let response = request_control(
-            &control,
-            ControlRequest::RegisterClient {
-                name: options.name.clone(),
-                token: token.clone(),
-                version: FS0_VERSION.to_owned(),
-            },
-        )
-        .await?;
-        let (client_id, storages) = match response {
-            ControlResponse::RegisterClient {
-                client_id,
-                storages,
-            } => (client_id, storages),
-            response => return unexpected_control_response(response),
-        };
+        let (control, client_id, storages) =
+            connect_registered_control(&endpoint, central_endpoint.clone(), &options, &token)
+                .await?;
 
         Ok(Self {
             options,
             token,
-            client_id,
-            control,
+            client_id: Arc::new(RwLock::new(client_id)),
+            central_endpoint,
+            control: Arc::new(Mutex::new(control)),
             endpoint,
             storages: Arc::new(RwLock::new(storages)),
         })
@@ -161,7 +147,7 @@ impl Fs0Client {
     }
 
     pub async fn shutdown(&self) -> Fs0Result<()> {
-        self.control.close(b"fs0 client shutdown");
+        self.control.lock().await.close(b"fs0 client shutdown");
         self.endpoint.close().await;
 
         Ok(())
@@ -169,7 +155,7 @@ impl Fs0Client {
 
     #[must_use]
     pub fn client_id(&self) -> u64 {
-        self.client_id
+        *self.client_id.read()
     }
 
     pub fn storage_peers(&self) -> Vec<StoragePeerInfo> {
@@ -178,6 +164,23 @@ impl Fs0Client {
 
     pub(super) fn set_storage_peers(&self, storages: Vec<StoragePeerInfo>) {
         *self.storages.write() = storages;
+    }
+
+    pub(super) async fn reconnect_control(&self, control: &mut Connection) -> Fs0Result<()> {
+        let (new_control, client_id, storages) = connect_registered_control(
+            &self.endpoint,
+            self.central_endpoint.clone(),
+            &self.options,
+            &self.token,
+        )
+        .await?;
+
+        control.close(b"fs0 client reconnect");
+        *control = new_control;
+        *self.client_id.write() = client_id;
+        self.set_storage_peers(storages);
+
+        Ok(())
     }
 }
 
@@ -192,12 +195,40 @@ pub(super) async fn request_control(
     connection: &Connection,
     request: ControlRequest,
 ) -> Fs0Result<ControlResponse> {
-    match connection.rpc(ProtocolRequest::Control(request)).await? {
+    request_control_result(connection, request)
+        .await
+        .map_err(ControlRequestError::into_error)
+}
+
+pub(super) async fn request_control_result(
+    connection: &Connection,
+    request: ControlRequest,
+) -> Result<ControlResponse, ControlRequestError> {
+    match connection
+        .rpc(ProtocolRequest::Control(request))
+        .await
+        .map_err(ControlRequestError::Rpc)?
+    {
         ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
-            Err(err)
+            Err(ControlRequestError::Response(err))
         }
         ProtocolResponse::Control(response) => Ok(response),
-        response => unexpected_protocol_control_response(response),
+        response => {
+            unexpected_protocol_control_response(response).map_err(ControlRequestError::Rpc)
+        }
+    }
+}
+
+pub(super) enum ControlRequestError {
+    Rpc(Fs0Error),
+    Response(Fs0Error),
+}
+
+impl ControlRequestError {
+    pub(super) fn into_error(self) -> Fs0Error {
+        match self {
+            Self::Rpc(err) | Self::Response(err) => err,
+        }
     }
 }
 
@@ -211,4 +242,32 @@ pub(super) fn unexpected_protocol_control_response<T>(response: ProtocolResponse
     Err(Fs0Error::InvalidFrame {
         message: format!("unexpected control response: {response:?}"),
     })
+}
+
+async fn connect_registered_control(
+    endpoint: &Transport,
+    central_endpoint: EndpointAddr,
+    options: &ClientOptions,
+    token: &str,
+) -> Fs0Result<(Connection, u64, Vec<StoragePeerInfo>)> {
+    let control = endpoint
+        .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
+        .await?;
+    let response = request_control(
+        &control,
+        ControlRequest::RegisterClient {
+            name: options.name.clone(),
+            token: token.to_owned(),
+            version: FS0_VERSION.to_owned(),
+        },
+    )
+    .await?;
+
+    match response {
+        ControlResponse::RegisterClient {
+            client_id,
+            storages,
+        } => Ok((control, client_id, storages)),
+        response => unexpected_control_response(response),
+    }
 }

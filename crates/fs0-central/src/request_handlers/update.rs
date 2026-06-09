@@ -1,27 +1,27 @@
 use crate::{
     Fs0Error, Fs0Result,
-    db::{CentralTx, CreateAppendLease},
+    db::{CentralTx, CreateUpdateLease},
     server::CentralServer,
 };
 use fs0_core::{
-    APPEND_LEASE_TTL_MS, APPEND_VOLUME_USAGE_THRESHOLD, VOLUME_BUNDLE_RAW_SIZE,
+    UPDATE_LEASE_TTL_MS, UPDATE_VOLUME_USAGE_THRESHOLD, VOLUME_BUNDLE_RAW_SIZE,
     protocol::{
-        AppendLease, BeginAppendRequest, CommitAppendRequest, CommittedBundle, ControlRequest,
-        ControlResponse, FileBundleRef, FileChangeLogKind, FileReadPlan, GrantUploadLeaseRequest,
-        ProtocolRequest, ProtocolResponse, StorageVolumeInfo,
+        BeginUpdateRequest, CommitUpdateRequest, CommittedBundle, ControlRequest, ControlResponse,
+        FileBundleRef, FileChangeLogKind, FileReadPlan, GrantUploadLeaseRequest, ProtocolRequest,
+        ProtocolResponse, StorageVolumeInfo, UpdateLease,
     },
     utils::now_ms,
 };
 use std::collections::HashMap;
 
-pub(super) async fn begin_append(
+pub(super) async fn begin_update(
     server: &CentralServer,
-    request: BeginAppendRequest,
+    request: BeginUpdateRequest,
 ) -> Fs0Result<ControlResponse> {
-    let volume_id = select_append_volume(
+    let volume_id = select_update_volume(
         server,
         request.prefer_volume_name.as_deref(),
-        request.append_size_hint,
+        request.update_size_hint,
     )?;
     let storage_id = server
         .online_volumes
@@ -33,7 +33,7 @@ pub(super) async fn begin_append(
         let mut db = server.db.lock();
         let tx = db.tx()?;
         let now = now_ms();
-        let expires_at_ms = now + APPEND_LEASE_TTL_MS;
+        let expires_at_ms = now + UPDATE_LEASE_TTL_MS;
         let (file, base_size) = match tx.get_file_by_path(&request.path) {
             Ok(file) => {
                 if request.offset > file.size_bytes {
@@ -51,11 +51,11 @@ pub(super) async fn begin_append(
             }
             Err(err) => return Err(err),
         };
-        tx.delete_expired_append_leases(now)?;
-        if tx.file_has_active_append_lease(file.file_id)? {
+        tx.delete_expired_update_leases(now)?;
+        if tx.file_has_active_update_lease(file.file_id)? {
             return Err(Fs0Error::AlreadyExists { path: request.path });
         }
-        let lease = tx.create_append_lease(CreateAppendLease {
+        let lease = tx.create_update_lease(CreateUpdateLease {
             file_id: file.file_id,
             volume_id,
             base_size_bytes: base_size,
@@ -69,25 +69,25 @@ pub(super) async fn begin_append(
     };
 
     match grant_upload_lease_to_specific_storage(server, storage_id, &lease).await {
-        Ok(()) => Ok(ControlResponse::BeginAppend(lease)),
+        Ok(()) => Ok(ControlResponse::BeginUpdate(lease)),
         Err(err) => {
-            let _ = abort_append_db_only(server, lease.lease_id, lease.file_id);
+            let _ = abort_update_db_only(server, lease.lease_id, lease.file_id);
             Err(err)
         }
     }
 }
 
-pub(super) async fn commit_append(
+pub(super) async fn commit_update(
     server: &CentralServer,
-    request: CommitAppendRequest,
+    request: CommitUpdateRequest,
 ) -> Fs0Result<ControlResponse> {
     let lease_id = request.lease_id;
     let file_id = request.file_id;
-    let storage_id = storage_id_for_append_lease(server, lease_id, file_id).ok();
+    let storage_id = storage_id_for_update_lease(server, lease_id, file_id).ok();
     let plan = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
-        let plan = commit_append_tx(&tx, request)?;
+        let plan = commit_update_tx(&tx, request)?;
         tx.commit()?;
         plan
     };
@@ -97,34 +97,34 @@ pub(super) async fn commit_append(
         revoke_storage_upload_lease(server, storage_id, lease_id).await;
     }
 
-    result.map(ControlResponse::CommitAppend)
+    result.map(ControlResponse::CommitUpdate)
 }
 
-pub(super) async fn abort_append(
+pub(super) async fn abort_update(
     server: &CentralServer,
     lease_id: u64,
     file_id: u64,
 ) -> Fs0Result<ControlResponse> {
-    let storage_id = storage_id_for_append_lease(server, lease_id, file_id).ok();
-    abort_append_db_only(server, lease_id, file_id)?;
+    let storage_id = storage_id_for_update_lease(server, lease_id, file_id).ok();
+    abort_update_db_only(server, lease_id, file_id)?;
     if let Some(storage_id) = storage_id {
         revoke_storage_upload_lease(server, storage_id, lease_id).await;
     }
 
-    Ok(ControlResponse::AbortAppend)
+    Ok(ControlResponse::AbortUpdate)
 }
 
-fn select_append_volume(
+fn select_update_volume(
     server: &CentralServer,
     prefer_volume_name: Option<&str>,
-    append_size_hint: Option<u64>,
+    update_size_hint: Option<u64>,
 ) -> Fs0Result<u64> {
     let storages = server.storage_peers_snapshot();
 
     if let Some(name) = prefer_volume_name {
         for peer in &storages {
             if let Some(volume) = peer.volumes.iter().find(|volume| volume.name == name)
-                && volume_accepts_append(volume, append_size_hint)
+                && volume_accepts_update(volume, update_size_hint)
             {
                 return Ok(volume.volume_id);
             }
@@ -136,7 +136,7 @@ fn select_append_volume(
     storages
         .iter()
         .flat_map(|peer| peer.volumes.iter())
-        .filter(|volume| volume_accepts_append(volume, append_size_hint))
+        .filter(|volume| volume_accepts_update(volume, update_size_hint))
         .min_by(|left, right| {
             let left_used = u128::from(left.max_volume_offset) * u128::from(right.max_bytes);
             let right_used = u128::from(right.max_volume_offset) * u128::from(left.max_bytes);
@@ -149,16 +149,16 @@ fn select_append_volume(
         .ok_or(Fs0Error::NotFound)
 }
 
-fn volume_accepts_append(volume: &StorageVolumeInfo, append_size_hint: Option<u64>) -> bool {
+fn volume_accepts_update(volume: &StorageVolumeInfo, update_size_hint: Option<u64>) -> bool {
     if volume.read_only || volume.max_bytes == 0 {
         return false;
     }
 
-    if volume.max_volume_offset as f64 / volume.max_bytes as f64 >= APPEND_VOLUME_USAGE_THRESHOLD {
+    if volume.max_volume_offset as f64 / volume.max_bytes as f64 >= UPDATE_VOLUME_USAGE_THRESHOLD {
         return false;
     }
 
-    if let Some(size) = append_size_hint
+    if let Some(size) = update_size_hint
         && volume.max_bytes.saturating_sub(volume.max_volume_offset) < size
     {
         return false;
@@ -167,18 +167,18 @@ fn volume_accepts_append(volume: &StorageVolumeInfo, append_size_hint: Option<u6
     true
 }
 
-fn abort_append_db_only(server: &CentralServer, lease_id: u64, file_id: u64) -> Fs0Result<()> {
+fn abort_update_db_only(server: &CentralServer, lease_id: u64, file_id: u64) -> Fs0Result<()> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
-    tx.load_active_append_lease(lease_id, file_id)?;
-    tx.delete_append_lease(lease_id)?;
+    tx.load_active_update_lease(lease_id, file_id)?;
+    tx.delete_update_lease(lease_id)?;
     tx.commit()
 }
 
 async fn grant_upload_lease_to_specific_storage(
     server: &CentralServer,
     storage_id: u64,
-    lease: &AppendLease,
+    lease: &UpdateLease,
 ) -> Fs0Result<()> {
     let connection = server
         .storages
@@ -227,12 +227,12 @@ async fn revoke_storage_upload_lease(server: &CentralServer, storage_id: u64, le
         .await;
 }
 
-fn storage_id_for_append_lease(
+fn storage_id_for_update_lease(
     server: &CentralServer,
     lease_id: u64,
     file_id: u64,
 ) -> Fs0Result<u64> {
-    let volume_id = active_append_lease_volume_db(server, lease_id, file_id)?;
+    let volume_id = active_update_lease_volume_db(server, lease_id, file_id)?;
     server
         .online_volumes
         .read()
@@ -241,22 +241,22 @@ fn storage_id_for_append_lease(
         .ok_or(Fs0Error::NotFound)
 }
 
-fn active_append_lease_volume_db(
+fn active_update_lease_volume_db(
     server: &CentralServer,
     lease_id: u64,
     file_id: u64,
 ) -> Fs0Result<u64> {
     let mut db = server.db.lock();
     let tx = db.tx()?;
-    let volume_id = tx.active_append_lease_volume(lease_id, file_id)?;
+    let volume_id = tx.active_update_lease_volume(lease_id, file_id)?;
     tx.commit()?;
     Ok(volume_id)
 }
 
-fn commit_append_tx(tx: &CentralTx<'_>, request: CommitAppendRequest) -> Fs0Result<FileReadPlan> {
+fn commit_update_tx(tx: &CentralTx<'_>, request: CommitUpdateRequest) -> Fs0Result<FileReadPlan> {
     let now = now_ms();
-    let lease = tx.load_active_append_lease(request.lease_id, request.file_id)?;
-    validate_append_base(&lease, request.base_size, request.new_size)?;
+    let lease = tx.load_active_update_lease(request.lease_id, request.file_id)?;
+    validate_update_base(&lease, request.base_size, request.new_size)?;
 
     let file = tx.get_file_by_id(lease.file_id)?;
     if file.size_bytes != request.base_size {
@@ -332,13 +332,13 @@ fn commit_append_tx(tx: &CentralTx<'_>, request: CommitAppendRequest) -> Fs0Resu
         return Err(Fs0Error::InvalidRequest);
     }
 
-    tx.update_file_after_append(
+    tx.update_file_after_update(
         lease.file_id,
         request.new_size,
         final_compressed_size_bytes,
         now,
     )?;
-    tx.delete_append_lease(request.lease_id)?;
+    tx.delete_update_lease(request.lease_id)?;
     let file_dir = tx.get_dir_path_by_id(file.dir_id)?;
     tx.insert_file_change_log(
         if file.size_bytes == 0 {
@@ -433,7 +433,7 @@ fn submitted_bundle_totals(bundles: &[CommittedBundle]) -> Fs0Result<(u64, u64)>
     Ok((raw_size_bytes, compressed_size_bytes))
 }
 
-fn validate_append_base(
+fn validate_update_base(
     lease: &crate::db::LeaseRecord,
     base_size: u64,
     new_size: u64,
@@ -450,7 +450,7 @@ fn validate_append_base(
 
 fn file_version_conflict() -> Fs0Error {
     Fs0Error::VersionConflict {
-        message: "file changed while append lease was active".to_owned(),
+        message: "file changed while update lease was active".to_owned(),
     }
 }
 
@@ -486,10 +486,10 @@ mod tests {
         volume_id
     }
 
-    fn begin_append(db: &mut CentralDb, volume_id: u64, path: &str, offset: u64) -> AppendLease {
+    fn begin_update(db: &mut CentralDb, volume_id: u64, path: &str, offset: u64) -> UpdateLease {
         let tx = db.tx().unwrap();
         let now = now_ms();
-        let expires_at_ms = now + APPEND_LEASE_TTL_MS;
+        let expires_at_ms = now + UPDATE_LEASE_TTL_MS;
         let (file, base_size) = match tx.get_file_by_path(path) {
             Ok(file) => {
                 let base_size = file.size_bytes;
@@ -499,12 +499,12 @@ mod tests {
                 assert_eq!(offset, 0);
                 (tx.create_file(path, now).unwrap(), 0)
             }
-            Err(err) => panic!("unexpected begin append error {err:?}"),
+            Err(err) => panic!("unexpected begin update error {err:?}"),
         };
-        tx.delete_expired_append_leases(now).unwrap();
-        assert!(!tx.file_has_active_append_lease(file.file_id).unwrap());
+        tx.delete_expired_update_leases(now).unwrap();
+        assert!(!tx.file_has_active_update_lease(file.file_id).unwrap());
         let lease = tx
-            .create_append_lease(CreateAppendLease {
+            .create_update_lease(CreateUpdateLease {
                 file_id: file.file_id,
                 volume_id,
                 base_size_bytes: base_size,
@@ -518,16 +518,16 @@ mod tests {
         lease
     }
 
-    fn commit_append(
+    fn commit_update(
         db: &mut CentralDb,
-        lease: &AppendLease,
+        lease: &UpdateLease,
         new_size: u64,
         bundles: Vec<CommittedBundle>,
     ) -> Fs0Result<FileReadPlan> {
         let tx = db.tx()?;
-        let plan = commit_append_tx(
+        let plan = commit_update_tx(
             &tx,
-            CommitAppendRequest {
+            CommitUpdateRequest {
                 lease_id: lease.lease_id,
                 file_id: lease.file_id,
                 base_size: lease.base_size,
@@ -601,9 +601,9 @@ mod tests {
     fn seed_two_bundle_file(db: &mut CentralDb, volume_id: u64) -> FileReadPlan {
         record_bundle(db, volume_id, 1, VOLUME_BUNDLE_RAW_SIZE, 11);
         record_bundle(db, volume_id, 2, 40, 7);
-        let lease = begin_append(db, volume_id, "/file.bin", 0);
+        let lease = begin_update(db, volume_id, "/file.bin", 0);
 
-        commit_append(
+        commit_update(
             db,
             &lease,
             VOLUME_BUNDLE_RAW_SIZE + 40,
@@ -616,14 +616,14 @@ mod tests {
     }
 
     #[test]
-    fn commit_append_accepts_suffix_bundles_from_first_bundle_index() {
+    fn commit_update_accepts_suffix_bundles_from_first_bundle_index() {
         let mut db = open_test_db();
         let volume_id = create_volume(&mut db, "primary");
         let original = seed_two_bundle_file(&mut db, volume_id);
         record_bundle(&mut db, volume_id, 3, 50, 9);
-        let lease = begin_append(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
+        let lease = begin_update(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
 
-        let plan = commit_append(
+        let plan = commit_update(
             &mut db,
             &lease,
             VOLUME_BUNDLE_RAW_SIZE + 50,
@@ -639,14 +639,14 @@ mod tests {
     }
 
     #[test]
-    fn commit_append_accepts_full_file_bundles_and_skips_existing_prefix() {
+    fn commit_update_accepts_full_file_bundles_and_skips_existing_prefix() {
         let mut db = open_test_db();
         let volume_id = create_volume(&mut db, "primary");
         seed_two_bundle_file(&mut db, volume_id);
         record_bundle(&mut db, volume_id, 3, 50, 9);
-        let lease = begin_append(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
+        let lease = begin_update(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
 
-        let plan = commit_append(
+        let plan = commit_update(
             &mut db,
             &lease,
             VOLUME_BUNDLE_RAW_SIZE + 50,
@@ -663,42 +663,42 @@ mod tests {
     }
 
     #[test]
-    fn commit_append_rejects_raw_total_that_does_not_match_new_size() {
+    fn commit_update_rejects_raw_total_that_does_not_match_new_size() {
         let mut db = open_test_db();
         let volume_id = create_volume(&mut db, "primary");
         record_bundle(&mut db, volume_id, 1, 10, 5);
-        let lease = begin_append(&mut db, volume_id, "/file.bin", 0);
+        let lease = begin_update(&mut db, volume_id, "/file.bin", 0);
 
         assert_error(
-            commit_append(&mut db, &lease, 11, vec![committed_bundle(1, 10, 5)]),
+            commit_update(&mut db, &lease, 11, vec![committed_bundle(1, 10, 5)]),
             Fs0Error::InvalidRequest,
         );
     }
 
     #[test]
-    fn commit_append_rejects_compressed_len_that_does_not_match_replica_metadata() {
+    fn commit_update_rejects_compressed_len_that_does_not_match_replica_metadata() {
         let mut db = open_test_db();
         let volume_id = create_volume(&mut db, "primary");
         record_bundle(&mut db, volume_id, 1, 10, 5);
-        let lease = begin_append(&mut db, volume_id, "/file.bin", 0);
+        let lease = begin_update(&mut db, volume_id, "/file.bin", 0);
 
         assert_error(
-            commit_append(&mut db, &lease, 10, vec![committed_bundle(1, 10, 6)]),
+            commit_update(&mut db, &lease, 10, vec![committed_bundle(1, 10, 6)]),
             Fs0Error::InvalidRequest,
         );
     }
 
     #[test]
-    fn commit_append_rejects_missing_replica_in_preserved_prefix() {
+    fn commit_update_rejects_missing_replica_in_preserved_prefix() {
         let mut db = open_test_db();
         let volume_id = create_volume(&mut db, "primary");
         seed_two_bundle_file(&mut db, volume_id);
         record_bundle(&mut db, volume_id, 3, 50, 9);
         remove_bundle_replicas(&mut db, volume_id, 1);
-        let lease = begin_append(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
+        let lease = begin_update(&mut db, volume_id, "/file.bin", VOLUME_BUNDLE_RAW_SIZE);
 
         assert_error(
-            commit_append(
+            commit_update(
                 &mut db,
                 &lease,
                 VOLUME_BUNDLE_RAW_SIZE + 50,
@@ -709,16 +709,16 @@ mod tests {
     }
 
     #[test]
-    fn commit_append_rejects_conflicting_replica_metadata() {
+    fn commit_update_rejects_conflicting_replica_metadata() {
         let mut db = open_test_db();
         let primary_volume_id = create_volume(&mut db, "primary");
         let replica_volume_id = create_volume(&mut db, "replica");
         record_bundle(&mut db, primary_volume_id, 1, 10, 5);
         insert_conflicting_replica(&mut db, replica_volume_id, 1);
-        let lease = begin_append(&mut db, primary_volume_id, "/file.bin", 0);
+        let lease = begin_update(&mut db, primary_volume_id, "/file.bin", 0);
 
         assert_error(
-            commit_append(&mut db, &lease, 10, vec![committed_bundle(1, 10, 5)]),
+            commit_update(&mut db, &lease, 10, vec![committed_bundle(1, 10, 5)]),
             Fs0Error::InvalidData {
                 message: "bundle replica metadata conflict".to_owned(),
             },
