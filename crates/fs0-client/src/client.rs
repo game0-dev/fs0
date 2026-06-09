@@ -14,13 +14,19 @@ use fs0_core::{
 };
 use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
-use std::{path::Path, sync::Arc};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientOptions {
     pub name: Option<String>,
     pub upload_concurrency: usize,
     pub download_concurrency: usize,
+    pub download_cache_enabled: bool,
+    pub download_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ClientOptions {
@@ -29,6 +35,8 @@ impl Default for ClientOptions {
             name: None,
             upload_concurrency: DEFAULT_CLIENT_DATA_CONCURRENCY,
             download_concurrency: DEFAULT_CLIENT_DATA_CONCURRENCY,
+            download_cache_enabled: true,
+            download_cache_dir: default_download_cache_dir(),
         }
     }
 }
@@ -66,6 +74,10 @@ pub struct TransferStats {
     pub compressed_bytes: u64,
     pub chunks: u64,
     pub bundles: u64,
+    pub downloaded_compressed_bytes: u64,
+    pub cached_compressed_bytes: u64,
+    pub downloaded_chunks: u64,
+    pub cached_chunks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +177,13 @@ impl Fs0Client {
     pub(super) fn set_storage_peers(&self, storages: Vec<StoragePeerInfo>) {
         *self.storages.write() = storages;
     }
+}
+
+fn default_download_cache_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".fs0").join("cache"))
 }
 
 pub(super) async fn request_control(
