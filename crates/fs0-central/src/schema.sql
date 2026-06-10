@@ -83,8 +83,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_update_leases_file
 CREATE TABLE IF NOT EXISTS file_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_type TEXT NOT NULL,
-  old_dir TEXT,
-  old_name TEXT,
   new_dir TEXT,
   new_name TEXT,
   file_id INTEGER,

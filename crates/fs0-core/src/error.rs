@@ -29,6 +29,13 @@ pub enum Fs0Error {
     AlreadyExists { path: String },
     #[error("volume does not exist: {path}")]
     VolumeNotFound { path: String },
+    #[error(
+        "no available volume for update: preferred {prefer_volume_name:?}, size hint {update_size_hint:?}"
+    )]
+    NoAvailableVolume {
+        prefer_volume_name: Option<String>,
+        update_size_hint: Option<u64>,
+    },
     #[error("chunk {chunk_id:?} was not found")]
     ChunkNotFound { chunk_id: HashId },
     #[error("bundle {bundle_id:?} was not found")]

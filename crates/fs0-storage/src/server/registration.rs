@@ -132,9 +132,7 @@ pub(super) async fn register_storage(
             storage_id,
             storages,
         }) => Ok((storage_id, storages)),
-        ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
-            Err(err)
-        }
+        ProtocolResponse::Error(err) => Err(err),
         response => Err(Fs0Error::InvalidFrame {
             message: format!("unexpected storage registration response: {response:?}"),
         }),

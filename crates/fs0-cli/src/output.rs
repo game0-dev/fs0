@@ -48,14 +48,13 @@ pub(crate) fn print_file_read_plan(plan: FileReadPlan) {
 pub(crate) fn print_file_change_logs(logs: FileChangeLogs) {
     for operation in logs.operations {
         println!(
-            "{}\t{:?}\tfile={}\told={}\tnew={}",
+            "{}\t{:?}\tfile={}\tnew={}",
             operation.event_id,
             operation.kind,
             operation
                 .file_id
                 .map(|file_id| file_id.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
-            operation.old_path.unwrap_or_else(|| "-".to_owned()),
             operation.new_path.unwrap_or_else(|| "-".to_owned())
         );
     }

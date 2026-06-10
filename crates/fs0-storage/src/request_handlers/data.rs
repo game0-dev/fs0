@@ -1,6 +1,6 @@
 use crate::server::StorageServer;
 use fs0_core::{
-    Fs0Error,
+    Fs0Error, Fs0Result,
     protocol::{DataRequest, DataResponse},
 };
 use std::sync::Arc;
@@ -9,24 +9,24 @@ pub(super) async fn handle_data_request(
     server: Arc<StorageServer>,
     _client_id: u64,
     request: DataRequest,
-) -> DataResponse {
+) -> Fs0Result<DataResponse> {
     match request {
-        DataRequest::Authenticate { .. } => DataResponse::Error(Fs0Error::InvalidRequest),
+        DataRequest::Authenticate { .. } => Err(Fs0Error::InvalidRequest),
         DataRequest::HasChunk {
             volume_id,
             chunk_id,
         } => match server.has_chunk(volume_id, chunk_id).await {
-            Ok(Some(meta)) => DataResponse::HasChunk {
+            Ok(Some(meta)) => Ok(DataResponse::HasChunk {
                 exists: true,
                 raw_len: Some(meta.raw_len),
                 compressed_len: Some(meta.compressed_len),
-            },
-            Ok(None) => DataResponse::HasChunk {
+            }),
+            Ok(None) => Ok(DataResponse::HasChunk {
                 exists: false,
                 raw_len: None,
                 compressed_len: None,
-            },
-            Err(err) => DataResponse::Error(err),
+            }),
+            Err(err) => Err(err),
         },
         DataRequest::UploadChunk {
             lease_id,
@@ -48,38 +48,38 @@ pub(super) async fn handle_data_request(
                 )
                 .await
             {
-                Ok(_) => DataResponse::UploadChunk {
+                Ok(_) => Ok(DataResponse::UploadChunk {
                     chunk_id,
                     raw_len,
                     compressed_len,
-                },
-                Err(err) => DataResponse::Error(err),
+                }),
+                Err(err) => Err(err),
             }
         }
         DataRequest::DownloadChunk {
             volume_id,
             chunk_id,
         } => match server.read_chunk(volume_id, chunk_id).await {
-            Ok(bytes) => DataResponse::DownloadChunk {
+            Ok(bytes) => Ok(DataResponse::DownloadChunk {
                 compressed_bytes: bytes,
-            },
-            Err(err) => DataResponse::Error(err),
+            }),
+            Err(err) => Err(err),
         },
         DataRequest::HasBundle {
             volume_id,
             bundle_id,
         } => match server.bundle_meta(volume_id, bundle_id).await {
-            Ok(Some((raw_len, compressed_len))) => DataResponse::HasBundle {
+            Ok(Some((raw_len, compressed_len))) => Ok(DataResponse::HasBundle {
                 exists: true,
                 raw_len: Some(raw_len),
                 compressed_len: Some(compressed_len),
-            },
-            Ok(None) => DataResponse::HasBundle {
+            }),
+            Ok(None) => Ok(DataResponse::HasBundle {
                 exists: false,
                 raw_len: None,
                 compressed_len: None,
-            },
-            Err(err) => DataResponse::Error(err),
+            }),
+            Err(err) => Err(err),
         },
         DataRequest::CommitBundle {
             lease_id,
@@ -91,19 +91,19 @@ pub(super) async fn handle_data_request(
             .commit_bundle(lease_id, file_id, volume_id, bundle_id, chunks)
             .await
         {
-            Ok(bundle) => DataResponse::CommitBundle {
+            Ok(bundle) => Ok(DataResponse::CommitBundle {
                 bundle_id,
                 raw_len: bundle.raw_len,
                 compressed_len: bundle.compressed_len,
-            },
-            Err(err) => DataResponse::Error(err),
+            }),
+            Err(err) => Err(err),
         },
         DataRequest::ListBundleChunks {
             volume_id,
             bundle_id,
         } => match server.list_bundle_chunks(volume_id, bundle_id).await {
-            Ok(chunks) => DataResponse::ListBundleChunks { chunks },
-            Err(err) => DataResponse::Error(err),
+            Ok(chunks) => Ok(DataResponse::ListBundleChunks { chunks }),
+            Err(err) => Err(err),
         },
     }
 }

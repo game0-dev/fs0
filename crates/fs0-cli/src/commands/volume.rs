@@ -1,6 +1,6 @@
 use crate::{commands::config_path, output::print_volume_meta};
 use fs0_client::{ClientOptions, Fs0Client};
-use fs0_config::{ClientConfig, Fs0Config};
+use fs0_config::Fs0Config;
 use fs0_core::{Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY};
 use std::path::PathBuf;
 
@@ -32,16 +32,7 @@ pub(super) fn inspect(path: PathBuf) -> Fs0Result<()> {
 
 async fn connect_storage_control(config: PathBuf) -> Fs0Result<Fs0Client> {
     let config = Fs0Config::load_from(config)?.storage()?;
-    Fs0Client::connect(
-        ClientConfig {
-            token: config.token,
-            central_endpoint_id: config.central_endpoint_id,
-            central_addr: config.central_addr,
-            relay: config.relay,
-        },
-        ClientOptions::default(),
-    )
-    .await
+    Fs0Client::connect_storage_control(config, ClientOptions::default()).await
 }
 
 fn parse_bytes(value: &str) -> Fs0Result<u64> {

@@ -6,7 +6,7 @@ mod file_bundle;
 mod lease;
 mod volume;
 
-pub(crate) use lease::{CreateUpdateLease, LeaseRecord};
+pub(crate) use lease::CreateUpdateLease;
 
 use fs0_core::Fs0Result;
 use rusqlite::Connection;

@@ -75,9 +75,10 @@ pub(super) fn spawn_control_accept_loop(
                     let server = server.clone();
                     async move {
                         let response = match request {
-                            ProtocolRequest::Control(request) => {
-                                ProtocolResponse::Control(handle_control_request(&server, request))
-                            }
+                            ProtocolRequest::Control(request) => match handle_control_request(&server, request) {
+                                Ok(response) => ProtocolResponse::Control(response),
+                                Err(err) => ProtocolResponse::Error(err),
+                            },
                             _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
                         };
                         Ok(Some(response))

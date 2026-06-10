@@ -60,7 +60,9 @@ impl Fs0Client {
             })
             .await?
         {
-            ControlResponse::GetFileReadPlan(plan) => Ok(plan),
+            ControlResponse::GetFileReadPlan(plan) | ControlResponse::GetFileReadPlanById(plan) => {
+                Ok(plan)
+            }
             response => unexpected_control_response(response),
         }
     }
@@ -82,7 +84,7 @@ impl Fs0Client {
             })
             .await?
         {
-            ControlResponse::DeleteFile => Ok(()),
+            ControlResponse::DeleteFile | ControlResponse::DeleteFileById => Ok(()),
             response => unexpected_control_response(response),
         }
     }
@@ -105,7 +107,7 @@ impl Fs0Client {
             })
             .await?
         {
-            ControlResponse::CopyFile(file) => Ok(file),
+            ControlResponse::CopyFile(file) | ControlResponse::CopyFileById(file) => Ok(file),
             response => unexpected_control_response(response),
         }
     }
@@ -135,7 +137,7 @@ impl Fs0Client {
             })
             .await?
         {
-            ControlResponse::RenameFile(file) => Ok(file),
+            ControlResponse::RenameFile(file) | ControlResponse::RenameFileById(file) => Ok(file),
             response => unexpected_control_response(response),
         }
     }
@@ -164,9 +166,9 @@ impl Fs0Client {
         }
     }
 
-    pub async fn commit_update(&self, request: CommitUpdateRequest) -> Fs0Result<FileReadPlan> {
+    pub async fn commit_update(&self, request: CommitUpdateRequest) -> Fs0Result<FileRecord> {
         match self.request(ControlRequest::CommitUpdate(request)).await? {
-            ControlResponse::CommitUpdate(plan) => Ok(plan),
+            ControlResponse::CommitUpdate(file) => Ok(file),
             response => unexpected_control_response(response),
         }
     }

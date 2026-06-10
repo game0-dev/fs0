@@ -2,27 +2,22 @@ mod client;
 mod storage;
 mod update;
 
-use crate::{Fs0Error, Fs0Result, server::CentralServer};
+use crate::{
+    Fs0Error, Fs0Result,
+    server::{CentralServer, ControlConnectionIdentity},
+};
 use fs0_core::{
     FS0_VERSION,
-    protocol::{ControlRequest, ControlResponse, StoragePeerInfo},
+    protocol::{ControlRequest, ControlResponse, ProtocolResponse},
 };
 use fs0_transport::Connection;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ControlConnectionIdentity {
-    #[default]
-    Anonymous,
-    Client(u64),
-    Storage(u64),
-}
 
 pub(crate) async fn handle_control_request(
     server: &CentralServer,
     connection: &Connection,
     request: ControlRequest,
     identity: &mut ControlConnectionIdentity,
-) -> ControlResponse {
+) -> ProtocolResponse {
     let response = match request {
         ControlRequest::RegisterClient {
             name: _,
@@ -30,7 +25,7 @@ pub(crate) async fn handle_control_request(
             version,
         } => {
             match validate_registration_version(&version)
-                .and_then(|_| register_client(server, token, connection.clone()))
+                .and_then(|_| server.register_client(token, connection.clone()))
             {
                 Ok((client_id, storages)) => {
                     *identity = ControlConnectionIdentity::Client(client_id);
@@ -50,14 +45,7 @@ pub(crate) async fn handle_control_request(
             iroh_endpoint,
         } => {
             match validate_registration_version(&version).and_then(|_| {
-                storage::register_storage(
-                    server,
-                    name,
-                    token,
-                    volumes,
-                    iroh_endpoint,
-                    connection.clone(),
-                )
+                server.register_storage(name, token, volumes, iroh_endpoint, connection.clone())
             }) {
                 Ok((storage_id, storages)) => {
                     *identity = ControlConnectionIdentity::Storage(storage_id);
@@ -80,7 +68,10 @@ pub(crate) async fn handle_control_request(
         }
     };
 
-    response.unwrap_or_else(ControlResponse::Error)
+    match response {
+        Ok(response) => ProtocolResponse::Control(response),
+        Err(err) => ProtocolResponse::Error(err),
+    }
 }
 
 fn validate_registration_version(version: &str) -> Fs0Result<()> {
@@ -99,10 +90,7 @@ async fn handle_client_request(
     request: ControlRequest,
 ) -> Fs0Result<ControlResponse> {
     match request {
-        ControlRequest::CreateVolume { name, max_bytes } => {
-            client::create_volume(server, name, max_bytes)
-        }
-        ControlRequest::CentralStatus => storage::central_status(server),
+        ControlRequest::CentralStatus => client::central_status(server),
         ControlRequest::ListDirectory { dir, limit, cursor } => {
             client::list_directory(server, &dir, limit, cursor)
         }
@@ -147,7 +135,9 @@ async fn handle_storage_request(
     request: ControlRequest,
 ) -> Fs0Result<ControlResponse> {
     match request {
-        ControlRequest::CentralStatus => storage::central_status(server),
+        ControlRequest::CreateVolume { name, max_bytes } => {
+            storage::create_volume(server, name, max_bytes)
+        }
         ControlRequest::ValidateClientAuth {
             client_id,
             client_token,
@@ -162,40 +152,6 @@ async fn handle_storage_request(
             storage::update_storage_volume_offset(server, storage_id, volume_id, max_volume_offset)
         }
         _ => Err(Fs0Error::Unauthorized),
-    }
-}
-
-pub(crate) fn unregister_identity(server: &CentralServer, identity: ControlConnectionIdentity) {
-    match identity {
-        ControlConnectionIdentity::Anonymous => {}
-        ControlConnectionIdentity::Client(client_id) => unregister_client(server, client_id),
-        ControlConnectionIdentity::Storage(storage_id) => {
-            storage::unregister_storage(server, storage_id);
-        }
-    }
-}
-
-fn register_client(
-    server: &CentralServer,
-    token: String,
-    connection: Connection,
-) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
-    if !server.token_allowed(&token) {
-        return Err(Fs0Error::Unauthorized);
-    }
-
-    let client_id = server.next_id();
-    server.clients.write().insert(
-        client_id,
-        crate::server::ClientControlConnection { token, connection },
-    );
-
-    Ok((client_id, server.storage_peers_snapshot()))
-}
-
-fn unregister_client(server: &CentralServer, client_id: u64) {
-    if let Some(client) = server.clients.write().remove(&client_id) {
-        client.connection.close(b"central client unregistered");
     }
 }
 

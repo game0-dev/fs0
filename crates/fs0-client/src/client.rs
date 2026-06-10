@@ -5,7 +5,7 @@ mod endpoint;
 mod upload;
 
 pub use fs0_config::ClientConfig;
-use fs0_config::Fs0Config;
+use fs0_config::{Fs0Config, StorageConfig};
 use fs0_core::{
     DEFAULT_CLIENT_DATA_CONCURRENCY, FS0_VERSION, Fs0Error, Fs0Result, HashId,
     TRANSPORT_CONTROL_ALPN,
@@ -112,6 +112,7 @@ pub struct ChunkUploadResult {
 pub struct Fs0Client {
     pub(super) options: ClientOptions,
     pub(super) token: String,
+    registration: ControlRegistration,
     pub(super) client_id: Arc<RwLock<u64>>,
     pub(super) central_endpoint: EndpointAddr,
     pub(super) control: Arc<Mutex<Connection>>,
@@ -119,19 +120,59 @@ pub struct Fs0Client {
     pub(super) storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlRegistration {
+    Client { name: Option<String> },
+    Storage { name: String },
+}
+
 impl Fs0Client {
     pub async fn connect(config: ClientConfig, options: ClientOptions) -> Fs0Result<Self> {
         let endpoint = Transport::bind(Vec::new(), None, None, config.relay.clone()).await?;
         let central_endpoint = endpoint::central_endpoint_addr(&config)?;
         let token = config.token;
+        let registration = ControlRegistration::Client {
+            name: options.name.clone(),
+        };
         let (control, client_id, storages) =
-            connect_registered_control(&endpoint, central_endpoint.clone(), &options, &token)
+            connect_registered_control(&endpoint, central_endpoint.clone(), &registration, &token)
                 .await?;
 
         Ok(Self {
             options,
             token,
+            registration,
             client_id: Arc::new(RwLock::new(client_id)),
+            central_endpoint,
+            control: Arc::new(Mutex::new(control)),
+            endpoint,
+            storages: Arc::new(RwLock::new(storages)),
+        })
+    }
+
+    pub async fn connect_storage_control(
+        config: StorageConfig,
+        options: ClientOptions,
+    ) -> Fs0Result<Self> {
+        let endpoint = Transport::bind(Vec::new(), None, None, config.relay.clone()).await?;
+        let client_config = ClientConfig {
+            token: config.token,
+            central_endpoint_id: config.central_endpoint_id,
+            central_addr: config.central_addr,
+            relay: None,
+        };
+        let central_endpoint = endpoint::central_endpoint_addr(&client_config)?;
+        let token = client_config.token;
+        let registration = ControlRegistration::Storage { name: config.name };
+        let (control, storage_id, storages) =
+            connect_registered_control(&endpoint, central_endpoint.clone(), &registration, &token)
+                .await?;
+
+        Ok(Self {
+            options,
+            token,
+            registration,
+            client_id: Arc::new(RwLock::new(storage_id)),
             central_endpoint,
             control: Arc::new(Mutex::new(control)),
             endpoint,
@@ -170,7 +211,7 @@ impl Fs0Client {
         let (new_control, client_id, storages) = connect_registered_control(
             &self.endpoint,
             self.central_endpoint.clone(),
-            &self.options,
+            &self.registration,
             &self.token,
         )
         .await?;
@@ -209,9 +250,7 @@ pub(super) async fn request_control_result(
         .await
         .map_err(ControlRequestError::Rpc)?
     {
-        ProtocolResponse::Control(ControlResponse::Error(err)) | ProtocolResponse::Error(err) => {
-            Err(ControlRequestError::Response(err))
-        }
+        ProtocolResponse::Error(err) => Err(ControlRequestError::Response(err)),
         ProtocolResponse::Control(response) => Ok(response),
         response => {
             unexpected_protocol_control_response(response).map_err(ControlRequestError::Rpc)
@@ -247,27 +286,54 @@ pub(super) fn unexpected_protocol_control_response<T>(response: ProtocolResponse
 async fn connect_registered_control(
     endpoint: &Transport,
     central_endpoint: EndpointAddr,
-    options: &ClientOptions,
+    registration: &ControlRegistration,
     token: &str,
 ) -> Fs0Result<(Connection, u64, Vec<StoragePeerInfo>)> {
     let control = endpoint
         .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
         .await?;
-    let response = request_control(
-        &control,
-        ControlRequest::RegisterClient {
-            name: options.name.clone(),
-            token: token.to_owned(),
-            version: FS0_VERSION.to_owned(),
-        },
-    )
-    .await?;
+    let response = match registration {
+        ControlRegistration::Client { name } => {
+            request_control(
+                &control,
+                ControlRequest::RegisterClient {
+                    name: name.clone(),
+                    token: token.to_owned(),
+                    version: FS0_VERSION.to_owned(),
+                },
+            )
+            .await?
+        }
+        ControlRegistration::Storage { name } => {
+            request_control(
+                &control,
+                ControlRequest::RegisterStorage {
+                    name: name.clone(),
+                    token: token.to_owned(),
+                    version: FS0_VERSION.to_owned(),
+                    volumes: Vec::new(),
+                    iroh_endpoint: Vec::new(),
+                },
+            )
+            .await?
+        }
+    };
 
-    match response {
-        ControlResponse::RegisterClient {
-            client_id,
-            storages,
-        } => Ok((control, client_id, storages)),
-        response => unexpected_control_response(response),
+    match (registration, response) {
+        (
+            ControlRegistration::Client { .. },
+            ControlResponse::RegisterClient {
+                client_id,
+                storages,
+            },
+        ) => Ok((control, client_id, storages)),
+        (
+            ControlRegistration::Storage { .. },
+            ControlResponse::RegisterStorage {
+                storage_id,
+                storages,
+            },
+        ) => Ok((control, storage_id, storages)),
+        (_, response) => unexpected_control_response(response),
     }
 }

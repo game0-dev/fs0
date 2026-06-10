@@ -2,7 +2,10 @@ mod relay;
 mod spawn;
 
 use crate::{CentralConfig, Fs0Result, db::CentralDb};
-use fs0_core::{Fs0Error, TRANSPORT_CONTROL_ALPN, protocol::StoragePeerInfo};
+use fs0_core::{
+    Fs0Error, TRANSPORT_CONTROL_ALPN,
+    protocol::{StoragePeerInfo, StorageVolumeInfo},
+};
 use fs0_transport::{Connection, EndpointAddr, SecretKey, Transport};
 use parking_lot::{Mutex, RwLock};
 use std::{
@@ -39,6 +42,14 @@ pub(crate) struct ClientControlConnection {
 pub(crate) struct StorageControlConnection {
     pub(crate) peer: StoragePeerInfo,
     pub(crate) connection: Connection,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ControlConnectionIdentity {
+    #[default]
+    Anonymous,
+    Client(u64),
+    Storage(u64),
 }
 
 impl CentralServer {
@@ -83,7 +94,6 @@ impl CentralServer {
             server.transport.clone(),
             relay,
             Arc::downgrade(&server),
-            server.shutdown_notify.clone(),
         ));
 
         Ok(server)
@@ -141,6 +151,106 @@ impl CentralServer {
             .collect::<Vec<_>>();
         peers.sort_by_key(|peer| peer.storage_id);
         peers
+    }
+
+    pub(crate) fn register_client(
+        &self,
+        token: String,
+        connection: Connection,
+    ) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
+        if !self.token_allowed(&token) {
+            return Err(Fs0Error::Unauthorized);
+        }
+
+        let client_id = self.next_id();
+        self.clients
+            .write()
+            .insert(client_id, ClientControlConnection { token, connection });
+
+        Ok((client_id, self.storage_peers_snapshot()))
+    }
+
+    pub(crate) fn unregister_client(&self, client_id: u64) {
+        if let Some(client) = self.clients.write().remove(&client_id) {
+            client.connection.close(b"central client unregistered");
+        }
+    }
+
+    pub(crate) fn register_storage(
+        &self,
+        name: String,
+        token: String,
+        mut volumes: Vec<StorageVolumeInfo>,
+        iroh_endpoint: Vec<u8>,
+        connection: Connection,
+    ) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
+        if !self.token_allowed(&token) {
+            return Err(Fs0Error::Unauthorized);
+        }
+
+        {
+            let mut db = self.db.lock();
+            let tx = db.tx()?;
+            for volume in &mut volumes {
+                let registered = tx.get_volume(volume.volume_id)?;
+                volume.name = registered.name;
+                volume.max_volume_offset =
+                    registered.max_volume_offset.max(volume.max_volume_offset);
+                if volume.max_volume_offset != registered.max_volume_offset {
+                    tx.update_volume_offset(volume.volume_id, volume.max_volume_offset)?;
+                }
+
+                if registered.max_bytes != volume.max_bytes {
+                    return Err(Fs0Error::InvalidRequest);
+                }
+            }
+            tx.commit()?;
+        }
+
+        let storage_id = self.next_id();
+        let peer = StoragePeerInfo {
+            storage_id,
+            name,
+            volumes,
+            iroh_endpoint,
+        };
+
+        {
+            let mut online_volumes = self.online_volumes.write();
+            for volume in &peer.volumes {
+                if online_volumes.contains_key(&volume.volume_id) {
+                    return Err(Fs0Error::VolumeAlreadyMounted);
+                }
+            }
+
+            for volume in &peer.volumes {
+                online_volumes.insert(volume.volume_id, storage_id);
+            }
+        }
+
+        self.storages.write().insert(
+            peer.storage_id,
+            StorageControlConnection { peer, connection },
+        );
+
+        Ok((storage_id, self.storage_peers_snapshot()))
+    }
+
+    pub(crate) fn unregister_storage(&self, storage_id: u64) {
+        if let Some(storage) = self.storages.write().remove(&storage_id) {
+            storage.connection.close(b"central storage unregistered");
+        }
+        self.online_volumes
+            .write()
+            .retain(|_, mounted_storage_id| *mounted_storage_id != storage_id);
+    }
+
+    pub(crate) fn unregister_identity(&self, identity: ControlConnectionIdentity) {
+        match identity {
+            ControlConnectionIdentity::Anonymous => {}
+            ControlConnectionIdentity::Client(client_id) => self.unregister_client(client_id),
+            ControlConnectionIdentity::Storage(storage_id) => self.unregister_storage(storage_id),
+        }
     }
 }
 

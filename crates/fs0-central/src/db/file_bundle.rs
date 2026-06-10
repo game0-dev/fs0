@@ -90,11 +90,16 @@ impl CentralTx<'_> {
             .iter()
             .map(|bundle| bundle.bundle_id)
             .collect::<Vec<_>>();
-        let ready_bundles = self
-            .get_uniq_bundles_by_ids(&bundle_ids)?
-            .into_iter()
-            .map(|bundle| (bundle.bundle_id, bundle))
-            .collect::<HashMap<_, _>>();
+        let mut ready_bundles = HashMap::new();
+        for replica in self.get_bundle_replicas_by_id(&bundle_ids)? {
+            ready_bundles
+                .entry(replica.bundle_id)
+                .or_insert(CommittedBundle {
+                    bundle_id: replica.bundle_id,
+                    raw_len: replica.raw_len,
+                    compressed_len: replica.compressed_len,
+                });
+        }
 
         let mut raw_size_bytes = 0u64;
         let mut compressed_size_bytes = 0u64;

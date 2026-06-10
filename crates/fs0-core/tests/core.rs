@@ -100,6 +100,10 @@ fn fs0_error_roundtrips_over_postcard() {
     assert_postcard_roundtrip(&Fs0Error::InvalidPath {
         path: "/bad//path".to_owned(),
     });
+    assert_postcard_roundtrip(&Fs0Error::NoAvailableVolume {
+        prefer_volume_name: Some("fast".to_owned()),
+        update_size_hint: Some(1024),
+    });
 }
 
 #[test]
@@ -254,13 +258,6 @@ fn control_requests_roundtrip() {
 #[test]
 fn control_responses_roundtrip() {
     let storage = storage_peer();
-    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::VersionConflict {
-        message: "file changed while update lease was active".to_owned(),
-    }));
-    assert_postcard_roundtrip(&ControlResponse::Error(Fs0Error::Fs0Version {
-        required: FS0_VERSION.to_owned(),
-        actual: "0.0.1".to_owned(),
-    }));
     assert_postcard_roundtrip(&ControlResponse::RegisterClient {
         client_id: 42,
         storages: vec![storage.clone()],
@@ -283,7 +280,6 @@ fn control_responses_roundtrip() {
             event_id: 1,
             kind: FileChangeLogKind::Created,
             file_id: Some(2),
-            old_path: None,
             new_path: Some("/a".to_owned()),
             created_at_ms: 1000,
         }],
@@ -298,7 +294,7 @@ fn control_responses_roundtrip() {
         expires_at_ms: 2000,
         prefer_volume_name: Some("hot".to_owned()),
     }));
-    assert_postcard_roundtrip(&ControlResponse::CommitUpdate(file_read_plan()));
+    assert_postcard_roundtrip(&ControlResponse::CommitUpdate(file_record("/updated")));
     assert_postcard_roundtrip(&ControlResponse::AbortUpdate);
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlan(file_read_plan()));
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlanById(file_read_plan()));
@@ -387,7 +383,6 @@ fn data_protocol_roundtrip() {
     assert_postcard_roundtrip(&DataResponse::ListBundleChunks {
         chunks: vec![chunk],
     });
-    assert_postcard_roundtrip(&DataResponse::Error(Fs0Error::UnknownVolume));
 }
 
 fn assert_postcard_roundtrip<T>(value: &T)

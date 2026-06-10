@@ -5,7 +5,7 @@ use fs0_core::{
     bundle_hash_from_chunks,
     protocol::{
         BeginUpdateRequest, BundleChunkRef, CommitUpdateRequest, CommittedBundle, FileReadPlan,
-        UpdateLease,
+        FileRecord, UpdateLease,
     },
     zstd_compress,
 };
@@ -18,7 +18,7 @@ impl Fs0Client {
         remote_path: &str,
         local_path: impl AsRef<Path>,
         options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan> {
+    ) -> Fs0Result<FileRecord> {
         let local_path = local_path.as_ref();
         let update_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
         let file = tokio::fs::File::open(local_path).await?;
@@ -32,7 +32,7 @@ impl Fs0Client {
         remote_path: &str,
         local_path: impl AsRef<Path>,
         options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan> {
+    ) -> Fs0Result<FileRecord> {
         let local_path = local_path.as_ref();
         let update_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
         let file = tokio::fs::File::open(local_path).await?;
@@ -46,7 +46,7 @@ impl Fs0Client {
         remote_path: &str,
         reader: R,
         options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan>
+    ) -> Fs0Result<FileRecord>
     where
         R: AsyncRead + Unpin,
     {
@@ -60,7 +60,7 @@ impl Fs0Client {
         reader: R,
         options: WriteOptions,
         update_size_hint: Option<u64>,
-    ) -> Fs0Result<FileReadPlan>
+    ) -> Fs0Result<FileRecord>
     where
         R: AsyncRead + Unpin,
     {
@@ -73,7 +73,7 @@ impl Fs0Client {
         remote_path: &str,
         reader: R,
         options: WriteOptions,
-    ) -> Fs0Result<FileReadPlan>
+    ) -> Fs0Result<FileRecord>
     where
         R: AsyncRead + Unpin,
     {
@@ -87,7 +87,7 @@ impl Fs0Client {
         reader: R,
         options: WriteOptions,
         update_size_hint: Option<u64>,
-    ) -> Fs0Result<FileReadPlan>
+    ) -> Fs0Result<FileRecord>
     where
         R: AsyncRead + Unpin,
     {
@@ -107,7 +107,7 @@ impl Fs0Client {
         options: WriteOptions,
         offset: u64,
         update_size_hint: Option<u64>,
-    ) -> Fs0Result<FileReadPlan>
+    ) -> Fs0Result<FileRecord>
     where
         R: AsyncRead + Unpin,
     {
@@ -119,8 +119,8 @@ impl Fs0Client {
                 update_size_hint,
             })
             .await?;
-        let rewrite_offset = match self.rewrite_offset_for_lease(&lease).await {
-            Ok(rewrite_offset) => rewrite_offset,
+        let (rewrite_offset, prefix_bundles) = match self.rewrite_offset_for_lease(&lease).await {
+            Ok(rewrite) => rewrite,
             Err(err) => {
                 let _ = self.abort_update(lease.lease_id, lease.file_id).await;
                 return Err(err);
@@ -153,13 +153,15 @@ impl Fs0Client {
             .await
         {
             Ok((new_size, bundles)) => {
+                let mut final_bundles = prefix_bundles;
+                final_bundles.extend(bundles);
                 let commit = self
                     .commit_update(CommitUpdateRequest {
                         lease_id: lease.lease_id,
                         file_id: lease.file_id,
                         base_size: lease.base_size,
                         new_size,
-                        bundles,
+                        bundles: final_bundles,
                     })
                     .await;
                 if commit.is_err() {
@@ -175,9 +177,12 @@ impl Fs0Client {
         }
     }
 
-    async fn rewrite_offset_for_lease(&self, lease: &UpdateLease) -> Fs0Result<u64> {
+    async fn rewrite_offset_for_lease(
+        &self,
+        lease: &UpdateLease,
+    ) -> Fs0Result<(u64, Vec<CommittedBundle>)> {
         if lease.base_size == 0 {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let plan = self.get_file_read_plan_by_id(lease.file_id).await?;
@@ -187,7 +192,27 @@ impl Fs0Client {
             });
         }
 
-        rewrite_offset_for_plan(&plan, lease.offset)
+        let rewrite_offset = rewrite_offset_for_plan(&plan, lease.offset)?;
+        let mut current_offset = 0u64;
+        let mut prefix_bundles = Vec::new();
+        for bundle in &plan.bundles {
+            let bundle_end = current_offset.checked_add(bundle.raw_len).ok_or_else(|| {
+                Fs0Error::IntegerConversion {
+                    message: "file bundle offset overflow".to_owned(),
+                }
+            })?;
+            if bundle_end > rewrite_offset {
+                break;
+            }
+            prefix_bundles.push(CommittedBundle {
+                bundle_id: bundle.bundle_id,
+                raw_len: bundle.raw_len,
+                compressed_len: bundle.compressed_len,
+            });
+            current_offset = bundle_end;
+        }
+
+        Ok((rewrite_offset, prefix_bundles))
     }
 
     async fn write_lease_from_reader<R>(

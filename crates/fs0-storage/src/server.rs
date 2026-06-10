@@ -192,8 +192,7 @@ impl StorageServer {
             ProtocolResponse::Control(ControlResponse::ValidateClientAuth { client_id: _ }) => {
                 Ok(())
             }
-            ProtocolResponse::Control(ControlResponse::Error(err))
-            | ProtocolResponse::Error(err) => Err(err),
+            ProtocolResponse::Error(err) => Err(err),
             response => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected validate client auth response: {response:?}"),
             }),
@@ -441,8 +440,7 @@ impl StorageServer {
             .await
         {
             Ok(ProtocolResponse::Control(ControlResponse::ReportBundleReplica)) => Ok(()),
-            Ok(ProtocolResponse::Control(ControlResponse::Error(err)))
-            | Ok(ProtocolResponse::Error(err)) => Err(err),
+            Ok(ProtocolResponse::Error(err)) => Err(err),
             Ok(response) => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected report bundle replica response: {response:?}"),
             }),
@@ -463,8 +461,7 @@ impl StorageServer {
             .await
         {
             Ok(ProtocolResponse::Control(ControlResponse::UpdateStorageVolumeOffset)) => Ok(()),
-            Ok(ProtocolResponse::Control(ControlResponse::Error(err)))
-            | Ok(ProtocolResponse::Error(err)) => Err(err),
+            Ok(ProtocolResponse::Error(err)) => Err(err),
             Ok(response) => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected update storage volume offset response: {response:?}"),
             }),

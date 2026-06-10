@@ -3,7 +3,7 @@ mod data;
 
 use crate::server::StorageServer;
 use fs0_core::{
-    Fs0Error,
+    Fs0Error, Fs0Result,
     protocol::{DataRequest, DataResponse, ProtocolRequest, ProtocolResponse},
 };
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub(crate) fn handle_control_request(
     server: &StorageServer,
     request: fs0_core::protocol::ControlRequest,
-) -> fs0_core::protocol::ControlResponse {
+) -> Fs0Result<fs0_core::protocol::ControlResponse> {
     control::handle_control_request(server, request)
 }
 
@@ -49,7 +49,10 @@ async fn handle_authenticated_data_request(
             ProtocolResponse::Error(Fs0Error::InvalidRequest)
         }
         ProtocolRequest::Data(request) => {
-            ProtocolResponse::Data(data::handle_data_request(server, client_id, request).await)
+            match data::handle_data_request(server, client_id, request).await {
+                Ok(response) => ProtocolResponse::Data(response),
+                Err(err) => ProtocolResponse::Error(err),
+            }
         }
         _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
     }

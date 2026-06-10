@@ -139,7 +139,6 @@ pub enum ControlRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
-    Error(Fs0Error),
     RegisterClient {
         client_id: u64,
         storages: Vec<StoragePeerInfo>,
@@ -166,7 +165,7 @@ pub enum ControlResponse {
     RenameFileById(FileRecord),
     GetFileChangeLogs(FileChangeLogs),
     BeginUpdate(UpdateLease),
-    CommitUpdate(FileReadPlan),
+    CommitUpdate(FileRecord),
     AbortUpdate,
     GrantUploadLease {
         lease_id: u64,
@@ -249,7 +248,6 @@ pub enum DataResponse {
     ListBundleChunks {
         chunks: Vec<BundleChunkRef>,
     },
-    Error(Fs0Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,7 +395,6 @@ pub struct FileChangeLog {
     pub event_id: u64,
     pub kind: FileChangeLogKind,
     pub file_id: Option<u64>,
-    pub old_path: Option<String>,
     pub new_path: Option<String>,
     pub created_at_ms: u64,
 }

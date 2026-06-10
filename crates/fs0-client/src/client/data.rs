@@ -283,9 +283,7 @@ impl Fs0Client {
             ProtocolResponse::Data(DataResponse::Authenticate {
                 client_id: authenticated_client_id,
             }) if authenticated_client_id == client_id => Ok(connection),
-            ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => {
-                Err(err)
-            }
+            ProtocolResponse::Error(err) => Err(err),
             response => unexpected_protocol_data_response(response),
         }
     }
@@ -317,14 +315,14 @@ async fn upload_chunk_if_missing_on_connection(
                 uploaded: true,
             },
         )),
-        ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => Err(err),
+        ProtocolResponse::Error(err) => Err(err),
         response => unexpected_protocol_data_response(response),
     }
 }
 
 async fn request_data(connection: &Connection, request: DataRequest) -> Fs0Result<DataResponse> {
     match connection.rpc(ProtocolRequest::Data(request)).await? {
-        ProtocolResponse::Data(DataResponse::Error(err)) | ProtocolResponse::Error(err) => Err(err),
+        ProtocolResponse::Error(err) => Err(err),
         ProtocolResponse::Data(response) => Ok(response),
         response => unexpected_protocol_data_response(response),
     }

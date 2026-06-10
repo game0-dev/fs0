@@ -227,14 +227,14 @@ pub(super) async fn central_status(config: &Option<PathBuf>, json: bool) -> Fs0R
     client.shutdown().await
 }
 
-fn print_write_result(json: bool, plan: &fs0_core::protocol::FileReadPlan) -> Fs0Result<()> {
+fn print_write_result(json: bool, file: &fs0_core::protocol::FileRecord) -> Fs0Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(plan).map_err(json_error)?
+            serde_json::to_string_pretty(file).map_err(json_error)?
         );
     } else {
-        println!("{} {} bytes", plan.path, plan.size);
+        println!("{} {} bytes", file.path, file.size_bytes);
     }
 
     Ok(())
