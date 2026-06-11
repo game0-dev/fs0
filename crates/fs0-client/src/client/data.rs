@@ -5,8 +5,9 @@ use crate::{Fs0Error, Fs0Result};
 use fs0_core::{
     HashId, TRANSPORT_DATA_ALPN,
     protocol::{
-        BundleChunkRef, CommittedBundle, DataRequest, DataResponse, ProtocolRequest,
-        ProtocolResponse, StoragePeerInfo,
+        BundleChunkRef, CommittedBundle, CommitBundleRequest, CommitBundleResponse, DataRequest,
+        DataResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo, UploadChunkRequest,
+        UploadChunkResponse,
     },
 };
 use fs0_transport::Connection;
@@ -70,19 +71,19 @@ impl Fs0Client {
         let response = self
             .storage_rpc(
                 target,
-                DataRequest::UploadChunk {
+                DataRequest::UploadChunk(UploadChunkRequest {
                     lease_id,
                     file_id,
                     volume_id: target.volume_id,
                     chunk_id,
                     raw_len,
                     compressed_bytes,
-                },
+                }),
             )
             .await?;
 
         match response {
-            DataResponse::UploadChunk { .. } => Ok(true),
+            DataResponse::UploadChunk(UploadChunkResponse { .. }) => Ok(true),
             response => unexpected_data_response(response),
         }
     }
@@ -183,22 +184,22 @@ impl Fs0Client {
         let response = self
             .storage_rpc(
                 target,
-                DataRequest::CommitBundle {
+                DataRequest::CommitBundle(CommitBundleRequest {
                     lease_id,
                     file_id,
                     volume_id: target.volume_id,
                     bundle_id,
                     chunks,
-                },
+                }),
             )
             .await?;
 
         match response {
-            DataResponse::CommitBundle {
+            DataResponse::CommitBundle(CommitBundleResponse {
                 raw_len,
                 compressed_len,
                 ..
-            } => Ok(CommittedBundle {
+            }) => Ok(CommittedBundle {
                 bundle_id,
                 raw_len,
                 compressed_len,
@@ -298,17 +299,17 @@ async fn upload_chunk_if_missing_on_connection(
     chunk: ChunkUpload,
 ) -> Fs0Result<(usize, ChunkUploadResult)> {
     match connection
-        .rpc(ProtocolRequest::Data(DataRequest::UploadChunk {
+        .rpc(ProtocolRequest::Data(DataRequest::UploadChunk(UploadChunkRequest {
             lease_id,
             file_id,
             volume_id,
             chunk_id: chunk.chunk_id,
             raw_len: chunk.raw_len,
             compressed_bytes: chunk.compressed_bytes,
-        }))
+        })))
         .await?
     {
-        ProtocolResponse::Data(DataResponse::UploadChunk { .. }) => Ok((
+        ProtocolResponse::Data(DataResponse::UploadChunk(UploadChunkResponse { .. })) => Ok((
             index,
             ChunkUploadResult {
                 chunk_id: chunk.chunk_id,

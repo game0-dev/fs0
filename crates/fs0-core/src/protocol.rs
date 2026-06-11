@@ -188,14 +188,7 @@ pub enum DataRequest {
         volume_id: u64,
         chunk_id: HashId,
     },
-    UploadChunk {
-        lease_id: u64,
-        file_id: u64,
-        volume_id: u64,
-        chunk_id: HashId,
-        raw_len: u64,
-        compressed_bytes: Vec<u8>,
-    },
+    UploadChunk(UploadChunkRequest),
     DownloadChunk {
         volume_id: u64,
         chunk_id: HashId,
@@ -204,13 +197,7 @@ pub enum DataRequest {
         volume_id: u64,
         bundle_id: HashId,
     },
-    CommitBundle {
-        lease_id: u64,
-        file_id: u64,
-        volume_id: u64,
-        bundle_id: HashId,
-        chunks: Vec<BundleChunkRef>,
-    },
+    CommitBundle(CommitBundleRequest),
     ListBundleChunks {
         volume_id: u64,
         bundle_id: HashId,
@@ -227,11 +214,7 @@ pub enum DataResponse {
         raw_len: Option<u64>,
         compressed_len: Option<u64>,
     },
-    UploadChunk {
-        chunk_id: HashId,
-        raw_len: u64,
-        compressed_len: u64,
-    },
+    UploadChunk(UploadChunkResponse),
     DownloadChunk {
         compressed_bytes: Vec<u8>,
     },
@@ -240,11 +223,7 @@ pub enum DataResponse {
         raw_len: Option<u64>,
         compressed_len: Option<u64>,
     },
-    CommitBundle {
-        bundle_id: HashId,
-        raw_len: u64,
-        compressed_len: u64,
-    },
+    CommitBundle(CommitBundleResponse),
     ListBundleChunks {
         chunks: Vec<BundleChunkRef>,
     },
@@ -254,6 +233,39 @@ pub enum DataResponse {
 pub struct BundleChunkRef {
     pub chunk_index: u64,
     pub chunk_id: HashId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadChunkRequest {
+    pub lease_id: u64,
+    pub file_id: u64,
+    pub volume_id: u64,
+    pub chunk_id: HashId,
+    pub raw_len: u64,
+    pub compressed_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitBundleRequest {
+    pub lease_id: u64,
+    pub file_id: u64,
+    pub volume_id: u64,
+    pub bundle_id: HashId,
+    pub chunks: Vec<BundleChunkRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadChunkResponse {
+    pub chunk_id: HashId,
+    pub raw_len: u64,
+    pub compressed_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitBundleResponse {
+    pub bundle_id: HashId,
+    pub raw_len: u64,
+    pub compressed_len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -60,6 +60,8 @@ pub enum Fs0Error {
     Unauthorized,
     #[error("unknown volume")]
     UnknownVolume,
+    #[error("central connection is unavailable")]
+    CentralUnavailable,
     #[error("internal: {message}")]
     Internal { message: String },
     #[error(

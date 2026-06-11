@@ -4,56 +4,45 @@ mod data;
 use crate::server::StorageServer;
 use fs0_core::{
     Fs0Error, Fs0Result,
-    protocol::{DataRequest, DataResponse, ProtocolRequest, ProtocolResponse},
+    protocol::{ControlRequest, ControlResponse, DataRequest, DataResponse},
 };
-use std::sync::Arc;
 
 pub(crate) fn handle_control_request(
     server: &StorageServer,
-    request: fs0_core::protocol::ControlRequest,
-) -> Fs0Result<fs0_core::protocol::ControlResponse> {
-    control::handle_control_request(server, request)
-}
-
-pub(crate) async fn handle_data_protocol_request(
-    server: Arc<StorageServer>,
-    authenticated_client_id: &mut Option<u64>,
-    request: ProtocolRequest,
-) -> ProtocolResponse {
-    if let Some(client_id) = *authenticated_client_id {
-        return handle_authenticated_data_request(server, client_id, request).await;
-    }
-
+    request: ControlRequest,
+) -> Fs0Result<ControlResponse> {
     match request {
-        ProtocolRequest::Data(DataRequest::Authenticate {
-            client_id,
-            client_token,
-        }) => match server.validate_client_auth(client_id, client_token).await {
-            Ok(()) => {
-                *authenticated_client_id = Some(client_id);
-                ProtocolResponse::Data(DataResponse::Authenticate { client_id })
-            }
-            Err(err) => ProtocolResponse::Error(err),
-        },
-        _ => ProtocolResponse::Error(Fs0Error::Unauthorized),
+        ControlRequest::GrantUploadLease(lease) => control::grant_upload_lease(server, lease),
+        ControlRequest::RevokeUploadLease { lease_id } => {
+            control::revoke_upload_lease(server, lease_id)
+        }
+        _ => Err(Fs0Error::InvalidRequest),
     }
 }
 
-async fn handle_authenticated_data_request(
-    server: Arc<StorageServer>,
-    client_id: u64,
-    request: ProtocolRequest,
-) -> ProtocolResponse {
+pub(crate) async fn handle_data_request(
+    server: &StorageServer,
+    request: DataRequest,
+) -> Fs0Result<DataResponse> {
     match request {
-        ProtocolRequest::Data(DataRequest::Authenticate { .. }) => {
-            ProtocolResponse::Error(Fs0Error::InvalidRequest)
-        }
-        ProtocolRequest::Data(request) => {
-            match data::handle_data_request(server, client_id, request).await {
-                Ok(response) => ProtocolResponse::Data(response),
-                Err(err) => ProtocolResponse::Error(err),
-            }
-        }
-        _ => ProtocolResponse::Error(Fs0Error::InvalidRequest),
+        DataRequest::Authenticate { .. } => Err(Fs0Error::InvalidRequest),
+        DataRequest::HasChunk {
+            volume_id,
+            chunk_id,
+        } => data::has_chunk(server, volume_id, chunk_id).await,
+        DataRequest::UploadChunk(request) => data::upload_chunk(server, request).await,
+        DataRequest::DownloadChunk {
+            volume_id,
+            chunk_id,
+        } => data::download_chunk(server, volume_id, chunk_id).await,
+        DataRequest::HasBundle {
+            volume_id,
+            bundle_id,
+        } => data::has_bundle(server, volume_id, bundle_id).await,
+        DataRequest::CommitBundle(request) => data::commit_bundle(server, request).await,
+        DataRequest::ListBundleChunks {
+            volume_id,
+            bundle_id,
+        } => data::list_bundle_chunks(server, volume_id, bundle_id).await,
     }
 }

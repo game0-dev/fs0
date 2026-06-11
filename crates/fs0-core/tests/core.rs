@@ -2,12 +2,13 @@ use fs0_core::{
     DEFAULT_ZSTD_LEVEL, FS0_VERSION, Fs0Error, HashId, blake3_hash, bundle_hash_from_chunks,
     protocol::{
         BeginUpdateRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
-        CentralAdminRequest, CentralAdminResponse, CentralAdminStatus, CommitUpdateRequest,
-        CommittedBundle, ControlRequest, ControlResponse, DataRequest, DataResponse,
-        DirectoryEntries, FileBundleRef, FileChangeLog, FileChangeLogKind, FileChangeLogs,
-        FileReadPlan, FileRecord, GrantUploadLeaseRequest, ProtocolEvent, ProtocolRequest,
-        ProtocolResponse, ReplicaLocation, StorageAdminRequest, StorageAdminResponse,
-        StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo, UpdateLease,
+        CentralAdminRequest, CentralAdminResponse, CentralAdminStatus, CommitBundleRequest,
+        CommitBundleResponse, CommitUpdateRequest, CommittedBundle, ControlRequest,
+        ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog,
+        FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest,
+        ProtocolEvent, ProtocolRequest, ProtocolResponse, ReplicaLocation, StorageAdminRequest,
+        StorageAdminResponse, StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo, UpdateLease,
+        UploadChunkRequest, UploadChunkResponse,
     },
     zstd_compress, zstd_decompress,
 };
@@ -104,6 +105,7 @@ fn fs0_error_roundtrips_over_postcard() {
         prefer_volume_name: Some("fast".to_owned()),
         update_size_hint: Some(1024),
     });
+    assert_postcard_roundtrip(&Fs0Error::CentralUnavailable);
 }
 
 #[test]
@@ -328,14 +330,14 @@ fn data_protocol_roundtrip() {
         volume_id: 4,
         chunk_id,
     });
-    assert_postcard_roundtrip(&DataRequest::UploadChunk {
+    assert_postcard_roundtrip(&DataRequest::UploadChunk(UploadChunkRequest {
         lease_id: 9,
         file_id: 11,
         volume_id: 4,
         chunk_id,
         raw_len: 12,
         compressed_bytes: vec![1, 2, 3],
-    });
+    }));
     assert_postcard_roundtrip(&DataRequest::DownloadChunk {
         volume_id: 4,
         chunk_id,
@@ -344,13 +346,13 @@ fn data_protocol_roundtrip() {
         volume_id: 4,
         bundle_id,
     });
-    assert_postcard_roundtrip(&DataRequest::CommitBundle {
+    assert_postcard_roundtrip(&DataRequest::CommitBundle(CommitBundleRequest {
         lease_id: 9,
         file_id: 11,
         volume_id: 4,
         bundle_id,
         chunks: vec![chunk.clone()],
-    });
+    }));
     assert_postcard_roundtrip(&DataRequest::ListBundleChunks {
         volume_id: 4,
         bundle_id,
@@ -362,11 +364,11 @@ fn data_protocol_roundtrip() {
         raw_len: Some(12),
         compressed_len: Some(3),
     });
-    assert_postcard_roundtrip(&DataResponse::UploadChunk {
+    assert_postcard_roundtrip(&DataResponse::UploadChunk(UploadChunkResponse {
         chunk_id,
         raw_len: 12,
         compressed_len: 3,
-    });
+    }));
     assert_postcard_roundtrip(&DataResponse::DownloadChunk {
         compressed_bytes: vec![1, 2, 3],
     });
@@ -375,11 +377,11 @@ fn data_protocol_roundtrip() {
         raw_len: None,
         compressed_len: None,
     });
-    assert_postcard_roundtrip(&DataResponse::CommitBundle {
+    assert_postcard_roundtrip(&DataResponse::CommitBundle(CommitBundleResponse {
         bundle_id,
         raw_len: 12,
         compressed_len: 3,
-    });
+    }));
     assert_postcard_roundtrip(&DataResponse::ListBundleChunks {
         chunks: vec![chunk],
     });

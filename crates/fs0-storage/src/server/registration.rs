@@ -1,12 +1,6 @@
 use crate::{Fs0Error, Fs0Result, StorageConfig};
-use fs0_core::{
-    FS0_VERSION,
-    protocol::{
-        ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
-        StorageVolumeInfo,
-    },
-};
-use fs0_transport::{Connection, EndpointAddr, EndpointId};
+use fs0_core::protocol::StorageVolumeInfo;
+use fs0_transport::{EndpointAddr, EndpointId};
 use fs0_volume::Volume;
 use std::{
     collections::{HashMap, HashSet},
@@ -14,19 +8,10 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug)]
-pub(super) struct OpenedVolumes {
-    pub(super) volumes: HashMap<u64, Arc<Volume>>,
-    pub(super) read_only_volume_ids: HashSet<u64>,
-    pub(super) infos: Vec<StorageVolumeInfo>,
-}
-
-pub(super) fn open_volumes(config: &StorageConfig) -> Fs0Result<OpenedVolumes> {
+pub(super) fn open_volumes(config: &StorageConfig) -> Fs0Result<HashMap<u64, Arc<Volume>>> {
     let mut seen_ids = HashSet::with_capacity(config.volumes.len());
     let mut seen_names = HashSet::with_capacity(config.volumes.len());
     let mut volumes = HashMap::with_capacity(config.volumes.len());
-    let mut read_only_volume_ids = HashSet::new();
-    let mut infos = Vec::with_capacity(config.volumes.len());
 
     for volume_config in &config.volumes {
         if !seen_names.insert(volume_config.name.clone()) {
@@ -67,6 +52,26 @@ pub(super) fn open_volumes(config: &StorageConfig) -> Fs0Result<OpenedVolumes> {
             });
         }
 
+        volumes.insert(meta.volume_id, Arc::new(volume));
+    }
+
+    Ok(volumes)
+}
+
+pub(super) fn volume_infos(
+    config: &StorageConfig,
+    volumes: &HashMap<u64, Arc<Volume>>,
+) -> Fs0Result<Vec<StorageVolumeInfo>> {
+    let mut infos = Vec::with_capacity(config.volumes.len());
+
+    for volume_config in &config.volumes {
+        let volume = volumes
+            .values()
+            .find(|volume| volume.root() == volume_config.path)
+            .ok_or_else(|| Fs0Error::VolumeNotFound {
+                path: volume_config.path.display().to_string(),
+            })?;
+        let meta = volume.meta();
         infos.push(StorageVolumeInfo {
             volume_id: meta.volume_id,
             name: volume_config.name.clone(),
@@ -74,18 +79,9 @@ pub(super) fn open_volumes(config: &StorageConfig) -> Fs0Result<OpenedVolumes> {
             max_volume_offset: meta.active_volume_offset,
             read_only: volume_config.read_only,
         });
-        if volume_config.read_only {
-            read_only_volume_ids.insert(meta.volume_id);
-        }
-        volumes.insert(meta.volume_id, Arc::new(volume));
     }
-    infos.sort_by_key(|volume| volume.volume_id);
 
-    Ok(OpenedVolumes {
-        volumes,
-        read_only_volume_ids,
-        infos,
-    })
+    Ok(infos)
 }
 
 pub(super) fn central_endpoint_addr(config: &StorageConfig) -> Fs0Result<EndpointAddr> {
@@ -110,31 +106,4 @@ fn parse_socket_addr(value: &str, field: &str) -> Fs0Result<SocketAddr> {
         .map_err(|err| Fs0Error::InvalidConfig {
             message: format!("invalid {field} {value}: {err}"),
         })
-}
-
-pub(super) async fn register_storage(
-    control: &Connection,
-    config: &StorageConfig,
-    volumes: Vec<StorageVolumeInfo>,
-    data_endpoint: Vec<u8>,
-) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
-    match control
-        .rpc(ProtocolRequest::Control(ControlRequest::RegisterStorage {
-            name: config.name.clone(),
-            token: config.token.clone(),
-            version: FS0_VERSION.to_owned(),
-            volumes,
-            iroh_endpoint: data_endpoint,
-        }))
-        .await?
-    {
-        ProtocolResponse::Control(ControlResponse::RegisterStorage {
-            storage_id,
-            storages,
-        }) => Ok((storage_id, storages)),
-        ProtocolResponse::Error(err) => Err(err),
-        response => Err(Fs0Error::InvalidFrame {
-            message: format!("unexpected storage registration response: {response:?}"),
-        }),
-    }
 }

@@ -50,7 +50,10 @@ pub(super) fn spawn_bundle_reporter_loop(
                 break;
             }
 
-            let _ = server.sync_bundle_change_records().await;
+            let _ = server
+                .bundle_reporter
+                .sync_all(&server.central_connection, &server.volumes)
+                .await;
         }
     })
 }
