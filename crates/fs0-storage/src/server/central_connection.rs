@@ -1,5 +1,6 @@
-use super::{StorageServer, registration};
+use super::{StorageServer, storage_volume_infos};
 use crate::request_handlers::handle_control_request;
+use fs0_config::StorageConfig;
 use fs0_core::{
     FS0_VERSION, Fs0Error, Fs0Result, TRANSPORT_CONTROL_ALPN,
     protocol::{
@@ -7,16 +8,18 @@ use fs0_core::{
         StoragePeerInfo,
     },
 };
-use fs0_transport::Connection;
+use fs0_transport::{Connection, Transport};
+use fs0_volume::Volume;
 use parking_lot::RwLock;
 use std::{
+    collections::HashMap,
     sync::{
-        Weak,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::{sync::Notify, task::JoinHandle, time::sleep};
+use tokio::time::sleep;
 
 #[derive(Debug)]
 pub(crate) struct CentralConnection {
@@ -32,17 +35,41 @@ impl CentralConnection {
         }
     }
 
-    pub(crate) fn storage_id(&self) -> u64 {
-        self.storage_id.load(Ordering::Acquire)
-    }
+    pub(crate) async fn connect_and_register(
+        &self,
+        config: &StorageConfig,
+        transport: &Transport,
+        volumes: &HashMap<u64, Arc<Volume>>,
+    ) -> Fs0Result<Connection> {
+        let central_endpoint = config.central_endpoint.into();
+        let connection = transport
+            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
+            .await?;
+        let (storage_id, _storages) = match self
+            .register_storage(config, transport, volumes, &connection)
+            .await
+        {
+            Ok(registered) => registered,
+            Err(err) => {
+                connection.close(b"storage registration failed");
+                return Err(err);
+            }
+        };
 
-    pub(crate) fn spawn(
-        server: Weak<StorageServer>,
-        shutdown_notify: std::sync::Arc<Notify>,
-        initial_connection: Option<Connection>,
-    ) -> JoinHandle<()> {
+        self.storage_id.store(storage_id, Ordering::Release);
+        *self.connection.write() = Some(connection.clone());
+        Ok(connection)
+    }
+    pub(crate) fn spawn(&self, server: Weak<StorageServer>) -> Fs0Result<()> {
+        let initial_connection = self
+            .connection
+            .read()
+            .clone()
+            .ok_or(Fs0Error::CentralUnavailable)?;
+
         tokio::spawn(async move {
-            let mut next_connection = initial_connection;
+            let mut next_connection = Some(initial_connection);
+
             loop {
                 let Some(server) = server.upgrade() else {
                     return;
@@ -55,19 +82,26 @@ impl CentralConnection {
                     Some(connection) => connection,
                     None => match server
                         .central_connection
-                        .connect_and_register(&server)
+                        .connect_and_register(&server.config, server.transport(), &server.volumes)
                         .await
                     {
                         Ok(connection) => connection,
                         Err(_) => {
-                            wait_before_reconnect(&shutdown_notify).await;
+                            tokio::select! {
+                                _ = server.shutdown_notify.notified() => {}
+                                _ = sleep(Duration::from_secs(1)) => {}
+                            }
                             continue;
                         }
                     },
                 };
 
+                if server.is_exiting() {
+                    return;
+                }
+
                 tokio::select! {
-                    _ = shutdown_notify.notified() => {
+                    _ = server.shutdown_notify.notified() => {
                         server.central_connection.close(b"storage shutdown");
                         return;
                     }
@@ -92,46 +126,41 @@ impl CentralConnection {
                 }
 
                 connection.close(b"storage central connection closed");
-                server.central_connection.clear();
-                wait_before_reconnect(&shutdown_notify).await;
+                *server.central_connection.connection.write() = None;
+                server
+                    .central_connection
+                    .storage_id
+                    .store(0, Ordering::Release);
+                tokio::select! {
+                    _ = server.shutdown_notify.notified() => {}
+                    _ = sleep(Duration::from_secs(1)) => {}
+                }
             }
-        })
+        });
+        Ok(())
     }
 
-    pub(crate) async fn connect_and_register(
-        &self,
-        server: &StorageServer,
-    ) -> Fs0Result<Connection> {
-        let central_endpoint = registration::central_endpoint_addr(&server.config)?;
-        let connection = server
-            .endpoint()
-            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
-            .await?;
-        let registered = self.register_storage(server, &connection).await;
-        if registered.is_err() {
-            connection.close(b"storage registration failed");
-        }
-        let (storage_id, _storages) = registered?;
-        self.set_registered(storage_id, connection.clone());
-        Ok(connection)
+    pub(crate) fn storage_id(&self) -> u64 {
+        self.storage_id.load(Ordering::Acquire)
     }
 
     async fn register_storage(
         &self,
-        server: &StorageServer,
+        config: &StorageConfig,
+        transport: &Transport,
+        volumes: &HashMap<u64, Arc<Volume>>,
         connection: &Connection,
     ) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
-        let volumes = registration::volume_infos(&server.config, &server.volumes)?;
-        let data_endpoint = postcard::to_allocvec(&server.endpoint().addr()).map_err(|err| {
-            Fs0Error::InvalidFrame {
+        let volumes = storage_volume_infos(config, volumes)?;
+        let data_endpoint =
+            postcard::to_allocvec(&transport.addr()).map_err(|err| Fs0Error::InvalidFrame {
                 message: format!("failed to encode storage endpoint: {err}"),
-            }
-        })?;
+            })?;
 
         match connection
             .rpc(ProtocolRequest::Control(ControlRequest::RegisterStorage {
-                name: server.config.name.clone(),
-                token: server.config.token.clone(),
+                name: config.name.clone(),
+                token: config.token.clone(),
                 version: FS0_VERSION.to_owned(),
                 volumes,
                 iroh_endpoint: data_endpoint,
@@ -154,8 +183,13 @@ impl CentralConnection {
         client_id: u64,
         client_token: String,
     ) -> Fs0Result<()> {
-        match self
-            .connection()?
+        let connection = self
+            .connection
+            .read()
+            .clone()
+            .ok_or(Fs0Error::CentralUnavailable)?;
+
+        match connection
             .rpc(ProtocolRequest::Control(
                 ControlRequest::ValidateClientAuth {
                     client_id,
@@ -178,8 +212,13 @@ impl CentralConnection {
         &self,
         events: Vec<BundleReplicaEvent>,
     ) -> Fs0Result<()> {
-        match self
-            .connection()?
+        let connection = self
+            .connection
+            .read()
+            .clone()
+            .ok_or(Fs0Error::CentralUnavailable)?;
+
+        match connection
             .rpc(ProtocolRequest::Control(
                 ControlRequest::ReportBundleReplica { events },
             ))
@@ -198,8 +237,13 @@ impl CentralConnection {
         volume_id: u64,
         max_volume_offset: u64,
     ) -> Fs0Result<()> {
-        match self
-            .connection()?
+        let connection = self
+            .connection
+            .read()
+            .clone()
+            .ok_or(Fs0Error::CentralUnavailable)?;
+
+        match connection
             .rpc(ProtocolRequest::Control(
                 ControlRequest::UpdateStorageVolumeOffset {
                     volume_id,
@@ -221,29 +265,5 @@ impl CentralConnection {
             connection.close(reason);
         }
         self.storage_id.store(0, Ordering::Release);
-    }
-
-    fn set_registered(&self, storage_id: u64, connection: Connection) {
-        self.storage_id.store(storage_id, Ordering::Release);
-        *self.connection.write() = Some(connection);
-    }
-
-    fn clear(&self) {
-        *self.connection.write() = None;
-        self.storage_id.store(0, Ordering::Release);
-    }
-
-    fn connection(&self) -> Fs0Result<Connection> {
-        self.connection
-            .read()
-            .clone()
-            .ok_or(Fs0Error::CentralUnavailable)
-    }
-}
-
-async fn wait_before_reconnect(shutdown_notify: &Notify) {
-    tokio::select! {
-        _ = shutdown_notify.notified() => {}
-        _ = sleep(Duration::from_secs(1)) => {}
     }
 }

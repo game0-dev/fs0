@@ -9,5 +9,6 @@ readme = "../../README.md"
 
 [dependencies]
 fs0-core.workspace = true
+iroh.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -76,27 +76,27 @@ Create `~/.fs0/config.toml`:
 ```toml
 [central]
 db_path = ".local/central.sqlite"
-secret_key = "central-secret-key"
+secret_key = "REPLACE_WITH_CENTRAL_SECRET_KEY"
 bind_port = 7800
 replication_factor = 2
-auth_tokens = ["dev-token"]
+auth_tokens = ["REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"]
 
 [central.relay]
 public_url = "https://1.2.3.4:7801"
-token = "relay-token"
+token = "REPLACE_WITH_RELAY_TOKEN"
 https_bind_port = 7801
 cert_path = ".local/relay-cert.pem"
 key_path = ".local/relay-key.pem"
 quic_bind_port = 7802
 
 [client]
-token = "dev-token"
-central_endpoint_id = "central-endpoint-id"
+token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
+central_endpoint_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18"
 central_addr = "1.2.3.4:7800"
 
 [client.relay]
 url = "https://1.2.3.4:7801"
-token = "relay-token"
+token = "REPLACE_WITH_RELAY_TOKEN"
 quic_port = 7802
 ca_cert = """
 -----BEGIN CERTIFICATE-----
@@ -106,14 +106,14 @@ ca_cert = """
 
 [storage]
 name = "local-storage-1"
-token = "dev-token"
-central_endpoint_id = "central-endpoint-id"
+token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
+central_endpoint_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18"
 central_addr = "1.2.3.4:7800"
 bind_port = 3341
 
 [storage.relay]
 url = "https://1.2.3.4:7801"
-token = "relay-token"
+token = "REPLACE_WITH_RELAY_TOKEN"
 quic_port = 7802
 ca_cert = """
 -----BEGIN CERTIFICATE-----

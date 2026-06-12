@@ -2,35 +2,39 @@ use fs0_core::{
     DEFAULT_REPLICATION_FACTOR, Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY,
     VOLUME_WRITE_CONCURRENCY,
 };
+use iroh::{EndpointAddr, EndpointId};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 /// Full config example:
 ///
 /// ```toml
 /// [central]
 /// db_path = ".local/central.sqlite"
-/// secret_key = "central-secret-key"
+/// secret_key = "REPLACE_WITH_CENTRAL_SECRET_KEY"
 /// bind_port = 7800
 /// replication_factor = 2
-/// auth_tokens = ["dev-token"]
+/// auth_tokens = ["REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"]
 ///
 /// [central.relay]
 /// public_url = "https://1.2.3.4:7801"
-/// token = "relay-token"
+/// token = "REPLACE_WITH_RELAY_TOKEN"
 /// https_bind_port = 7801
 /// quic_bind_port = 7802
 /// cert_path = ".local/relay-cert.pem"
 /// key_path = ".local/relay-key.pem"
 ///
 /// [client]
-/// token = "dev-token"
-/// central_endpoint_id = "central-endpoint-id"
+/// token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
+/// central_endpoint_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18"
 /// central_addr = "1.2.3.4:7800"
 ///
 /// [client.relay]
 /// url = "https://1.2.3.4:7801"
-/// token = "relay-token"
+/// token = "REPLACE_WITH_RELAY_TOKEN"
 /// quic_port = 7802
 /// ca_cert = """
 /// -----BEGIN CERTIFICATE-----
@@ -40,15 +44,15 @@ use std::path::{Path, PathBuf};
 ///
 /// [storage]
 /// name = "local-storage-1"
-/// token = "dev-token"
+/// token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
 /// bind_port = 3341
-/// central_endpoint_id = "central-endpoint-id"
+/// central_endpoint_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18"
 /// central_addr = "1.2.3.4:7800"
 /// check_hash_before_write = false
 ///
 /// [storage.relay]
 /// url = "https://1.2.3.4:7801"
-/// token = "relay-token"
+/// token = "REPLACE_WITH_RELAY_TOKEN"
 /// quic_port = 7802
 /// ca_cert = """
 /// -----BEGIN CERTIFICATE-----
@@ -96,8 +100,8 @@ pub struct CentralRelayConfig {
 pub struct StorageConfig {
     pub name: String,
     pub token: String,
-    pub central_endpoint_id: String,
-    pub central_addr: String,
+    #[serde(flatten)]
+    pub central_endpoint: EndpointConfig,
     #[serde(default)]
     pub bind_port: Option<u16>,
     #[serde(default)]
@@ -114,18 +118,26 @@ pub struct StorageVolumeConfig {
     #[serde(default)]
     pub read_only: bool,
     #[serde(default = "default_volume_read_concurrency")]
-    pub read_concurrency: usize,
+    pub read_concurrency: u32,
     #[serde(default = "default_volume_write_concurrency")]
-    pub write_concurrency: usize,
+    pub write_concurrency: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
     pub token: String,
-    pub central_endpoint_id: String,
-    pub central_addr: String,
+    #[serde(flatten)]
+    pub central_endpoint: EndpointConfig,
     #[serde(default)]
     pub relay: Option<RelayClientConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct EndpointConfig {
+    #[serde(rename = "central_endpoint_id")]
+    pub id: EndpointId,
+    #[serde(rename = "central_addr")]
+    pub addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -161,6 +173,12 @@ impl Fs0Config {
     }
 }
 
+impl From<EndpointConfig> for EndpointAddr {
+    fn from(config: EndpointConfig) -> Self {
+        EndpointAddr::new(config.id).with_ip_addr(config.addr)
+    }
+}
+
 fn load_toml<T>(path: impl AsRef<Path>) -> Fs0Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -169,12 +187,12 @@ where
     Ok(toml::from_str(&contents)?)
 }
 
-fn default_volume_read_concurrency() -> usize {
-    VOLUME_READ_CONCURRENCY
+fn default_volume_read_concurrency() -> u32 {
+    VOLUME_READ_CONCURRENCY as u32
 }
 
-fn default_volume_write_concurrency() -> usize {
-    VOLUME_WRITE_CONCURRENCY
+fn default_volume_write_concurrency() -> u32 {
+    VOLUME_WRITE_CONCURRENCY as u32
 }
 
 fn default_replication_factor() -> u16 {
@@ -185,33 +203,36 @@ fn default_replication_factor() -> u16 {
 mod tests {
     use super::*;
 
+    const CENTRAL_ENDPOINT_ID: &str =
+        "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18";
+
     #[test]
     fn parses_current_config_shape() {
-        let config: Fs0Config = toml::from_str(
+        let config_toml = format!(
             r#"
             [central]
             db_path = ".local/central.sqlite"
-            secret_key = "central-secret-key"
+            secret_key = "REPLACE_WITH_CENTRAL_SECRET_KEY"
             bind_port = 7800
             replication_factor = 2
-            auth_tokens = ["dev-token"]
+            auth_tokens = ["REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"]
 
             [central.relay]
             public_url = "https://1.2.3.4:7801"
-            token = "relay-token"
+            token = "REPLACE_WITH_RELAY_TOKEN"
             https_bind_port = 7801
             cert_path = ".local/relay-cert.pem"
             key_path = ".local/relay-key.pem"
             quic_bind_port = 7802
 
             [client]
-            token = "dev-token"
-            central_endpoint_id = "central-endpoint-id"
+            token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
+            central_endpoint_id = "{CENTRAL_ENDPOINT_ID}"
             central_addr = "1.2.3.4:7800"
 
             [client.relay]
             url = "https://1.2.3.4:7801"
-            token = "relay-token"
+            token = "REPLACE_WITH_RELAY_TOKEN"
             quic_port = 7802
             ca_cert = """
             -----BEGIN CERTIFICATE-----
@@ -221,15 +242,15 @@ mod tests {
 
             [storage]
             name = "local-storage-1"
-            token = "dev-token"
-            central_endpoint_id = "central-endpoint-id"
+            token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
+            central_endpoint_id = "{CENTRAL_ENDPOINT_ID}"
             central_addr = "1.2.3.4:7800"
             bind_port = 3341
             check_hash_before_write = false
 
             [storage.relay]
             url = "https://1.2.3.4:7801"
-            token = "relay-token"
+            token = "REPLACE_WITH_RELAY_TOKEN"
             quic_port = 7802
             ca_cert = """
             -----BEGIN CERTIFICATE-----
@@ -241,20 +262,20 @@ mod tests {
             path = ".local/volume-1"
             name = "local-volume-1"
             "#,
-        )
-        .unwrap();
+        );
+        let config: Fs0Config = toml::from_str(&config_toml).unwrap();
 
         let central = config.central.unwrap();
         assert_eq!(central.bind_port, 7800);
         assert_eq!(central.replication_factor, 2);
         assert_eq!(central.relay.public_url, "https://1.2.3.4:7801");
-        assert_eq!(central.relay.token, "relay-token");
+        assert_eq!(central.relay.token, "REPLACE_WITH_RELAY_TOKEN");
         assert_eq!(central.relay.https_bind_port, 7801);
         assert_eq!(central.relay.quic_bind_port, 7802);
 
         let storage = config.storage.unwrap();
-        assert_eq!(storage.central_endpoint_id, "central-endpoint-id");
-        assert_eq!(storage.central_addr, "1.2.3.4:7800");
+        assert_eq!(storage.central_endpoint.id.to_string(), CENTRAL_ENDPOINT_ID);
+        assert_eq!(storage.central_endpoint.addr.to_string(), "1.2.3.4:7800");
         assert_eq!(storage.bind_port, Some(3341));
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.url.as_str()),
@@ -262,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.token.as_str()),
-            Some("relay-token")
+            Some("REPLACE_WITH_RELAY_TOKEN")
         );
         assert_eq!(
             storage.relay.as_ref().map(|relay| relay.quic_port),
@@ -276,16 +297,21 @@ mod tests {
                 .is_some_and(|ca_cert| ca_cert.contains("test-storage-ca"))
         );
         assert!(!storage.check_hash_before_write);
+        let storage_endpoint = EndpointAddr::from(storage.central_endpoint);
+        assert_eq!(storage_endpoint.id, storage.central_endpoint.id);
 
         let client = config.client.unwrap();
-        assert_eq!(client.central_addr, "1.2.3.4:7800");
+        assert_eq!(client.central_endpoint.id.to_string(), CENTRAL_ENDPOINT_ID);
+        assert_eq!(client.central_endpoint.addr.to_string(), "1.2.3.4:7800");
+        let client_endpoint = EndpointAddr::from(client.central_endpoint);
+        assert_eq!(client_endpoint.id, client.central_endpoint.id);
         assert_eq!(
             client.relay.as_ref().map(|relay| relay.url.as_str()),
             Some("https://1.2.3.4:7801")
         );
         assert_eq!(
             client.relay.as_ref().map(|relay| relay.token.as_str()),
-            Some("relay-token")
+            Some("REPLACE_WITH_RELAY_TOKEN")
         );
         assert!(
             client
