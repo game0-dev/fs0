@@ -88,6 +88,10 @@ pub enum ControlRequest {
     GetFileReadPlanById {
         file_id: u64,
     },
+    HasBundle {
+        bundle_id: HashId,
+        volume_id: Option<u64>,
+    },
     DeleteFile {
         path: String,
     },
@@ -157,6 +161,9 @@ pub enum ControlResponse {
     ListDirectory(DirectoryEntries),
     GetFileReadPlan(FileReadPlan),
     GetFileReadPlanById(FileReadPlan),
+    HasBundle {
+        exists: bool,
+    },
     DeleteFile,
     DeleteFileById,
     CopyFile(FileRecord),

@@ -91,6 +91,9 @@ async fn handle_client_request(
 ) -> Fs0Result<ControlResponse> {
     match request {
         ControlRequest::CentralStatus => client::central_status(server),
+        ControlRequest::CreateVolume { name, max_bytes } => {
+            storage::create_volume(server, name, max_bytes)
+        }
         ControlRequest::ListDirectory { dir, limit, cursor } => {
             client::list_directory(server, &dir, limit, cursor)
         }
@@ -98,6 +101,10 @@ async fn handle_client_request(
         ControlRequest::GetFileReadPlanById { file_id } => {
             client::get_file_read_plan_by_id(server, file_id)
         }
+        ControlRequest::HasBundle {
+            bundle_id,
+            volume_id,
+        } => client::has_bundle(server, bundle_id, volume_id),
         ControlRequest::DeleteFile { path } => client::delete_file(server, &path),
         ControlRequest::DeleteFileById { file_id } => client::delete_file_by_id(server, file_id),
         ControlRequest::CopyFile {

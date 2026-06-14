@@ -1,10 +1,11 @@
 use fs0_core::{
-    DEFAULT_REPLICATION_FACTOR, Fs0Error, Fs0Result, VOLUME_READ_CONCURRENCY,
-    VOLUME_WRITE_CONCURRENCY,
+    DEFAULT_CLIENT_DATA_CONCURRENCY, DEFAULT_REPLICATION_FACTOR, Fs0Error, Fs0Result,
+    VOLUME_READ_CONCURRENCY, VOLUME_WRITE_CONCURRENCY,
 };
 use iroh::{EndpointAddr, EndpointId};
 use serde::Deserialize;
 use std::{
+    env,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -28,9 +29,13 @@ use std::{
 /// key_path = ".local/relay-key.pem"
 ///
 /// [client]
+/// name = "local-client-1"
 /// token = "REPLACE_WITH_CLIENT_OR_STORAGE_TOKEN"
 /// central_endpoint_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18"
 /// central_addr = "1.2.3.4:7800"
+/// upload_concurrency = 32
+/// download_concurrency = 32
+/// download_cache_dir = ".local/client-cache"
 ///
 /// [client.relay]
 /// url = "https://1.2.3.4:7801"
@@ -125,11 +130,19 @@ pub struct StorageVolumeConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
+    #[serde(default)]
+    pub name: Option<String>,
     pub token: String,
     #[serde(flatten)]
     pub central_endpoint: EndpointConfig,
     #[serde(default)]
     pub relay: Option<RelayClientConfig>,
+    #[serde(default = "default_client_data_concurrency")]
+    pub upload_concurrency: usize,
+    #[serde(default = "default_client_data_concurrency")]
+    pub download_concurrency: usize,
+    #[serde(default = "default_client_download_cache_dir")]
+    pub download_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -173,6 +186,24 @@ impl Fs0Config {
     }
 }
 
+impl ClientConfig {
+    pub fn new(
+        token: String,
+        central_endpoint: EndpointConfig,
+        relay: Option<RelayClientConfig>,
+    ) -> Self {
+        Self {
+            name: None,
+            token,
+            central_endpoint,
+            relay,
+            upload_concurrency: default_client_data_concurrency(),
+            download_concurrency: default_client_data_concurrency(),
+            download_cache_dir: default_client_download_cache_dir(),
+        }
+    }
+}
+
 impl From<EndpointConfig> for EndpointAddr {
     fn from(config: EndpointConfig) -> Self {
         EndpointAddr::new(config.id).with_ip_addr(config.addr)
@@ -197,6 +228,17 @@ fn default_volume_write_concurrency() -> u32 {
 
 fn default_replication_factor() -> u16 {
     DEFAULT_REPLICATION_FACTOR
+}
+
+fn default_client_data_concurrency() -> usize {
+    DEFAULT_CLIENT_DATA_CONCURRENCY
+}
+
+fn default_client_download_cache_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".fs0").join("cache"))
 }
 
 #[cfg(test)]
@@ -301,8 +343,15 @@ mod tests {
         assert_eq!(storage_endpoint.id, storage.central_endpoint.id);
 
         let client = config.client.unwrap();
+        assert_eq!(client.name, None);
         assert_eq!(client.central_endpoint.id.to_string(), CENTRAL_ENDPOINT_ID);
         assert_eq!(client.central_endpoint.addr.to_string(), "1.2.3.4:7800");
+        assert_eq!(client.upload_concurrency, DEFAULT_CLIENT_DATA_CONCURRENCY);
+        assert_eq!(client.download_concurrency, DEFAULT_CLIENT_DATA_CONCURRENCY);
+        assert_eq!(
+            client.download_cache_dir,
+            default_client_download_cache_dir()
+        );
         let client_endpoint = EndpointAddr::from(client.central_endpoint);
         assert_eq!(client_endpoint.id, client.central_endpoint.id);
         assert_eq!(

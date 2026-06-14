@@ -199,6 +199,10 @@ fn control_requests_roundtrip() {
         path: "/trades/a.parquet".to_owned(),
     });
     assert_postcard_roundtrip(&ControlRequest::GetFileReadPlanById { file_id: 3 });
+    assert_postcard_roundtrip(&ControlRequest::HasBundle {
+        bundle_id: HashId([2; 32]),
+        volume_id: Some(4),
+    });
     assert_postcard_roundtrip(&ControlRequest::DeleteFile {
         path: "/old".to_owned(),
     });
@@ -300,6 +304,7 @@ fn control_responses_roundtrip() {
     assert_postcard_roundtrip(&ControlResponse::AbortUpdate);
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlan(file_read_plan()));
     assert_postcard_roundtrip(&ControlResponse::GetFileReadPlanById(file_read_plan()));
+    assert_postcard_roundtrip(&ControlResponse::HasBundle { exists: true });
     assert_postcard_roundtrip(&ControlResponse::DeleteFile);
     assert_postcard_roundtrip(&ControlResponse::DeleteFileById);
     assert_postcard_roundtrip(&ControlResponse::CopyFile(file_record("/copy")));

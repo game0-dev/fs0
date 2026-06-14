@@ -1,8 +1,8 @@
-use super::{Fs0Client, ReadRange, StorageTarget, TransferStats};
+use crate::client::{Fs0Client, ReadRange, StorageTarget, TransferStats};
 use crate::{Fs0Error, Fs0Result};
 use fs0_core::{
     HashId, VOLUME_RAW_CHUNK_SIZE, blake3_hash, bundle_hash_from_chunks,
-    protocol::{BundleChunkRef, FileBundleRef, ReplicaLocation},
+    protocol::{BundleChunkRef, FileBundleRef, FileReadPlan, ReplicaLocation, StoragePeerInfo},
     zstd_decompress,
 };
 use std::{
@@ -46,43 +46,31 @@ struct VerifiedChunkBytes {
 }
 
 impl Fs0Client {
-    pub async fn read_to_vec(&self, remote_path: &str) -> Fs0Result<Vec<u8>> {
-        self.read_range_to_vec(remote_path, ReadRange::default())
-            .await
-    }
-
-    pub async fn read_range_to_vec(
+    pub(crate) async fn download_inner<W>(
         &self,
-        remote_path: &str,
-        range: ReadRange,
-    ) -> Fs0Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.download_to_writer(remote_path, &mut bytes, range)
-            .await?;
-
-        Ok(bytes)
-    }
-
-    pub async fn download_to_path(
-        &self,
-        remote_path: &str,
-        local_path: impl AsRef<Path>,
-        range: ReadRange,
-    ) -> Fs0Result<TransferStats> {
-        let file = tokio::fs::File::create(local_path).await?;
-        self.download_to_writer(remote_path, file, range).await
-    }
-
-    pub async fn download_to_writer<W>(
-        &self,
-        remote_path: &str,
-        mut writer: W,
-        range: ReadRange,
+        client_id: u64,
+        storages: &[StoragePeerInfo],
+        plan: &FileReadPlan,
+        writer: W,
     ) -> Fs0Result<TransferStats>
     where
         W: AsyncWrite + Unpin,
     {
-        let plan = self.get_file_read_plan(remote_path).await?;
+        self.download_range_inner(client_id, storages, plan, ReadRange::default(), writer)
+            .await
+    }
+
+    pub(crate) async fn download_range_inner<W>(
+        &self,
+        client_id: u64,
+        storages: &[StoragePeerInfo],
+        plan: &FileReadPlan,
+        range: ReadRange,
+        mut writer: W,
+    ) -> Fs0Result<TransferStats>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let mut remaining = range.len.unwrap_or(u64::MAX);
         let mut current_offset = 0u64;
         let mut stats = TransferStats::default();
@@ -99,7 +87,9 @@ impl Fs0Client {
                 continue;
             }
 
-            let chunks = self.download_bundle_from_replicas(bundle).await?;
+            let chunks = self
+                .download_bundle_from_replicas(client_id, storages, bundle)
+                .await?;
             for chunk in chunks {
                 if remaining == 0 {
                     break;
@@ -140,14 +130,30 @@ impl Fs0Client {
         Ok(stats)
     }
 
+    pub(crate) async fn download_file_inner(
+        &self,
+        client_id: u64,
+        storages: &[StoragePeerInfo],
+        plan: &FileReadPlan,
+        local_path: impl AsRef<Path>,
+    ) -> Fs0Result<TransferStats> {
+        let file = tokio::fs::File::create(local_path).await?;
+        self.download_inner(client_id, storages, plan, file).await
+    }
+
     async fn download_bundle_from_replicas(
         &self,
+        client_id: u64,
+        storages: &[StoragePeerInfo],
         bundle: &FileBundleRef,
     ) -> Fs0Result<Vec<VerifiedChunk>> {
         let mut last_error = None;
 
-        for target in self.read_targets(bundle.replicas.as_slice()) {
-            match self.download_verified_bundle(&target, bundle).await {
+        for target in self.read_targets(storages, bundle.replicas.as_slice()) {
+            match self
+                .download_verified_bundle(client_id, &target, bundle)
+                .await
+            {
                 Ok(chunks) => return Ok(chunks),
                 Err(err) => last_error = Some(err),
             }
@@ -158,10 +164,13 @@ impl Fs0Client {
 
     async fn download_verified_bundle(
         &self,
+        client_id: u64,
         target: &StorageTarget,
         bundle: &FileBundleRef,
     ) -> Fs0Result<Vec<VerifiedChunk>> {
-        let chunks = self.list_bundle_chunks(target, bundle.bundle_id).await?;
+        let chunks = self
+            .list_bundle_chunks(client_id, target, bundle.bundle_id)
+            .await?;
         if bundle_hash_from_chunks(&chunks) != bundle.bundle_id {
             return Err(Fs0Error::InvalidData {
                 message: "bundle id does not match listed chunk ids".to_owned(),
@@ -169,7 +178,7 @@ impl Fs0Client {
         }
 
         let chunks_by_id = self
-            .download_unique_chunks(target, chunks.as_slice(), self.options.download_concurrency)
+            .download_unique_chunks(client_id, target, chunks.as_slice())
             .await?;
         let (verified, total_raw_len, total_compressed_len) =
             expand_verified_chunks(chunks, &chunks_by_id)?;
@@ -183,8 +192,11 @@ impl Fs0Client {
         Ok(verified)
     }
 
-    fn read_targets(&self, replicas: &[ReplicaLocation]) -> Vec<StorageTarget> {
-        let storages = self.storages.read();
+    fn read_targets(
+        &self,
+        storages: &[StoragePeerInfo],
+        replicas: &[ReplicaLocation],
+    ) -> Vec<StorageTarget> {
         replicas
             .iter()
             .filter_map(|replica| {
@@ -202,9 +214,9 @@ impl Fs0Client {
 
     async fn download_unique_chunks(
         &self,
+        client_id: u64,
         target: &StorageTarget,
         chunks: &[BundleChunkRef],
-        concurrency: usize,
     ) -> Fs0Result<HashMap<HashId, VerifiedChunkBytes>> {
         let mut pending = Vec::new();
         for chunk in chunks {
@@ -213,40 +225,38 @@ impl Fs0Client {
             }
         }
 
-        let concurrency = concurrency.max(1);
         let mut tasks = tokio::task::JoinSet::new();
         let mut chunks = HashMap::with_capacity(pending.len());
         let mut pending = pending.into_iter();
 
         loop {
-            while tasks.len() < concurrency {
-                let Some(chunk_id) = pending.next() else {
-                    break;
-                };
-                let client = self.clone();
-                let target = target.clone();
-                tasks.spawn(async move { client.download_unique_chunk(&target, chunk_id).await });
-            }
-
-            if tasks.is_empty() {
+            let Some(chunk_id) = pending.next() else {
                 break;
-            }
+            };
+            let client = self.clone();
+            let target = target.clone();
+            tasks.spawn(async move {
+                client
+                    .download_unique_chunk(client_id, &target, chunk_id)
+                    .await
+            });
+        }
 
-            match tasks.join_next().await {
-                Some(Ok(Ok((chunk_id, chunk)))) => {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok((chunk_id, chunk))) => {
                     chunks.insert(chunk_id, chunk);
                 }
-                Some(Ok(Err(err))) => {
+                Ok(Err(err)) => {
                     tasks.abort_all();
                     return Err(err);
                 }
-                Some(Err(err)) => {
+                Err(err) => {
                     tasks.abort_all();
                     return Err(Fs0Error::Internal {
                         message: err.to_string(),
                     });
                 }
-                None => break,
             }
         }
 
@@ -254,7 +264,8 @@ impl Fs0Client {
     }
 
     async fn download_unique_chunk(
-        &self,
+        self,
+        client_id: u64,
         target: &StorageTarget,
         chunk_id: HashId,
     ) -> Fs0Result<(HashId, VerifiedChunkBytes)> {
@@ -266,8 +277,11 @@ impl Fs0Client {
                 raw: cached.raw,
             },
             None => {
-                let (raw_len, compressed_len, compressed, raw) =
-                    self.download_verified_chunk(target, chunk_id).await?;
+                let session = self.storage_session(target).await;
+                let _permit = session.acquire_download_permit().await?;
+                let (raw_len, compressed_len, compressed, raw) = self
+                    .download_verified_chunk(client_id, target, chunk_id)
+                    .await?;
                 self.write_cached_chunk(chunk_id, &compressed).await;
                 VerifiedChunkBytes {
                     raw_len,
@@ -283,14 +297,15 @@ impl Fs0Client {
 
     async fn download_verified_chunk(
         &self,
+        client_id: u64,
         target: &StorageTarget,
         chunk_id: HashId,
     ) -> Fs0Result<(u64, u64, Vec<u8>, Vec<u8>)> {
         let (raw_len, compressed_len) = self
-            .storage_has_chunk(target, chunk_id)
+            .storage_has_chunk(client_id, target, chunk_id)
             .await?
             .ok_or(Fs0Error::ChunkNotFound { chunk_id })?;
-        let compressed = self.download_chunk(target, chunk_id).await?;
+        let compressed = self.download_chunk(client_id, target, chunk_id).await?;
         if compressed.len() as u64 != compressed_len {
             return Err(Fs0Error::InvalidData {
                 message: "downloaded compressed length does not match chunk metadata".to_owned(),
@@ -351,13 +366,7 @@ impl Fs0Client {
     }
 
     fn cache_chunk_path(&self, chunk_id: HashId) -> Option<PathBuf> {
-        if !self.options.download_cache_enabled {
-            return None;
-        }
-
-        self.options
-            .download_cache_dir
-            .as_ref()
+        self.download_cache_dir()
             .map(|dir| dir.join(hash_id_hex(chunk_id)))
     }
 }

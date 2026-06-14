@@ -1,5 +1,6 @@
 use crate::{Fs0Error, Fs0Result, server::CentralServer};
 use fs0_core::{
+    HashId,
     protocol::{ControlResponse, FileBundleRef, FileChangeLogKind, FileReadPlan, ReplicaLocation},
     utils::now_ms,
 };
@@ -90,6 +91,21 @@ pub(super) fn get_file_read_plan_by_id(
         size: record.size_bytes,
         bundles,
     }))
+}
+
+pub(super) fn has_bundle(
+    server: &CentralServer,
+    bundle_id: HashId,
+    volume_id: Option<u64>,
+) -> Fs0Result<ControlResponse> {
+    let mut db = server.db.lock();
+    let tx = db.tx()?;
+    let exists = tx
+        .get_bundle_replicas_by_id(&[bundle_id])?
+        .into_iter()
+        .any(|replica| volume_id.is_none_or(|volume_id| replica.volume_id == volume_id));
+
+    Ok(ControlResponse::HasBundle { exists })
 }
 
 #[derive(Debug)]
