@@ -1,17 +1,7 @@
-use fs0_client::CentralStatus;
 use fs0_core::{
     Fs0Error,
     protocol::{DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord},
 };
-use std::path::PathBuf;
-
-pub(crate) fn local_file_name(remote_path: &str) -> PathBuf {
-    remote_path
-        .rsplit('/')
-        .find(|name| !name.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("fs0.out"))
-}
 
 pub(crate) fn print_directory_entries(entries: DirectoryEntries) {
     for entry in entries.entries {
@@ -60,22 +50,6 @@ pub(crate) fn print_file_change_logs(logs: FileChangeLogs) {
     }
     if let Some(next_event_id) = logs.next_event_id {
         println!("next_event_id: {next_event_id}");
-    }
-}
-
-pub(crate) fn print_central_status(status: CentralStatus) {
-    for storage in status.storages {
-        println!("storage {} {}", storage.storage_id, storage.name);
-        for volume in storage.volumes {
-            println!(
-                "  volume {} {} capacity={} used={} read_only={}",
-                volume.volume_id,
-                volume.name,
-                volume.max_bytes,
-                volume.max_volume_offset,
-                volume.read_only,
-            );
-        }
     }
 }
 

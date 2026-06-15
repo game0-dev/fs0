@@ -28,24 +28,12 @@ pub(crate) enum Command {
         #[arg(long)]
         cursor: Option<u64>,
     },
-    #[command(about = "Print remote file bytes to stdout")]
-    Cat {
-        remote_path: String,
-        #[arg(long, default_value_t = 0)]
-        offset: u64,
-        #[arg(long)]
-        len: Option<u64>,
-    },
     #[command(about = "Show remote file metadata and read plan")]
     Stat { remote_path: String },
     #[command(about = "Download a remote file")]
     Get {
         remote_path: String,
-        local_path: Option<PathBuf>,
-        #[arg(long, default_value_t = 0)]
-        offset: u64,
-        #[arg(long)]
-        len: Option<u64>,
+        local_path: PathBuf,
     },
     #[command(about = "Upload a remote file")]
     Put {
@@ -53,15 +41,6 @@ pub(crate) enum Command {
         local_path: String,
         #[arg(long)]
         prefer_volume: Option<String>,
-    },
-    #[command(about = "Update remote file data")]
-    Update {
-        remote_path: String,
-        local_path: String,
-        #[arg(long)]
-        prefer_volume: Option<String>,
-        #[arg(long)]
-        offset: Option<u64>,
     },
     #[command(about = "Delete a remote file")]
     Rm { remote_path: String },
@@ -100,8 +79,6 @@ pub(crate) enum Command {
 pub(crate) enum CentralCommand {
     #[command(about = "Run a central metadata server")]
     Run,
-    #[command(about = "Show central server status")]
-    Status,
 }
 
 #[derive(Debug, Subcommand)]
