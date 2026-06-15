@@ -1,11 +1,14 @@
 use crate::{central_session::CentralSession, storage_session::StorageSession};
 pub use fs0_config::ClientConfig;
 use fs0_core::{
-    Fs0Error, Fs0Result, HashId,
+    DEFAULT_ZSTD_LEVEL, Fs0Error, Fs0Result, HashId, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE,
+    blake3_hash, bundle_hash_from_chunks,
     protocol::{
-        BeginUpdateRequest, CommitUpdateRequest, CommittedBundle, DirectoryEntries, FileChangeLogs,
-        FileReadPlan, FileRecord, StoragePeerInfo,
+        BeginUpdateRequest, BundleChunkRef, CommitBundleRequest, CommitUpdateRequest,
+        CommittedBundle, DirectoryEntries, DownloadChunkRequest, FileChangeLogs, FileReadPlan,
+        FileRecord, StoragePeerInfo, UploadChunkRequest,
     },
+    zstd_compress, zstd_decompress,
 };
 use fs0_transport::Transport;
 use std::{
@@ -13,14 +16,8 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReadRange {
-    pub offset: u64,
-    pub len: Option<u64>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransferStats {
@@ -40,18 +37,19 @@ pub struct CentralStatus {
     pub storages: Vec<StoragePeerInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageTarget {
-    pub storage_id: u64,
-    pub volume_id: u64,
-    pub iroh_endpoint: Vec<u8>,
+#[derive(Debug)]
+struct PreparedBundle {
+    index: u64,
+    bundle_id: HashId,
+    raw_len: u64,
+    chunks: Vec<BundleChunkRef>,
+    uploads: Vec<PreparedChunk>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ChunkUpload {
-    pub chunk_id: HashId,
-    pub raw_len: u64,
-    pub compressed_bytes: Vec<u8>,
+#[derive(Debug)]
+struct PreparedChunk {
+    chunk_id: HashId,
+    raw_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,14 +113,6 @@ impl Fs0Client {
         self.central.list_directory(dir, limit, cursor).await
     }
 
-    pub async fn get_file_read_plan(&self, path: &str) -> Fs0Result<FileReadPlan> {
-        self.central.get_file_read_plan(path).await
-    }
-
-    pub async fn get_file_read_plan_by_id(&self, file_id: u64) -> Fs0Result<FileReadPlan> {
-        self.central.get_file_read_plan_by_id(file_id).await
-    }
-
     pub async fn delete_file(&self, path: &str) -> Fs0Result<()> {
         self.central.delete_file(path).await
     }
@@ -167,6 +157,10 @@ impl Fs0Client {
             .await
     }
 
+    pub async fn get_file_read_plan(&self, remote_path: &str) -> Fs0Result<FileReadPlan> {
+        self.central.get_file_read_plan(remote_path).await
+    }
+
     pub async fn upload<R>(
         &self,
         remote_path: &str,
@@ -194,33 +188,102 @@ impl Fs0Client {
             .await
     }
 
-    pub async fn download<W>(&self, remote_path: &str, writer: W) -> Fs0Result<TransferStats>
+    pub async fn download<W>(&self, remote_path: &str, mut writer: W) -> Fs0Result<TransferStats>
     where
         W: AsyncWrite + Unpin,
     {
         let plan = self.central.get_file_read_plan(remote_path).await?;
         let storages = self.storage_peers();
-        let client_id = self.client_id();
+        let mut stats = TransferStats::default();
 
-        self.download_inner(client_id, &storages, &plan, writer)
-            .await
-    }
+        for bundle in &plan.bundles {
+            let mut last_error = None;
+            let mut downloaded = None;
 
-    pub async fn download_range<W>(
-        &self,
-        remote_path: &str,
-        range: ReadRange,
-        writer: W,
-    ) -> Fs0Result<TransferStats>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let plan = self.central.get_file_read_plan(remote_path).await?;
-        let storages = self.storage_peers();
-        let client_id = self.client_id();
+            for replica in &bundle.replicas {
+                let Some(storage) = storages
+                    .iter()
+                    .find(|storage| storage.storage_id == replica.storage_id)
+                else {
+                    continue;
+                };
+                let session = self.storage_session(storage).await;
+                let attempt = async {
+                    let chunks = session
+                        .inner
+                        .list_bundle_chunks(replica.volume_id, bundle.bundle_id)
+                        .await?;
+                    if bundle_hash_from_chunks(&chunks) != bundle.bundle_id {
+                        return Err(Fs0Error::InvalidData {
+                            message: "bundle id does not match listed chunk ids".to_owned(),
+                        });
+                    }
 
-        self.download_range_inner(client_id, &storages, &plan, range, writer)
-            .await
+                    let mut raw_chunks = Vec::with_capacity(chunks.len());
+                    let mut raw_len = 0u64;
+                    let mut compressed_len = 0u64;
+                    for chunk in chunks {
+                        let compressed = session
+                            .download_chunk(DownloadChunkRequest {
+                                volume_id: replica.volume_id,
+                                chunk_id: chunk.chunk_id,
+                            })
+                            .await?;
+                        let raw = decompress_and_verify_chunk(
+                            chunk.chunk_id,
+                            compressed.as_slice(),
+                            VOLUME_RAW_CHUNK_SIZE,
+                        )?;
+                        raw_len = raw_len.checked_add(raw.len() as u64).ok_or_else(|| {
+                            Fs0Error::IntegerConversion {
+                                message: "bundle raw_len overflow".to_owned(),
+                            }
+                        })?;
+                        compressed_len = compressed_len
+                            .checked_add(compressed.len() as u64)
+                            .ok_or_else(|| Fs0Error::IntegerConversion {
+                                message: "bundle compressed_len overflow".to_owned(),
+                            })?;
+                        raw_chunks.push(raw);
+                    }
+
+                    if raw_len != bundle.raw_len || compressed_len != bundle.compressed_len {
+                        return Err(Fs0Error::InvalidData {
+                            message: "downloaded bundle lengths do not match read plan".to_owned(),
+                        });
+                    }
+
+                    let chunk_count = raw_chunks.len() as u64;
+                    Ok::<_, Fs0Error>((raw_chunks, raw_len, compressed_len, chunk_count))
+                }
+                .await;
+
+                match attempt {
+                    Ok(bundle_bytes) => {
+                        downloaded = Some(bundle_bytes);
+                        break;
+                    }
+                    Err(err) => last_error = Some(err),
+                }
+            }
+
+            let (raw_chunks, raw_len, compressed_len, chunk_count) =
+                downloaded.ok_or_else(|| last_error.unwrap_or(Fs0Error::NotFound))?;
+            for raw in raw_chunks {
+                writer.write_all(&raw).await?;
+            }
+
+            stats.raw_bytes += raw_len;
+            stats.compressed_bytes += compressed_len;
+            stats.downloaded_compressed_bytes += compressed_len;
+            stats.chunks += chunk_count;
+            stats.downloaded_chunks += chunk_count;
+            stats.bundles += 1;
+        }
+
+        writer.flush().await?;
+
+        Ok(stats)
     }
 
     pub async fn download_file(
@@ -228,12 +291,8 @@ impl Fs0Client {
         remote_path: &str,
         local_path: impl AsRef<Path>,
     ) -> Fs0Result<TransferStats> {
-        let plan = self.central.get_file_read_plan(remote_path).await?;
-        let storages = self.storage_peers();
-        let client_id = self.client_id();
-
-        self.download_file_inner(client_id, &storages, &plan, local_path)
-            .await
+        let file = tokio::fs::File::create(local_path).await?;
+        self.download(remote_path, file).await
     }
 
     async fn upload_reader<R>(
@@ -258,34 +317,24 @@ impl Fs0Client {
 
         let upload = async {
             let storages = self.storage_peers();
-            let target = storages
+            let (storage, volume_id) = storages
                 .iter()
                 .find_map(|storage| {
                     storage
                         .volumes
                         .iter()
                         .find(|volume| volume.volume_id == lease.volume_id)
-                        .map(|volume| StorageTarget {
-                            storage_id: storage.storage_id,
-                            volume_id: volume.volume_id,
-                            iroh_endpoint: storage.iroh_endpoint.clone(),
-                        })
+                        .map(|volume| (storage.clone(), volume.volume_id))
                 })
                 .ok_or(Fs0Error::NotFound)?;
 
             let mut new_size = 0u64;
             let mut suffix_bundles = BTreeMap::new();
-            let mut upload_scheduler = self
-                .upload_scheduler(self.client_id(), &target, lease.lease_id, lease.file_id)
-                .await?;
+            let session = self.storage_session(&storage).await;
             let mut bundle_index = 0u64;
 
             loop {
-                upload_scheduler
-                    .wait_for_reader_capacity(&mut suffix_bundles)
-                    .await?;
-
-                let Some(bundle) = self.read_upload_bundle(&mut reader, bundle_index).await? else {
+                let Some(bundle) = read_prepared_bundle(&mut reader, bundle_index).await? else {
                     break;
                 };
 
@@ -305,14 +354,85 @@ impl Fs0Client {
                         },
                     );
                 } else {
-                    upload_scheduler.schedule_bundle(bundle).await?;
+                    if let Some((raw_len, compressed_len)) = session
+                        .inner
+                        .has_bundle(volume_id, bundle.bundle_id)
+                        .await?
+                    {
+                        suffix_bundles.insert(
+                            bundle.index,
+                            CommittedBundle {
+                                bundle_id: bundle.bundle_id,
+                                raw_len,
+                                compressed_len,
+                            },
+                        );
+                    } else {
+                        let mut uploads = tokio::task::JoinSet::new();
+                        for chunk in bundle.uploads {
+                            let session = Arc::clone(&session);
+                            uploads.spawn(async move {
+                                let raw_len = chunk.raw_bytes.len() as u64;
+                                let request = UploadChunkRequest {
+                                    lease_id: lease.lease_id,
+                                    file_id: lease.file_id,
+                                    volume_id,
+                                    chunk_id: chunk.chunk_id,
+                                    raw_len,
+                                    compressed_bytes: zstd_compress(
+                                        &chunk.raw_bytes,
+                                        DEFAULT_ZSTD_LEVEL,
+                                    )?,
+                                };
+                                let response = session.upload_chunk(request).await?;
+
+                                if response.chunk_id != chunk.chunk_id
+                                    || response.raw_len != raw_len
+                                {
+                                    return Err(Fs0Error::InvalidData {
+                                        message: "uploaded chunk metadata does not match request"
+                                            .to_owned(),
+                                    });
+                                }
+
+                                Ok(())
+                            });
+                        }
+
+                        while let Some(result) = uploads.join_next().await {
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    uploads.abort_all();
+                                    return Err(err);
+                                }
+                                Err(err) => {
+                                    uploads.abort_all();
+                                    return Err(Fs0Error::Internal {
+                                        message: err.to_string(),
+                                    });
+                                }
+                            }
+                        }
+
+                        let bundle_index = bundle.index;
+                        let committed = session
+                            .inner
+                            .commit_bundle(CommitBundleRequest {
+                                volume_id,
+                                lease_id: lease.lease_id,
+                                file_id: lease.file_id,
+                                bundle_id: bundle.bundle_id,
+                                chunks: bundle.chunks,
+                            })
+                            .await?;
+                        suffix_bundles.insert(bundle_index, committed);
+                    }
                 }
 
-                upload_scheduler.collect_ready(&mut suffix_bundles)?;
                 bundle_index += 1;
             }
 
-            upload_scheduler.finish(&mut suffix_bundles).await?;
             Ok::<_, Fs0Error>((new_size, suffix_bundles.into_values().collect()))
         }
         .await;
@@ -348,24 +468,19 @@ impl Fs0Client {
         }
     }
 
-    pub(crate) async fn storage_session(&self, target: &StorageTarget) -> Arc<StorageSession> {
+    pub(crate) async fn storage_session(&self, storage: &StoragePeerInfo) -> Arc<StorageSession> {
         let mut sessions = self.storage_sessions.lock().await;
         sessions
-            .entry(target.storage_id)
+            .entry(storage.storage_id)
             .or_insert_with(|| {
                 Arc::new(StorageSession::new(
                     self.config.clone(),
                     self.transport.clone(),
-                    target.storage_id,
-                    self.config.upload_concurrency,
-                    self.config.download_concurrency,
+                    self.client_id(),
+                    storage.iroh_endpoint.clone(),
                 ))
             })
             .clone()
-    }
-
-    pub(crate) fn download_cache_dir(&self) -> Option<&Path> {
-        self.config.download_cache_dir.as_deref()
     }
 }
 
@@ -382,4 +497,63 @@ async fn close_storage_sessions(
     for session in sessions {
         session.close(reason).await;
     }
+}
+
+async fn read_prepared_bundle<R>(reader: &mut R, index: u64) -> Fs0Result<Option<PreparedBundle>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0u8; VOLUME_RAW_CHUNK_SIZE as usize];
+    let mut raw_len = 0u64;
+    let mut chunks = Vec::new();
+    let mut uploads = Vec::new();
+
+    while raw_len < VOLUME_BUNDLE_RAW_SIZE {
+        let remaining = VOLUME_BUNDLE_RAW_SIZE - raw_len;
+        let read_limit = buffer.len().min(remaining as usize);
+        let read = reader.read(&mut buffer[..read_limit]).await?;
+        if read == 0 {
+            break;
+        }
+
+        let raw = &buffer[..read];
+        let chunk_id = blake3_hash(raw);
+        chunks.push(BundleChunkRef {
+            chunk_index: chunks.len() as u64,
+            chunk_id,
+        });
+        uploads.push(PreparedChunk {
+            chunk_id,
+            raw_bytes: raw.to_vec(),
+        });
+        raw_len += read as u64;
+    }
+
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedBundle {
+        index,
+        bundle_id: bundle_hash_from_chunks(&chunks),
+        raw_len,
+        chunks,
+        uploads,
+    }))
+}
+
+fn decompress_and_verify_chunk(
+    chunk_id: HashId,
+    compressed: &[u8],
+    max_raw_len: u64,
+) -> Fs0Result<Vec<u8>> {
+    let max_raw_len = usize::try_from(max_raw_len).map_err(|_| Fs0Error::IntegerConversion {
+        message: format!("raw_len {max_raw_len} exceeds usize"),
+    })?;
+    let raw = zstd_decompress(compressed, max_raw_len)?;
+    if raw.len() as u64 > VOLUME_RAW_CHUNK_SIZE || blake3_hash(&raw) != chunk_id {
+        return Err(Fs0Error::HashMismatch { volume_offset: 0 });
+    }
+
+    Ok(raw)
 }

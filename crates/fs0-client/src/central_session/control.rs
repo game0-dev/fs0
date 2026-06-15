@@ -76,18 +76,6 @@ impl CentralSession {
         }
     }
 
-    pub(crate) async fn get_file_read_plan_by_id(&self, file_id: u64) -> Fs0Result<FileReadPlan> {
-        match self
-            .request(ControlRequest::GetFileReadPlanById { file_id })
-            .await?
-        {
-            ControlResponse::GetFileReadPlanById(plan) => Ok(plan),
-            response => Err(fs0_core::Fs0Error::InvalidFrame {
-                message: format!("unexpected control response: {response:?}"),
-            }),
-        }
-    }
-
     pub(crate) async fn has_bundle(
         &self,
         bundle_id: HashId,

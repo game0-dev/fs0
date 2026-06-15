@@ -4,11 +4,11 @@ use fs0_core::{
         BeginUpdateRequest, BundleChunkRef, BundleReplicaEvent, BundleReplicaEventKind,
         CentralAdminRequest, CentralAdminResponse, CentralAdminStatus, CommitBundleRequest,
         CommitBundleResponse, CommitUpdateRequest, CommittedBundle, ControlRequest,
-        ControlResponse, DataRequest, DataResponse, DirectoryEntries, FileBundleRef, FileChangeLog,
-        FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord, GrantUploadLeaseRequest,
-        ProtocolEvent, ProtocolRequest, ProtocolResponse, ReplicaLocation, StorageAdminRequest,
-        StorageAdminResponse, StorageAdminStatus, StoragePeerInfo, StorageVolumeInfo, UpdateLease,
-        UploadChunkRequest, UploadChunkResponse,
+        ControlResponse, DataRequest, DataResponse, DirectoryEntries, DownloadChunkRequest,
+        FileBundleRef, FileChangeLog, FileChangeLogKind, FileChangeLogs, FileReadPlan, FileRecord,
+        GrantUploadLeaseRequest, ProtocolEvent, ProtocolRequest, ProtocolResponse, ReplicaLocation,
+        StorageAdminRequest, StorageAdminResponse, StorageAdminStatus, StoragePeerInfo,
+        StorageVolumeInfo, UpdateLease, UploadChunkRequest, UploadChunkResponse,
     },
     zstd_compress, zstd_decompress,
 };
@@ -343,10 +343,10 @@ fn data_protocol_roundtrip() {
         raw_len: 12,
         compressed_bytes: vec![1, 2, 3],
     }));
-    assert_postcard_roundtrip(&DataRequest::DownloadChunk {
+    assert_postcard_roundtrip(&DataRequest::DownloadChunk(DownloadChunkRequest {
         volume_id: 4,
         chunk_id,
-    });
+    }));
     assert_postcard_roundtrip(&DataRequest::HasBundle {
         volume_id: 4,
         bundle_id,

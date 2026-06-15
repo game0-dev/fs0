@@ -196,10 +196,7 @@ pub enum DataRequest {
         chunk_id: HashId,
     },
     UploadChunk(UploadChunkRequest),
-    DownloadChunk {
-        volume_id: u64,
-        chunk_id: HashId,
-    },
+    DownloadChunk(DownloadChunkRequest),
     HasBundle {
         volume_id: u64,
         bundle_id: HashId,
@@ -250,6 +247,12 @@ pub struct UploadChunkRequest {
     pub chunk_id: HashId,
     pub raw_len: u64,
     pub compressed_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadChunkRequest {
+    pub volume_id: u64,
+    pub chunk_id: HashId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

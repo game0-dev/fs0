@@ -1,54 +1,98 @@
-mod data;
-mod download;
-mod upload;
+pub(crate) mod data;
+mod request_scheduler;
 
-use crate::client::StorageTarget;
+use crate::{Fs0Error, Fs0Result};
 use fs0_config::ClientConfig;
 use fs0_core::{
-    Fs0Error, Fs0Result, TRANSPORT_DATA_ALPN,
-    protocol::{DataRequest, DataResponse, ProtocolRequest, ProtocolResponse},
+    TRANSPORT_DATA_ALPN,
+    protocol::{
+        DataRequest, DataResponse, DownloadChunkRequest, ProtocolRequest, ProtocolResponse,
+        UploadChunkRequest, UploadChunkResponse,
+    },
 };
 use fs0_transport::{Connection, Transport};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Mutex;
+
+use self::request_scheduler::HashRequestScheduler;
 
 #[derive(Debug)]
 pub(crate) struct StorageSession {
+    pub(crate) inner: Arc<StorageSessionInner>,
+    upload_scheduler: HashRequestScheduler<(), UploadChunkRequest, UploadChunkResponse>,
+    download_scheduler: HashRequestScheduler<(), DownloadChunkRequest, Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StorageSessionInner {
     config: ClientConfig,
     transport: Transport,
-    storage_id: u64,
+    client_id: u64,
+    iroh_endpoint: Vec<u8>,
     connection: Mutex<Option<Connection>>,
-    upload_permits: Arc<Semaphore>,
-    download_permits: Arc<Semaphore>,
 }
 
 impl StorageSession {
     pub(crate) fn new(
         config: ClientConfig,
         transport: Transport,
-        storage_id: u64,
-        upload_concurrency: usize,
-        download_concurrency: usize,
+        client_id: u64,
+        iroh_endpoint: Vec<u8>,
     ) -> Self {
-        Self {
+        let upload_concurrency = config.upload_concurrency;
+        let download_concurrency = config.download_concurrency;
+        let inner = Arc::new(StorageSessionInner {
             config,
             transport,
-            storage_id,
+            client_id,
+            iroh_endpoint,
             connection: Mutex::new(None),
-            upload_permits: Arc::new(Semaphore::new(upload_concurrency.max(1))),
-            download_permits: Arc::new(Semaphore::new(download_concurrency.max(1))),
+        });
+        let upload_scheduler = HashRequestScheduler::new(upload_concurrency, {
+            let inner = Arc::clone(&inner);
+            move |(), request| {
+                let inner = Arc::clone(&inner);
+                Box::pin(async move { inner.upload_chunk(request).await })
+            }
+        });
+        let download_scheduler = HashRequestScheduler::new(download_concurrency, {
+            let inner = Arc::clone(&inner);
+            move |(), request| {
+                let inner = Arc::clone(&inner);
+                Box::pin(async move { inner.download_chunk(request).await })
+            }
+        });
+
+        Self {
+            inner,
+            upload_scheduler,
+            download_scheduler,
         }
     }
 
-    pub(crate) async fn ensure_connected(
+    pub(crate) async fn upload_chunk(
         &self,
-        client_id: u64,
-        target: &StorageTarget,
-    ) -> Fs0Result<Connection> {
-        if target.storage_id != self.storage_id {
-            return Err(Fs0Error::InvalidRequest);
-        }
+        request: UploadChunkRequest,
+    ) -> Fs0Result<Arc<UploadChunkResponse>> {
+        let chunk_id = request.chunk_id;
+        self.upload_scheduler.request(chunk_id, (), request).await
+    }
 
+    pub(crate) async fn download_chunk(
+        &self,
+        request: DownloadChunkRequest,
+    ) -> Fs0Result<Arc<Vec<u8>>> {
+        let chunk_id = request.chunk_id;
+        self.download_scheduler.request(chunk_id, (), request).await
+    }
+
+    pub(crate) async fn close(&self, reason: &[u8]) {
+        self.inner.close(reason).await;
+    }
+}
+
+impl StorageSessionInner {
+    pub(crate) async fn ensure_connected(&self) -> Fs0Result<Connection> {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.as_ref()
             && !connection.is_closed()
@@ -60,21 +104,21 @@ impl StorageSession {
             closed.close(b"fs0 storage reconnect");
         }
 
-        let data_endpoint = postcard::from_bytes(&target.iroh_endpoint).map_err(Fs0Error::from)?;
+        let data_endpoint = postcard::from_bytes(&self.iroh_endpoint).map_err(Fs0Error::from)?;
         let connection = self
             .transport
             .connect(data_endpoint, TRANSPORT_DATA_ALPN)
             .await?;
         match connection
             .rpc(ProtocolRequest::Data(DataRequest::Authenticate {
-                client_id,
+                client_id: self.client_id,
                 client_token: self.config.token.clone(),
             }))
             .await
         {
             Ok(ProtocolResponse::Data(DataResponse::Authenticate {
                 client_id: authenticated_client_id,
-            })) if authenticated_client_id == client_id => {}
+            })) if authenticated_client_id == self.client_id => {}
             Ok(ProtocolResponse::Error(err)) => {
                 connection.close(b"storage authentication failed");
                 return Err(err);
@@ -96,13 +140,8 @@ impl StorageSession {
         Ok(connection)
     }
 
-    pub(crate) async fn request(
-        &self,
-        client_id: u64,
-        target: &StorageTarget,
-        request: DataRequest,
-    ) -> Fs0Result<DataResponse> {
-        let connection = self.ensure_connected(client_id, target).await?;
+    pub(crate) async fn request(&self, request: DataRequest) -> Fs0Result<DataResponse> {
+        let connection = self.ensure_connected().await?;
         let response = match connection.rpc(ProtocolRequest::Data(request)).await? {
             ProtocolResponse::Error(err) => Err(err),
             ProtocolResponse::Data(response) => Ok(response),
@@ -117,31 +156,9 @@ impl StorageSession {
         response
     }
 
-    pub(crate) async fn close(&self, reason: &[u8]) {
+    async fn close(&self, reason: &[u8]) {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.close(reason);
         }
-    }
-
-    pub(crate) fn upload_available_permits(&self) -> usize {
-        self.upload_permits.available_permits()
-    }
-
-    pub(crate) async fn acquire_upload_permit(&self) -> Fs0Result<OwnedSemaphorePermit> {
-        Arc::clone(&self.upload_permits)
-            .acquire_owned()
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })
-    }
-
-    pub(crate) async fn acquire_download_permit(&self) -> Fs0Result<OwnedSemaphorePermit> {
-        Arc::clone(&self.download_permits)
-            .acquire_owned()
-            .await
-            .map_err(|err| Fs0Error::Internal {
-                message: err.to_string(),
-            })
     }
 }

@@ -2,8 +2,8 @@ use crate::server::StorageServer;
 use fs0_core::{
     Fs0Error, Fs0Result, HashId, blake3_hash,
     protocol::{
-        CommitBundleRequest, CommitBundleResponse, DataResponse, UploadChunkRequest,
-        UploadChunkResponse,
+        CommitBundleRequest, CommitBundleResponse, DataResponse, DownloadChunkRequest,
+        UploadChunkRequest, UploadChunkResponse,
     },
     utils::now_ms,
     zstd_decompress,
@@ -78,10 +78,12 @@ pub(super) async fn upload_chunk(
 
 pub(super) async fn download_chunk(
     server: &StorageServer,
-    volume_id: u64,
-    chunk_id: HashId,
+    request: DownloadChunkRequest,
 ) -> Fs0Result<DataResponse> {
-    let (_meta, bytes) = server.volume(volume_id)?.read_chunk(chunk_id).await?;
+    let (_meta, bytes) = server
+        .volume(request.volume_id)?
+        .read_chunk(request.chunk_id)
+        .await?;
     Ok(DataResponse::DownloadChunk {
         compressed_bytes: bytes,
     })

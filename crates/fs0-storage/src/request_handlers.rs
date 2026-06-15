@@ -31,10 +31,7 @@ pub(crate) async fn handle_data_request(
             chunk_id,
         } => data::has_chunk(server, volume_id, chunk_id).await,
         DataRequest::UploadChunk(request) => data::upload_chunk(server, request).await,
-        DataRequest::DownloadChunk {
-            volume_id,
-            chunk_id,
-        } => data::download_chunk(server, volume_id, chunk_id).await,
+        DataRequest::DownloadChunk(request) => data::download_chunk(server, request).await,
         DataRequest::HasBundle {
             volume_id,
             bundle_id,
