@@ -61,7 +61,7 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
 }
 
 pub(super) async fn connect_client(config: &Option<PathBuf>) -> Fs0Result<Fs0Client> {
-    Fs0Client::connect(Fs0Config::load_from(config_path(config))?.client()?).await
+    Fs0Client::connect(Fs0Config::load_client_from(config_path(config))?).await
 }
 
 pub(super) fn config_path(config: &Option<PathBuf>) -> PathBuf {

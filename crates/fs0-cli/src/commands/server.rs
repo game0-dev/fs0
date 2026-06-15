@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 pub(super) async fn run_central(config: &Option<PathBuf>) -> Fs0Result<()> {
     let server =
-        fs0_central::CentralServer::run(Fs0Config::load_from(config_path(config))?.central()?)
-            .await?;
+        fs0_central::CentralServer::run(Fs0Config::load_central_from(config_path(config))?).await?;
     println!("central endpoint: {:?}", server.control_endpoint());
     wait_for_shutdown_signal().await?;
     server.shutdown().await;
@@ -15,8 +14,7 @@ pub(super) async fn run_central(config: &Option<PathBuf>) -> Fs0Result<()> {
 
 pub(super) async fn run_storage(config: &Option<PathBuf>) -> Fs0Result<()> {
     let server =
-        fs0_storage::StorageServer::run(Fs0Config::load_from(config_path(config))?.storage()?)
-            .await?;
+        fs0_storage::StorageServer::run(Fs0Config::load_storage_from(config_path(config))?).await?;
     wait_for_shutdown_signal().await?;
     server.shutdown().await;
     Ok(())

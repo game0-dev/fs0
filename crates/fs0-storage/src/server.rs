@@ -94,7 +94,7 @@ impl StorageServer {
     }
 
     pub async fn run_config(path: impl AsRef<Path>) -> Fs0Result<Arc<Self>> {
-        Self::run(fs0_config::Fs0Config::load_from(path)?.storage()?).await
+        Self::run(fs0_config::Fs0Config::load_storage_from(path)?).await
     }
 
     #[must_use]

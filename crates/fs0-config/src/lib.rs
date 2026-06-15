@@ -79,6 +79,21 @@ pub struct Fs0Config {
     pub client: Option<ClientConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CentralRoot {
+    central: Option<CentralConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageRoot {
+    storage: Option<StorageConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientRoot {
+    client: Option<ClientConfig>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CentralConfig {
     pub db_path: PathBuf,
@@ -111,6 +126,7 @@ pub struct StorageConfig {
     pub bind_port: Option<u16>,
     #[serde(default)]
     pub relay: Option<RelayClientConfig>,
+    #[serde(default)]
     pub volumes: Vec<StorageVolumeConfig>,
     #[serde(default)]
     pub check_hash_before_write: bool,
@@ -167,6 +183,18 @@ impl Fs0Config {
         load_toml(path)
     }
 
+    pub fn load_central_from(path: impl AsRef<Path>) -> Fs0Result<CentralConfig> {
+        CentralRoot::load_from(path)
+    }
+
+    pub fn load_storage_from(path: impl AsRef<Path>) -> Fs0Result<StorageConfig> {
+        StorageRoot::load_from(path)
+    }
+
+    pub fn load_client_from(path: impl AsRef<Path>) -> Fs0Result<ClientConfig> {
+        ClientRoot::load_from(path)
+    }
+
     pub fn central(self) -> Fs0Result<CentralConfig> {
         self.central.ok_or_else(|| Fs0Error::InvalidConfig {
             message: "missing [central] config section".to_owned(),
@@ -183,6 +211,36 @@ impl Fs0Config {
         self.client.ok_or_else(|| Fs0Error::InvalidConfig {
             message: "missing [client] config section".to_owned(),
         })
+    }
+}
+
+impl CentralRoot {
+    fn load_from(path: impl AsRef<Path>) -> Fs0Result<CentralConfig> {
+        load_toml::<Self>(path)?
+            .central
+            .ok_or_else(|| Fs0Error::InvalidConfig {
+                message: "missing [central] config section".to_owned(),
+            })
+    }
+}
+
+impl StorageRoot {
+    fn load_from(path: impl AsRef<Path>) -> Fs0Result<StorageConfig> {
+        load_toml::<Self>(path)?
+            .storage
+            .ok_or_else(|| Fs0Error::InvalidConfig {
+                message: "missing [storage] config section".to_owned(),
+            })
+    }
+}
+
+impl ClientRoot {
+    fn load_from(path: impl AsRef<Path>) -> Fs0Result<ClientConfig> {
+        load_toml::<Self>(path)?
+            .client
+            .ok_or_else(|| Fs0Error::InvalidConfig {
+                message: "missing [client] config section".to_owned(),
+            })
     }
 }
 
@@ -369,5 +427,64 @@ mod tests {
                 .and_then(|relay| relay.ca_cert.as_deref())
                 .is_some_and(|ca_cert| ca_cert.contains("test-client-ca"))
         );
+    }
+
+    #[test]
+    fn central_loader_ignores_invalid_client_and_storage_sections() {
+        let config_toml = r#"
+            [central]
+            db_path = ".local/central.sqlite"
+            secret_key = "REPLACE_WITH_CENTRAL_SECRET_KEY"
+            bind_port = 7800
+            replication_factor = 1
+
+            [central.relay]
+            public_url = "https://127.0.0.1:7801"
+            token = "REPLACE_WITH_RELAY_TOKEN"
+            https_bind_port = 7801
+            cert_path = ".local/relay-cert.pem"
+            key_path = ".local/relay-key.pem"
+            quic_bind_port = 7802
+
+            [client]
+            token = "REPLACE_WITH_CLIENT_TOKEN"
+            central_endpoint_id = "REPLACE_WITH_CENTRAL_ENDPOINT_ID_FROM_CENTRAL_RUN"
+            central_addr = "127.0.0.1:7800"
+
+            [storage]
+            name = "local-storage-1"
+            token = "REPLACE_WITH_STORAGE_TOKEN"
+            central_endpoint_id = "REPLACE_WITH_CENTRAL_ENDPOINT_ID_FROM_CENTRAL_RUN"
+            central_addr = "127.0.0.1:7800"
+        "#;
+        let path = env::temp_dir().join(format!(
+            "fs0-config-central-loader-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, config_toml).unwrap();
+
+        let central = Fs0Config::load_central_from(&path).unwrap();
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(central.bind_port, 7800);
+        assert_eq!(central.replication_factor, 1);
+    }
+
+    #[test]
+    fn storage_volumes_default_to_empty() {
+        let config_toml = format!(
+            r#"
+            [storage]
+            name = "local-storage-1"
+            token = "REPLACE_WITH_STORAGE_TOKEN"
+            central_endpoint_id = "{CENTRAL_ENDPOINT_ID}"
+            central_addr = "127.0.0.1:7800"
+            bind_port = 3341
+        "#
+        );
+        let config: StorageRoot = toml::from_str(&config_toml).unwrap();
+        let storage = config.storage.unwrap();
+
+        assert!(storage.volumes.is_empty());
     }
 }

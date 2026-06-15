@@ -31,7 +31,7 @@ pub(super) fn inspect(path: PathBuf) -> Fs0Result<()> {
 }
 
 async fn connect_client_from_storage_config(config: PathBuf) -> Fs0Result<Fs0Client> {
-    let config = Fs0Config::load_from(config)?.storage()?;
+    let config = Fs0Config::load_storage_from(config)?;
     Fs0Client::connect(ClientConfig::new(
         config.token,
         config.central_endpoint,
