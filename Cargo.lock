@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-central"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs0-config",
  "fs0-core",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "fs0-central",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "fs0-config",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs0-core",
  "iroh",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "postcard",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs0-config",
  "fs0-core",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs0-config",
  "fs0-core",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "fs0-volume"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "fs0-core",
