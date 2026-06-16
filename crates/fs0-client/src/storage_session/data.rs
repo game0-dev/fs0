@@ -34,6 +34,31 @@ impl StorageSessionInner {
         }
     }
 
+    pub(crate) async fn has_chunk(
+        &self,
+        volume_id: u64,
+        chunk_id: HashId,
+    ) -> Fs0Result<Option<(u64, u64)>> {
+        let response = self
+            .request(DataRequest::HasChunk {
+                volume_id,
+                chunk_id,
+            })
+            .await?;
+
+        match response {
+            DataResponse::HasChunk {
+                exists: true,
+                raw_len: Some(raw_len),
+                compressed_len: Some(compressed_len),
+            } => Ok(Some((raw_len, compressed_len))),
+            DataResponse::HasChunk { exists: false, .. } => Ok(None),
+            response => Err(Fs0Error::InvalidFrame {
+                message: format!("unexpected data response: {response:?}"),
+            }),
+        }
+    }
+
     pub(crate) async fn upload_chunk(
         &self,
         request: UploadChunkRequest,

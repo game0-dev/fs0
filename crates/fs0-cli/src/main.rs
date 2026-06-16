@@ -5,9 +5,16 @@ mod output;
 use clap::Parser;
 use fs0_core::Fs0Result;
 use std::process::ExitCode;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("fs0=info")),
+        )
+        .init();
+
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

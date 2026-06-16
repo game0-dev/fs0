@@ -20,3 +20,4 @@ fs0-storage.workspace = true
 fs0-volume.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "signal"] }
+tracing-subscriber.workspace = true

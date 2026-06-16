@@ -1,34 +1,35 @@
-use crate::{central_session::CentralSession, storage_session::StorageSession};
+use crate::{
+    central_session::CentralSession,
+    storage_session::{StorageSession, UploadChunkJob},
+};
 pub use fs0_config::ClientConfig;
 use fs0_core::{
-    DEFAULT_ZSTD_LEVEL, Fs0Error, Fs0Result, HashId, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE,
-    blake3_hash, bundle_hash_from_chunks,
+    Fs0Error, Fs0Result, HashId, VOLUME_BUNDLE_RAW_SIZE, VOLUME_RAW_CHUNK_SIZE, blake3_hash,
+    bundle_hash_from_chunks,
     protocol::{
         BeginUpdateRequest, BundleChunkRef, CommitBundleRequest, CommitUpdateRequest,
         CommittedBundle, DirectoryEntries, DownloadChunkRequest, FileChangeLogs, FileReadPlan,
-        FileRecord, StoragePeerInfo, UploadChunkRequest,
+        FileRecord, StoragePeerInfo, UploadChunkResponse,
     },
-    zstd_compress, zstd_decompress,
+    zstd_decompress,
 };
 use fs0_transport::Transport;
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
 };
+use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::info;
+
+const MAX_PENDING_UPLOAD_BUNDLES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransferStats {
-    pub raw_bytes: u64,
-    pub compressed_bytes: u64,
     pub chunks: u64,
-    pub bundles: u64,
-    pub downloaded_compressed_bytes: u64,
-    pub cached_compressed_bytes: u64,
-    pub downloaded_chunks: u64,
-    pub cached_chunks: u64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,18 +39,35 @@ pub struct CentralStatus {
 }
 
 #[derive(Debug)]
-struct PreparedBundle {
+struct SpoolBundle {
     index: u64,
     bundle_id: HashId,
     raw_len: u64,
     chunks: Vec<BundleChunkRef>,
-    uploads: Vec<PreparedChunk>,
+    uploads: Vec<SpoolChunk>,
+    temp_dir: TempDir,
 }
 
 #[derive(Debug)]
-struct PreparedChunk {
+struct SpoolChunk {
     chunk_id: HashId,
-    raw_bytes: Vec<u8>,
+    raw_len: u64,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PendingBundle {
+    bundle_id: HashId,
+    raw_len: u64,
+    chunks: Vec<BundleChunkRef>,
+    unfinished_chunk_hashes: HashSet<HashId>,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadCompletion {
+    chunk_id: HashId,
+    result: Fs0Result<Arc<UploadChunkResponse>>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +76,19 @@ pub struct Fs0Client {
     central: Arc<CentralSession>,
     transport: Transport,
     storage_sessions: Arc<Mutex<HashMap<u64, Arc<StorageSession>>>>,
+}
+
+#[derive(Debug)]
+struct ChunkJob {
+    chunk_id: HashId,
+    ready: bool,
+}
+
+struct InternalDownloadState {
+    jobs: Vec<ChunkJob>,
+    remain_chunks: u64,
+    first_error: Option<Fs0Error>,
+    done_tx: Option<oneshot::Sender<Fs0Result<()>>>,
 }
 
 impl Fs0Client {
@@ -194,12 +225,17 @@ impl Fs0Client {
     {
         let plan = self.central.get_file_read_plan(remote_path).await?;
         let storages = self.storage_peers();
-        let mut stats = TransferStats::default();
+        let (done_tx, done_rx) = oneshot::channel();
+        let total_chunks = plan.size.div_ceil(fs0_core::VOLUME_RAW_CHUNK_SIZE);
+        let remain_chunks = total_chunks;
+        let download_state = Arc::new(StdMutex::new(InternalDownloadState {
+            jobs: Vec::new(),
+            remain_chunks,
+            first_error: None,
+            done_tx: Some(done_tx),
+        }));
 
         for bundle in &plan.bundles {
-            let mut last_error = None;
-            let mut downloaded = None;
-
             for replica in &bundle.replicas {
                 let Some(storage) = storages
                     .iter()
@@ -207,83 +243,124 @@ impl Fs0Client {
                 else {
                     continue;
                 };
+
                 let session = self.storage_session(storage).await;
-                let attempt = async {
-                    let chunks = session
-                        .inner
-                        .list_bundle_chunks(replica.volume_id, bundle.bundle_id)
-                        .await?;
-                    if bundle_hash_from_chunks(&chunks) != bundle.bundle_id {
-                        return Err(Fs0Error::InvalidData {
-                            message: "bundle id does not match listed chunk ids".to_owned(),
-                        });
-                    }
+                let chunks = session
+                    .inner
+                    .list_bundle_chunks(replica.volume_id, bundle.bundle_id)
+                    .await?;
 
-                    let mut raw_chunks = Vec::with_capacity(chunks.len());
-                    let mut raw_len = 0u64;
-                    let mut compressed_len = 0u64;
-                    for chunk in chunks {
-                        let compressed = session
-                            .download_chunk(DownloadChunkRequest {
-                                volume_id: replica.volume_id,
-                                chunk_id: chunk.chunk_id,
-                            })
-                            .await?;
-                        let raw = decompress_and_verify_chunk(
-                            chunk.chunk_id,
-                            compressed.as_slice(),
-                            VOLUME_RAW_CHUNK_SIZE,
-                        )?;
-                        raw_len = raw_len.checked_add(raw.len() as u64).ok_or_else(|| {
-                            Fs0Error::IntegerConversion {
-                                message: "bundle raw_len overflow".to_owned(),
-                            }
+                for chunk in &chunks {
+                    let chunk_id = chunk.chunk_id;
+                    let job_index = {
+                        let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
+                            message: "download state lock was poisoned".to_owned(),
                         })?;
-                        compressed_len = compressed_len
-                            .checked_add(compressed.len() as u64)
-                            .ok_or_else(|| Fs0Error::IntegerConversion {
-                                message: "bundle compressed_len overflow".to_owned(),
-                            })?;
-                        raw_chunks.push(raw);
-                    }
-
-                    if raw_len != bundle.raw_len || compressed_len != bundle.compressed_len {
-                        return Err(Fs0Error::InvalidData {
-                            message: "downloaded bundle lengths do not match read plan".to_owned(),
+                        let job_index = state.jobs.len();
+                        state.jobs.push(ChunkJob {
+                            chunk_id,
+                            ready: false,
                         });
-                    }
+                        job_index
+                    };
 
-                    let chunk_count = raw_chunks.len() as u64;
-                    Ok::<_, Fs0Error>((raw_chunks, raw_len, compressed_len, chunk_count))
-                }
-                .await;
+                    let download_state = Arc::clone(&download_state);
+                    session
+                        .enqueue_download(
+                            DownloadChunkRequest {
+                                volume_id: replica.volume_id,
+                                chunk_id,
+                            },
+                            move |result| {
+                                let Ok(mut state) = download_state.lock() else {
+                                    return;
+                                };
 
-                match attempt {
-                    Ok(bundle_bytes) => {
-                        downloaded = Some(bundle_bytes);
-                        break;
-                    }
-                    Err(err) => last_error = Some(err),
+                                match result {
+                                    Ok(_) => {
+                                        if let Some(entry) = state.jobs.get_mut(job_index) {
+                                            entry.ready = true;
+                                        } else if state.first_error.is_none() {
+                                            state.first_error = Some(Fs0Error::Internal {
+                                                message: format!(
+                                                    "download job {job_index} was not tracked"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if state.first_error.is_none() {
+                                            state.first_error = Some(err);
+                                        }
+                                    }
+                                }
+
+                                state.remain_chunks = state.remain_chunks.saturating_sub(1);
+                                let completed_chunks =
+                                    total_chunks.saturating_sub(state.remain_chunks);
+                                info!(completed_chunks, total_chunks, "download chunks completed");
+                                if state.remain_chunks == 0
+                                    && let Some(done_tx) = state.done_tx.take()
+                                {
+                                    let result = match state.first_error.take() {
+                                        Some(err) => Err(err),
+                                        None => Ok(()),
+                                    };
+                                    let _ = done_tx.send(result);
+                                }
+                            },
+                        )
+                        .await?;
                 }
             }
-
-            let (raw_chunks, raw_len, compressed_len, chunk_count) =
-                downloaded.ok_or_else(|| last_error.unwrap_or(Fs0Error::NotFound))?;
-            for raw in raw_chunks {
-                writer.write_all(&raw).await?;
-            }
-
-            stats.raw_bytes += raw_len;
-            stats.compressed_bytes += compressed_len;
-            stats.downloaded_compressed_bytes += compressed_len;
-            stats.chunks += chunk_count;
-            stats.downloaded_chunks += chunk_count;
-            stats.bundles += 1;
         }
 
+        if remain_chunks > 0 {
+            done_rx.await.map_err(|_| Fs0Error::Internal {
+                message: "download completion channel closed".to_owned(),
+            })??;
+        }
+
+        let chunk_jobs = {
+            let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
+                message: "download state lock was poisoned".to_owned(),
+            })?;
+            std::mem::take(&mut state.jobs)
+        };
+        let download_cache_dir = self
+            .config
+            .download_cache_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("fs0-client-cache"));
+
+        for job in &chunk_jobs {
+            if !job.ready {
+                return Err(Fs0Error::Internal {
+                    message: "download job was not ready before write".to_owned(),
+                });
+            }
+
+            let cache_path = download_cache_dir.join(format!("{}.zst", hash_to_hex(job.chunk_id)));
+            let compressed = tokio::fs::read(&cache_path).await?;
+            let raw = match decompress_and_verify_chunk(
+                job.chunk_id,
+                compressed.as_slice(),
+                VOLUME_RAW_CHUNK_SIZE,
+            ) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&cache_path).await;
+                    return Err(error);
+                }
+            };
+            writer.write_all(&raw).await?;
+        }
         writer.flush().await?;
 
-        Ok(stats)
+        Ok(TransferStats {
+            chunks: total_chunks,
+            size: plan.size,
+        })
     }
 
     pub async fn download_file(
@@ -332,29 +409,36 @@ impl Fs0Client {
             let mut suffix_bundles = BTreeMap::new();
             let session = self.storage_session(&storage).await;
             let mut bundle_index = 0u64;
+            let mut input_done = false;
+            let mut pending_bundles = BTreeMap::new();
+            let mut active_by_hash = HashMap::<HashId, Vec<u64>>::new();
+            let mut active_raw_lens = HashMap::<HashId, u64>::new();
+            let mut done_hashes = HashSet::new();
+            let (upload_tx, mut upload_rx) = mpsc::unbounded_channel();
 
             loop {
-                let Some(bundle) = read_prepared_bundle(&mut reader, bundle_index).await? else {
-                    break;
-                };
+                while !input_done && pending_bundles.len() < MAX_PENDING_UPLOAD_BUNDLES {
+                    let Some(bundle) = read_spool_bundle(&mut reader, bundle_index).await? else {
+                        input_done = true;
+                        break;
+                    };
 
-                new_size = new_size.checked_add(bundle.raw_len).ok_or_else(|| {
-                    Fs0Error::IntegerConversion {
-                        message: "uploaded file size overflow".to_owned(),
-                    }
-                })?;
+                    new_size = new_size.checked_add(bundle.raw_len).ok_or_else(|| {
+                        Fs0Error::IntegerConversion {
+                            message: "uploaded file size overflow".to_owned(),
+                        }
+                    })?;
 
-                if self.central.has_bundle(bundle.bundle_id, None).await? {
-                    suffix_bundles.insert(
-                        bundle.index,
-                        CommittedBundle {
-                            bundle_id: bundle.bundle_id,
-                            raw_len: bundle.raw_len,
-                            compressed_len: 0,
-                        },
-                    );
-                } else {
-                    if let Some((raw_len, compressed_len)) = session
+                    if self.central.has_bundle(bundle.bundle_id, None).await? {
+                        suffix_bundles.insert(
+                            bundle.index,
+                            CommittedBundle {
+                                bundle_id: bundle.bundle_id,
+                                raw_len: bundle.raw_len,
+                                compressed_len: 0,
+                            },
+                        );
+                    } else if let Some((raw_len, compressed_len)) = session
                         .inner
                         .has_bundle(volume_id, bundle.bundle_id)
                         .await?
@@ -368,69 +452,98 @@ impl Fs0Client {
                             },
                         );
                     } else {
-                        let mut uploads = tokio::task::JoinSet::new();
-                        for chunk in bundle.uploads {
-                            let session = Arc::clone(&session);
-                            uploads.spawn(async move {
-                                let raw_len = chunk.raw_bytes.len() as u64;
-                                let request = UploadChunkRequest {
-                                    lease_id: lease.lease_id,
-                                    file_id: lease.file_id,
-                                    volume_id,
-                                    chunk_id: chunk.chunk_id,
-                                    raw_len,
-                                    compressed_bytes: zstd_compress(
-                                        &chunk.raw_bytes,
-                                        DEFAULT_ZSTD_LEVEL,
-                                    )?,
-                                };
-                                let response = session.upload_chunk(request).await?;
-
-                                if response.chunk_id != chunk.chunk_id
-                                    || response.raw_len != raw_len
-                                {
-                                    return Err(Fs0Error::InvalidData {
-                                        message: "uploaded chunk metadata does not match request"
-                                            .to_owned(),
-                                    });
-                                }
-
-                                Ok(())
-                            });
-                        }
-
-                        while let Some(result) = uploads.join_next().await {
-                            match result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => {
-                                    uploads.abort_all();
-                                    return Err(err);
-                                }
-                                Err(err) => {
-                                    uploads.abort_all();
-                                    return Err(Fs0Error::Internal {
-                                        message: err.to_string(),
-                                    });
-                                }
-                            }
-                        }
-
-                        let bundle_index = bundle.index;
-                        let committed = session
-                            .inner
-                            .commit_bundle(CommitBundleRequest {
-                                volume_id,
-                                lease_id: lease.lease_id,
-                                file_id: lease.file_id,
-                                bundle_id: bundle.bundle_id,
-                                chunks: bundle.chunks,
-                            })
-                            .await?;
-                        suffix_bundles.insert(bundle_index, committed);
+                        let SpoolBundle {
+                            index,
+                            bundle_id,
+                            raw_len,
+                            chunks,
+                            uploads,
+                            temp_dir,
+                        } = bundle;
+                        let unfinished_chunk_hashes =
+                            uploads.iter().map(|chunk| chunk.chunk_id).collect();
+                        pending_bundles.insert(
+                            index,
+                            PendingBundle {
+                                bundle_id,
+                                raw_len,
+                                chunks,
+                                unfinished_chunk_hashes,
+                                temp_dir,
+                            },
+                        );
+                        schedule_upload_chunks(
+                            Arc::clone(&session),
+                            volume_id,
+                            lease.lease_id,
+                            lease.file_id,
+                            index,
+                            uploads,
+                            &mut pending_bundles,
+                            &mut active_by_hash,
+                            &mut active_raw_lens,
+                            &done_hashes,
+                            &upload_tx,
+                        )
+                        .await?;
                     }
+
+                    bundle_index += 1;
+                    drain_upload_completions(
+                        &mut upload_rx,
+                        &mut pending_bundles,
+                        &mut active_by_hash,
+                        &mut active_raw_lens,
+                        &mut done_hashes,
+                    )?;
+                    commit_ready_bundles(
+                        &session,
+                        volume_id,
+                        lease.lease_id,
+                        lease.file_id,
+                        &mut pending_bundles,
+                        &mut suffix_bundles,
+                    )
+                    .await?;
                 }
 
-                bundle_index += 1;
+                drain_upload_completions(
+                    &mut upload_rx,
+                    &mut pending_bundles,
+                    &mut active_by_hash,
+                    &mut active_raw_lens,
+                    &mut done_hashes,
+                )?;
+                commit_ready_bundles(
+                    &session,
+                    volume_id,
+                    lease.lease_id,
+                    lease.file_id,
+                    &mut pending_bundles,
+                    &mut suffix_bundles,
+                )
+                .await?;
+
+                if input_done && pending_bundles.is_empty() && active_by_hash.is_empty() {
+                    break;
+                }
+
+                if active_by_hash.is_empty() {
+                    return Err(Fs0Error::Internal {
+                        message: "pending upload bundles have no active chunk uploads".to_owned(),
+                    });
+                }
+
+                let completion = upload_rx.recv().await.ok_or_else(|| Fs0Error::Internal {
+                    message: "upload completion channel closed".to_owned(),
+                })?;
+                process_upload_completion(
+                    completion,
+                    &mut pending_bundles,
+                    &mut active_by_hash,
+                    &mut active_raw_lens,
+                    &mut done_hashes,
+                )?;
             }
 
             Ok::<_, Fs0Error>((new_size, suffix_bundles.into_values().collect()))
@@ -499,10 +612,11 @@ async fn close_storage_sessions(
     }
 }
 
-async fn read_prepared_bundle<R>(reader: &mut R, index: u64) -> Fs0Result<Option<PreparedBundle>>
+async fn read_spool_bundle<R>(reader: &mut R, index: u64) -> Fs0Result<Option<SpoolBundle>>
 where
     R: AsyncRead + Unpin,
 {
+    let temp_dir = tempfile::tempdir()?;
     let mut buffer = vec![0u8; VOLUME_RAW_CHUNK_SIZE as usize];
     let mut raw_len = 0u64;
     let mut chunks = Vec::new();
@@ -518,13 +632,19 @@ where
 
         let raw = &buffer[..read];
         let chunk_id = blake3_hash(raw);
+        let chunk_index = chunks.len() as u64;
+        let path = temp_dir.path().join(format!("chunk-{chunk_index}"));
+        let mut file = tokio::fs::File::create(&path).await?;
+        file.write_all(raw).await?;
+        file.flush().await?;
         chunks.push(BundleChunkRef {
-            chunk_index: chunks.len() as u64,
+            chunk_index,
             chunk_id,
         });
-        uploads.push(PreparedChunk {
+        uploads.push(SpoolChunk {
             chunk_id,
-            raw_bytes: raw.to_vec(),
+            raw_len: read as u64,
+            path,
         });
         raw_len += read as u64;
     }
@@ -533,13 +653,189 @@ where
         return Ok(None);
     }
 
-    Ok(Some(PreparedBundle {
+    Ok(Some(SpoolBundle {
         index,
         bundle_id: bundle_hash_from_chunks(&chunks),
         raw_len,
         chunks,
         uploads,
+        temp_dir,
     }))
+}
+
+async fn schedule_upload_chunks(
+    session: Arc<StorageSession>,
+    volume_id: u64,
+    lease_id: u64,
+    file_id: u64,
+    bundle_index: u64,
+    uploads: Vec<SpoolChunk>,
+    pending_bundles: &mut BTreeMap<u64, PendingBundle>,
+    active_by_hash: &mut HashMap<HashId, Vec<u64>>,
+    active_raw_lens: &mut HashMap<HashId, u64>,
+    done_hashes: &HashSet<HashId>,
+    upload_tx: &mpsc::UnboundedSender<UploadCompletion>,
+) -> Fs0Result<()> {
+    let mut seen_in_bundle = HashSet::new();
+
+    for chunk in uploads {
+        if !seen_in_bundle.insert(chunk.chunk_id) {
+            continue;
+        }
+
+        if done_hashes.contains(&chunk.chunk_id) {
+            if let Some(bundle) = pending_bundles.get_mut(&bundle_index) {
+                bundle.unfinished_chunk_hashes.remove(&chunk.chunk_id);
+            }
+            continue;
+        }
+
+        if let Some(waiters) = active_by_hash.get_mut(&chunk.chunk_id) {
+            waiters.push(bundle_index);
+            continue;
+        }
+
+        active_by_hash.insert(chunk.chunk_id, vec![bundle_index]);
+        active_raw_lens.insert(chunk.chunk_id, chunk.raw_len);
+
+        let chunk_id = chunk.chunk_id;
+        let raw_len = chunk.raw_len;
+        let path = chunk.path;
+        let upload_tx = upload_tx.clone();
+        let raw_bytes = tokio::fs::read(&path).await?;
+        if raw_bytes.len() as u64 != raw_len {
+            return Err(Fs0Error::InvalidData {
+                message: format!(
+                    "spooled chunk {} length {} does not match raw_len {}",
+                    hash_to_hex(chunk_id),
+                    raw_bytes.len(),
+                    raw_len
+                ),
+            });
+        }
+        let job = UploadChunkJob {
+            lease_id,
+            file_id,
+            volume_id,
+            chunk_id,
+            raw_bytes,
+        };
+        session
+            .enqueue_upload(job, move |result| {
+                let _ = upload_tx.send(UploadCompletion { chunk_id, result });
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn drain_upload_completions(
+    upload_rx: &mut mpsc::UnboundedReceiver<UploadCompletion>,
+    pending_bundles: &mut BTreeMap<u64, PendingBundle>,
+    active_by_hash: &mut HashMap<HashId, Vec<u64>>,
+    active_raw_lens: &mut HashMap<HashId, u64>,
+    done_hashes: &mut HashSet<HashId>,
+) -> Fs0Result<()> {
+    while let Ok(completion) = upload_rx.try_recv() {
+        process_upload_completion(
+            completion,
+            pending_bundles,
+            active_by_hash,
+            active_raw_lens,
+            done_hashes,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn process_upload_completion(
+    completion: UploadCompletion,
+    pending_bundles: &mut BTreeMap<u64, PendingBundle>,
+    active_by_hash: &mut HashMap<HashId, Vec<u64>>,
+    active_raw_lens: &mut HashMap<HashId, u64>,
+    done_hashes: &mut HashSet<HashId>,
+) -> Fs0Result<()> {
+    let waiters =
+        active_by_hash
+            .remove(&completion.chunk_id)
+            .ok_or_else(|| Fs0Error::Internal {
+                message: "completed upload chunk was not tracked".to_owned(),
+            })?;
+    let expected_raw_len = active_raw_lens
+        .remove(&completion.chunk_id)
+        .ok_or_else(|| Fs0Error::Internal {
+            message: "completed upload chunk raw_len was not tracked".to_owned(),
+        })?;
+    let response = completion.result?;
+    if response.chunk_id != completion.chunk_id || response.raw_len != expected_raw_len {
+        return Err(Fs0Error::InvalidData {
+            message: "uploaded chunk metadata does not match request".to_owned(),
+        });
+    }
+
+    done_hashes.insert(completion.chunk_id);
+    for bundle_index in waiters {
+        let bundle = pending_bundles
+            .get_mut(&bundle_index)
+            .ok_or_else(|| Fs0Error::Internal {
+                message: format!("pending bundle {bundle_index} was not tracked"),
+            })?;
+        bundle.unfinished_chunk_hashes.remove(&completion.chunk_id);
+    }
+
+    Ok(())
+}
+
+async fn commit_ready_bundles(
+    session: &Arc<StorageSession>,
+    volume_id: u64,
+    lease_id: u64,
+    file_id: u64,
+    pending_bundles: &mut BTreeMap<u64, PendingBundle>,
+    suffix_bundles: &mut BTreeMap<u64, CommittedBundle>,
+) -> Fs0Result<()> {
+    let ready = pending_bundles
+        .iter()
+        .filter_map(|(index, bundle)| bundle.unfinished_chunk_hashes.is_empty().then_some(*index))
+        .collect::<Vec<_>>();
+
+    for bundle_index in ready {
+        let bundle = pending_bundles
+            .remove(&bundle_index)
+            .ok_or_else(|| Fs0Error::Internal {
+                message: format!("ready bundle {bundle_index} was not tracked"),
+            })?;
+        let committed = session
+            .inner
+            .commit_bundle(CommitBundleRequest {
+                volume_id,
+                lease_id,
+                file_id,
+                bundle_id: bundle.bundle_id,
+                chunks: bundle.chunks,
+            })
+            .await?;
+        if committed.raw_len != bundle.raw_len {
+            return Err(Fs0Error::InvalidData {
+                message: "committed bundle raw_len does not match spooled bundle".to_owned(),
+            });
+        }
+        suffix_bundles.insert(bundle_index, committed);
+        drop(bundle.temp_dir);
+    }
+
+    Ok(())
+}
+
+fn hash_to_hex(hash_id: HashId) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in hash_id.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 fn decompress_and_verify_chunk(

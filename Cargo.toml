@@ -43,5 +43,6 @@ thiserror = "2.0.17"
 tokio = "1.48.0"
 toml = "0.9.8"
 tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 zstd = "0.13.3"

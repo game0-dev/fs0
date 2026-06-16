@@ -1010,6 +1010,7 @@ dependencies = [
  "fs0-volume",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1023,7 +1024,9 @@ dependencies = [
  "iroh",
  "parking_lot",
  "postcard",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
