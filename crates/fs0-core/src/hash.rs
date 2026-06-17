@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::protocol::BundleChunkRef;
 
@@ -15,11 +16,30 @@ impl HashId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut output = String::with_capacity(64);
+        for byte in self.as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{byte:02x}");
+        }
+        output
+    }
 }
 
 impl From<[u8; 32]> for HashId {
     fn from(value: [u8; 32]) -> Self {
         Self(value)
+    }
+}
+
+impl fmt::Display for HashId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 

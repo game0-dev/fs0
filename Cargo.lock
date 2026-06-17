@@ -1024,7 +1024,6 @@ dependencies = [
  "iroh",
  "parking_lot",
  "postcard",
- "tempfile",
  "tokio",
  "tracing",
 ]

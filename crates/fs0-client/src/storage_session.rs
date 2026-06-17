@@ -16,8 +16,10 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use self::request_scheduler::HashRequestScheduler;
 
@@ -135,36 +137,82 @@ async fn upload_chunk_job(
     inner: &StorageSessionInner,
     job: UploadChunkJob,
 ) -> Fs0Result<UploadChunkResponse> {
+    let chunk_id = job.chunk_id;
     let raw_len = job.raw_bytes.len() as u64;
-    if blake3_hash(&job.raw_bytes) != job.chunk_id {
+    if blake3_hash(&job.raw_bytes) != chunk_id {
         return Err(Fs0Error::HashMismatch { volume_offset: 0 });
     }
 
-    if let Some((existing_raw_len, compressed_len)) =
-        inner.has_chunk(job.volume_id, job.chunk_id).await?
-    {
-        if existing_raw_len != raw_len {
-            return Err(Fs0Error::InvalidData {
-                message: "existing chunk raw_len does not match upload job".to_owned(),
+    let has_chunk_started_at = Instant::now();
+    match inner.has_chunk(job.volume_id, chunk_id).await {
+        Ok(Some((existing_raw_len, compressed_len))) => {
+            if existing_raw_len != raw_len {
+                return Err(Fs0Error::InvalidData {
+                    message: "existing chunk raw_len does not match upload job".to_owned(),
+                });
+            }
+            return Ok(UploadChunkResponse {
+                chunk_id,
+                raw_len,
+                compressed_len,
             });
         }
-        return Ok(UploadChunkResponse {
-            chunk_id: job.chunk_id,
-            raw_len,
-            compressed_len,
-        });
+        Ok(None) => {}
+        Err(err) => {
+            warn!(
+                %chunk_id,
+                raw_len,
+                elapsed_ms = has_chunk_started_at.elapsed().as_millis(),
+                error = %err,
+                "upload chunk has_chunk failed"
+            );
+            return Err(err);
+        }
     }
 
-    inner
+    let compress_started_at = Instant::now();
+    let compressed_bytes = tokio::task::spawn_blocking(move || {
+        zstd_compress(job.raw_bytes.as_slice(), DEFAULT_ZSTD_LEVEL)
+    })
+    .await
+    .map_err(|err| Fs0Error::Internal {
+        message: err.to_string(),
+    })??;
+    let compress_elapsed_ms = compress_started_at.elapsed().as_millis();
+    if compress_elapsed_ms > 1_000 {
+        info!(
+            %chunk_id,
+            raw_len,
+            compressed_len = compressed_bytes.len(),
+            elapsed_ms = compress_elapsed_ms,
+            "upload chunk compressed"
+        );
+    }
+
+    let upload_started_at = Instant::now();
+    match inner
         .upload_chunk(UploadChunkRequest {
             lease_id: job.lease_id,
             file_id: job.file_id,
             volume_id: job.volume_id,
-            chunk_id: job.chunk_id,
+            chunk_id,
             raw_len,
-            compressed_bytes: zstd_compress(&job.raw_bytes, DEFAULT_ZSTD_LEVEL)?,
+            compressed_bytes,
         })
         .await
+    {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            warn!(
+                %chunk_id,
+                raw_len,
+                elapsed_ms = upload_started_at.elapsed().as_millis(),
+                error = %err,
+                "upload chunk rpc failed"
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn download_chunk_job(
@@ -189,7 +237,7 @@ async fn download_chunk_job(
 }
 
 fn cache_path(cache_dir: &Path, chunk_id: HashId) -> PathBuf {
-    cache_dir.join(format!("{}.zst", hash_to_hex(chunk_id)))
+    cache_dir.join(format!("{}.zst", chunk_id.to_hex()))
 }
 
 fn download_cache_dir(config: &ClientConfig) -> PathBuf {
@@ -197,15 +245,6 @@ fn download_cache_dir(config: &ClientConfig) -> PathBuf {
         .download_cache_dir
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("fs0-client-cache"))
-}
-
-fn hash_to_hex(hash_id: HashId) -> String {
-    let mut output = String::with_capacity(64);
-    for byte in hash_id.as_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }
 
 fn compressed_chunk_matches(chunk_id: HashId, compressed_bytes: &[u8]) -> Fs0Result<()> {
