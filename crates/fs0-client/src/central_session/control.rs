@@ -76,6 +76,7 @@ impl CentralSession {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn has_bundle(
         &self,
         bundle_id: HashId,

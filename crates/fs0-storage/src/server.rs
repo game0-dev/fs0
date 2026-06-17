@@ -17,6 +17,7 @@ use std::{
     },
 };
 use tokio::{sync::Notify, task::JoinHandle};
+use tracing::info;
 
 pub(crate) use bundle_reporter::BundleReporter;
 pub(crate) use central_connection::CentralConnection;
@@ -55,10 +56,15 @@ impl StorageServer {
             config.relay.clone(),
         )
         .await?;
+        info!(endpoint = ?transport.addr(), "storage data transport bound");
         let central_connection = CentralConnection::new();
         central_connection
             .connect_and_register(&config, &transport, &volumes)
             .await?;
+        info!(
+            storage_id = central_connection.storage_id(),
+            "storage registered with central"
+        );
 
         let server = Arc::new(Self {
             config: Arc::new(config),

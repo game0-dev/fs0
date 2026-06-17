@@ -17,6 +17,7 @@ use std::{
     },
 };
 use tokio::{sync::Notify, task::JoinHandle};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct CentralServer {
@@ -75,6 +76,7 @@ impl CentralServer {
             None,
         )
         .await?;
+        info!(endpoint = ?transport.addr(), "central control transport bound");
         let db = CentralDb::open(&config.db_path)?;
 
         let server = Arc::new(Self {

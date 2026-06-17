@@ -216,7 +216,8 @@ mod tests {
                 tasks.spawn(async move {
                     scheduler
                         .enqueue_blocking(hash_id(index), (), move |result| {
-                            let _ = tx.send(result.unwrap());
+                            result.unwrap();
+                            let _ = tx.send(());
                         })
                         .await
                         .unwrap()

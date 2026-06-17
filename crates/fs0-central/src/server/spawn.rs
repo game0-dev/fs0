@@ -8,6 +8,7 @@ use fs0_transport::{Connection, Transport};
 use iroh_relay::server::Server as RelayServer;
 use std::sync::{Arc, Weak};
 use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
 pub(super) fn spawn_central_tasks(
     transport: Transport,
@@ -36,8 +37,12 @@ pub(super) fn spawn_central_tasks(
                     let connection = match connection {
                         Ok(Some(connection)) => connection,
                         Ok(None) => break,
-                        Err(_) => continue,
+                        Err(err) => {
+                            warn!(error = %err, "central failed to accept control connection");
+                            continue;
+                        }
                     };
+                    info!("central accepted control connection");
                     tokio::spawn(async move {
                         handle_control_connection(server, connection).await;
                     });
@@ -84,4 +89,5 @@ async fn handle_control_connection(server: Arc<CentralServer>, connection: Conne
 
     server.unregister_identity(*identity.lock().await);
     connection.close(b"central control closed");
+    info!("central control connection closed");
 }

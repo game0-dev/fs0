@@ -10,6 +10,7 @@ use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 pub(crate) struct CentralSession {
     config: ClientConfig,
@@ -85,6 +86,7 @@ impl CentralSession {
         }
 
         let central_endpoint = self.config.central_endpoint.into();
+        info!(endpoint = ?central_endpoint, "client connecting to central");
         let new_connection = self
             .transport
             .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
@@ -98,6 +100,7 @@ impl CentralSession {
             .await?
         {
             ProtocolResponse::Error(err) => {
+                warn!(error = %err, "client central registration failed");
                 new_connection.close(b"client registration failed");
                 return Err(err);
             }
@@ -120,6 +123,11 @@ impl CentralSession {
             });
         };
 
+        info!(
+            client_id,
+            storages = storages.len(),
+            "client registered with central"
+        );
         self.client_id.store(client_id, Ordering::Release);
         *self.storages.write() = storages;
         *connection = Some(new_connection.clone());

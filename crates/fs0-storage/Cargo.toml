@@ -15,6 +15,7 @@ iroh.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

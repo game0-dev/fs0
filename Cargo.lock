@@ -1065,6 +1065,7 @@ dependencies = [
  "postcard",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

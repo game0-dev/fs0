@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::sleep;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub(crate) struct CentralConnection {
@@ -42,6 +43,7 @@ impl CentralConnection {
         volumes: &HashMap<u64, Arc<Volume>>,
     ) -> Fs0Result<Connection> {
         let central_endpoint = config.central_endpoint.into();
+        info!(endpoint = ?central_endpoint, "connecting storage to central");
         let connection = transport
             .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
             .await?;
@@ -58,6 +60,7 @@ impl CentralConnection {
 
         self.storage_id.store(storage_id, Ordering::Release);
         *self.connection.write() = Some(connection.clone());
+        info!(storage_id, "storage central connection registered");
         Ok(connection)
     }
     pub(crate) fn spawn(&self, server: Weak<StorageServer>) -> Fs0Result<()> {
@@ -86,7 +89,8 @@ impl CentralConnection {
                         .await
                     {
                         Ok(connection) => connection,
-                        Err(_) => {
+                        Err(err) => {
+                            warn!(error = %err, "storage failed to reconnect to central");
                             tokio::select! {
                                 _ = server.shutdown_notify.notified() => {}
                                 _ = sleep(Duration::from_secs(1)) => {}
@@ -112,6 +116,7 @@ impl CentralConnection {
                             async move {
                                 let response = match request {
                                     ProtocolRequest::Control(request) => {
+                                        info!("storage received central control request");
                                         match handle_control_request(&server, request) {
                                             Ok(response) => ProtocolResponse::Control(response),
                                             Err(err) => ProtocolResponse::Error(err),
@@ -126,6 +131,7 @@ impl CentralConnection {
                 }
 
                 connection.close(b"storage central connection closed");
+                warn!("storage central connection closed; reconnecting");
                 *server.central_connection.connection.write() = None;
                 server
                     .central_connection
@@ -152,8 +158,10 @@ impl CentralConnection {
         connection: &Connection,
     ) -> Fs0Result<(u64, Vec<StoragePeerInfo>)> {
         let volumes = storage_volume_infos(config, volumes)?;
+        let data_endpoint_addr = transport.addr();
+        info!(endpoint = ?data_endpoint_addr, "registering storage data endpoint");
         let data_endpoint =
-            postcard::to_allocvec(&transport.addr()).map_err(|err| Fs0Error::InvalidFrame {
+            postcard::to_allocvec(&data_endpoint_addr).map_err(|err| Fs0Error::InvalidFrame {
                 message: format!("failed to encode storage endpoint: {err}"),
             })?;
 

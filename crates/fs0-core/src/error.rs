@@ -36,9 +36,9 @@ pub enum Fs0Error {
         prefer_volume_name: Option<String>,
         update_size_hint: Option<u64>,
     },
-    #[error("chunk {chunk_id:?} was not found")]
+    #[error("chunk {chunk_id} was not found")]
     ChunkNotFound { chunk_id: HashId },
-    #[error("bundle {bundle_id:?} was not found")]
+    #[error("bundle {bundle_id} was not found")]
     BundleNotFound { bundle_id: HashId },
     #[error("volume capacity exceeded: required end {required_end}, max {max_bytes}")]
     CapacityExceeded { required_end: u64, max_bytes: u64 },

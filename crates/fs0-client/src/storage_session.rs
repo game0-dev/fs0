@@ -283,6 +283,7 @@ impl StorageSessionInner {
         }
 
         let data_endpoint = postcard::from_bytes(&self.iroh_endpoint).map_err(Fs0Error::from)?;
+        info!(endpoint = ?data_endpoint, "client connecting to storage");
         let connection = self
             .transport
             .connect(data_endpoint, TRANSPORT_DATA_ALPN)
@@ -296,8 +297,14 @@ impl StorageSessionInner {
         {
             Ok(ProtocolResponse::Data(DataResponse::Authenticate {
                 client_id: authenticated_client_id,
-            })) if authenticated_client_id == self.client_id => {}
+            })) if authenticated_client_id == self.client_id => {
+                info!(
+                    client_id = self.client_id,
+                    "client authenticated storage connection"
+                );
+            }
             Ok(ProtocolResponse::Error(err)) => {
+                warn!(error = %err, "client storage authentication failed");
                 connection.close(b"storage authentication failed");
                 return Err(err);
             }

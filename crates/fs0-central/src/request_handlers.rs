@@ -11,6 +11,7 @@ use fs0_core::{
     protocol::{ControlRequest, ControlResponse, ProtocolResponse},
 };
 use fs0_transport::Connection;
+use tracing::{info, warn};
 
 pub(crate) async fn handle_control_request(
     server: &CentralServer,
@@ -29,6 +30,11 @@ pub(crate) async fn handle_control_request(
             {
                 Ok((client_id, storages)) => {
                     *identity = ControlConnectionIdentity::Client(client_id);
+                    info!(
+                        client_id,
+                        storages = storages.len(),
+                        "central registered client"
+                    );
                     Ok(ControlResponse::RegisterClient {
                         client_id,
                         storages,
@@ -49,6 +55,11 @@ pub(crate) async fn handle_control_request(
             }) {
                 Ok((storage_id, storages)) => {
                     *identity = ControlConnectionIdentity::Storage(storage_id);
+                    info!(
+                        storage_id,
+                        storages = storages.len(),
+                        "central registered storage"
+                    );
                     Ok(ControlResponse::RegisterStorage {
                         storage_id,
                         storages,
@@ -70,7 +81,10 @@ pub(crate) async fn handle_control_request(
 
     match response {
         Ok(response) => ProtocolResponse::Control(response),
-        Err(err) => ProtocolResponse::Error(err),
+        Err(err) => {
+            warn!(error = %err, "central control request failed");
+            ProtocolResponse::Error(err)
+        }
     }
 }
 
