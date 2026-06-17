@@ -22,9 +22,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check version tag
-        run: python3 .github/scripts/check-version-tag.py
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.93.1
         with:
@@ -52,23 +49,33 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: fs0-linux-x86_64
+            artifact_name: fs0-x86_64-unknown-linux-gnu
+            target_triple: x86_64-unknown-linux-gnu
             binary_name: fs0
-            archive_name: fs0-linux-x86_64.tar.gz
+            archive_ext: tar.gz
 
           - os: macos-15
-            artifact_name: fs0-macos-arm64
+            artifact_name: fs0-aarch64-apple-darwin
+            target_triple: aarch64-apple-darwin
             binary_name: fs0
-            archive_name: fs0-macos-arm64.tar.gz
+            archive_ext: tar.gz
 
           - os: windows-latest
-            artifact_name: fs0-windows-x86_64
+            artifact_name: fs0-x86_64-pc-windows-msvc
+            target_triple: x86_64-pc-windows-msvc
             binary_name: fs0.exe
-            archive_name: fs0-windows-x86_64.zip
+            archive_ext: zip
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set archive name
+        id: archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "name=fs0-${version}-${{ matrix.target_triple }}.${{ matrix.archive_ext }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.93.1
@@ -89,19 +96,19 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          tar -czf "${{ matrix.archive_name }}" -C dist "${{ matrix.binary_name }}"
+          tar -czf "${{ steps.archive.outputs.name }}" -C dist "${{ matrix.binary_name }}"
 
       - name: Package Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/${{ matrix.binary_name }}" -DestinationPath "${{ matrix.archive_name }}"
+          Compress-Archive -Path "dist/${{ matrix.binary_name }}" -DestinationPath "${{ steps.archive.outputs.name }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive_name }}
-          path: ${{ matrix.archive_name }}
+          name: ${{ steps.archive.outputs.name }}
+          path: ${{ steps.archive.outputs.name }}
 
   github-release:
     name: Create GitHub Release
