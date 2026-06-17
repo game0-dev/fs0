@@ -8,7 +8,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN test -n "$FS0_TAG" \
-    && curl -fsSL "https://github.com/${FS0_REPOSITORY}/releases/download/${FS0_TAG}/fs0-linux-x86_64.tar.gz" \
+    && version="${FS0_TAG#v}" \
+    && curl -fsSL "https://github.com/${FS0_REPOSITORY}/releases/download/${FS0_TAG}/fs0-${version}-x86_64-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin fs0 \
     && chmod +x /usr/local/bin/fs0
 
