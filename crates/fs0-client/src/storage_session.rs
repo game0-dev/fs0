@@ -1,7 +1,7 @@
 pub(crate) mod data;
 mod request_scheduler;
 
-use crate::{Fs0Error, Fs0Result};
+use crate::{Fs0Error, Fs0Result, central_session::CentralSession};
 use fs0_config::ClientConfig;
 use fs0_core::{
     DEFAULT_ZSTD_LEVEL, HashId, TRANSPORT_DATA_ALPN, blake3_hash,
@@ -50,8 +50,9 @@ impl fmt::Debug for StorageSession {
 pub(crate) struct StorageSessionInner {
     config: ClientConfig,
     transport: Transport,
+    central: Arc<CentralSession>,
     client_id: u64,
-    iroh_endpoint: Vec<u8>,
+    storage_id: u64,
     connection: Mutex<Option<Connection>>,
 }
 
@@ -59,8 +60,9 @@ impl StorageSession {
     pub(crate) fn new(
         config: ClientConfig,
         transport: Transport,
+        central: Arc<CentralSession>,
         client_id: u64,
-        iroh_endpoint: Vec<u8>,
+        storage_id: u64,
     ) -> Self {
         let upload_concurrency = config.upload_concurrency;
         let download_concurrency = config.download_concurrency;
@@ -68,8 +70,9 @@ impl StorageSession {
         let inner = Arc::new(StorageSessionInner {
             config,
             transport,
+            central,
             client_id,
-            iroh_endpoint,
+            storage_id,
             connection: Mutex::new(None),
         });
         let upload_scheduler = HashRequestScheduler::new(upload_concurrency, {
@@ -282,12 +285,24 @@ impl StorageSessionInner {
             closed.close(b"fs0 storage reconnect");
         }
 
-        let data_endpoint = postcard::from_bytes(&self.iroh_endpoint).map_err(Fs0Error::from)?;
+        let storage = self
+            .central
+            .storage_peer(self.storage_id)
+            .ok_or(Fs0Error::NotFound)?;
+        let data_endpoint = postcard::from_bytes(&storage.iroh_endpoint).map_err(Fs0Error::from)?;
         info!(endpoint = ?data_endpoint, "client connecting to storage");
         let connection = self
             .transport
             .connect(data_endpoint, TRANSPORT_DATA_ALPN)
             .await?;
+        self.authenticate(connection.clone()).await?;
+
+        *current = Some(connection.clone());
+
+        Ok(connection)
+    }
+
+    async fn authenticate(&self, connection: Connection) -> Fs0Result<()> {
         match connection
             .rpc(ProtocolRequest::Data(DataRequest::Authenticate {
                 client_id: self.client_id,
@@ -320,9 +335,7 @@ impl StorageSessionInner {
             }
         }
 
-        *current = Some(connection.clone());
-
-        Ok(connection)
+        Ok(())
     }
 
     pub(crate) async fn request(&self, request: DataRequest) -> Fs0Result<DataResponse> {

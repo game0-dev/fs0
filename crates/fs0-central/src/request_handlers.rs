@@ -8,7 +8,7 @@ use crate::{
 };
 use fs0_core::{
     FS0_VERSION,
-    protocol::{ControlRequest, ControlResponse, ProtocolResponse},
+    protocol::{ControlRequest, ControlResponse, ProtocolEvent, ProtocolResponse},
 };
 use fs0_transport::Connection;
 use tracing::{info, warn};
@@ -60,6 +60,11 @@ pub(crate) async fn handle_control_request(
                         storages = storages.len(),
                         "central registered storage"
                     );
+                    if let Some(peer) = server.storage_peer(storage_id) {
+                        server
+                            .broadcast_event(ProtocolEvent::StorageChanged(peer))
+                            .await;
+                    }
                     Ok(ControlResponse::RegisterStorage {
                         storage_id,
                         storages,
@@ -165,6 +170,22 @@ async fn handle_storage_request(
         } => storage::validate_client_auth(server, client_id, client_token),
         ControlRequest::ReportBundleReplica { events } => {
             storage::report_bundle_replica(server, storage_id, events)
+        }
+        ControlRequest::UpdateStorageEndpoint {
+            storage_id: request_storage_id,
+            iroh_endpoint,
+        } => {
+            if request_storage_id != storage_id {
+                Err(Fs0Error::Unauthorized)
+            } else {
+                let response = storage::update_storage_endpoint(server, storage_id, iroh_endpoint)?;
+                if let Some(peer) = server.storage_peer(storage_id) {
+                    server
+                        .broadcast_event(ProtocolEvent::StorageChanged(peer))
+                        .await;
+                }
+                Ok(response)
+            }
         }
         ControlRequest::UpdateStorageVolumeOffset {
             volume_id,

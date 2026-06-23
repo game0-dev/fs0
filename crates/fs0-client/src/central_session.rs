@@ -3,12 +3,16 @@ use fs0_config::ClientConfig;
 use fs0_core::{
     FS0_VERSION, Fs0Error, Fs0Result, TRANSPORT_CONTROL_ALPN,
     protocol::{
-        ControlRequest, ControlResponse, ProtocolRequest, ProtocolResponse, StoragePeerInfo,
+        ControlRequest, ControlResponse, ProtocolEvent, ProtocolRequest, ProtocolResponse,
+        StoragePeerInfo,
     },
 };
 use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -18,7 +22,7 @@ pub(crate) struct CentralSession {
     name: Option<String>,
     client_id: AtomicU64,
     connection: Mutex<Option<Connection>>,
-    storages: RwLock<Vec<StoragePeerInfo>>,
+    storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
 }
 
 impl std::fmt::Debug for CentralSession {
@@ -40,7 +44,7 @@ impl CentralSession {
             name,
             client_id: AtomicU64::new(0),
             connection: Mutex::new(None),
-            storages: RwLock::new(Vec::new()),
+            storages: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -61,6 +65,14 @@ impl CentralSession {
 
     pub(crate) fn storage_peers(&self) -> Vec<StoragePeerInfo> {
         self.storages.read().clone()
+    }
+
+    pub(crate) fn storage_peer(&self, storage_id: u64) -> Option<StoragePeerInfo> {
+        self.storages
+            .read()
+            .iter()
+            .find(|storage| storage.storage_id == storage_id)
+            .cloned()
     }
 
     pub(crate) fn set_storage_peers(&self, storages: Vec<StoragePeerInfo>) {
@@ -130,8 +142,45 @@ impl CentralSession {
         );
         self.client_id.store(client_id, Ordering::Release);
         *self.storages.write() = storages;
+        spawn_event_listener(new_connection.clone(), Arc::clone(&self.storages));
         *connection = Some(new_connection.clone());
 
         Ok(new_connection)
     }
+}
+
+fn spawn_event_listener(connection: Connection, storages: Arc<RwLock<Vec<StoragePeerInfo>>>) {
+    tokio::spawn(async move {
+        let result = connection
+            .serve(move |request| {
+                let storages = Arc::clone(&storages);
+                async move {
+                    match request {
+                        ProtocolRequest::Event(ProtocolEvent::StorageChanged(peer)) => {
+                            let mut storages = storages.write();
+                            match storages
+                                .iter_mut()
+                                .find(|storage| storage.storage_id == peer.storage_id)
+                            {
+                                Some(storage) => *storage = peer,
+                                None => storages.push(peer),
+                            }
+                            storages.sort_by_key(|storage| storage.storage_id);
+                            Ok(None)
+                        }
+                        ProtocolRequest::Event(ProtocolEvent::StorageRemoved { storage_id }) => {
+                            storages
+                                .write()
+                                .retain(|storage| storage.storage_id != storage_id);
+                            Ok(None)
+                        }
+                        _ => Err(Fs0Error::InvalidRequest),
+                    }
+                }
+            })
+            .await;
+        if let Err(err) = result {
+            warn!(error = %err, "client central event listener stopped");
+        }
+    });
 }

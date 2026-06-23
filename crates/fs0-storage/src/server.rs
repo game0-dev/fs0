@@ -81,6 +81,10 @@ impl StorageServer {
         server.central_connection.spawn(Arc::downgrade(&server))?;
 
         server.tasks.lock().extend([
+            CentralConnection::spawn_endpoint_addr_watcher(
+                Arc::downgrade(&server),
+                server.shutdown_notify.clone(),
+            ),
             tasks::spawn_connection_accept_loop(
                 server.transport.clone(),
                 Arc::downgrade(&server),

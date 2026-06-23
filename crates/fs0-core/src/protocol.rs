@@ -72,6 +72,10 @@ pub enum ControlRequest {
         volumes: Vec<StorageVolumeInfo>,
         iroh_endpoint: Vec<u8>,
     },
+    UpdateStorageEndpoint {
+        storage_id: u64,
+        iroh_endpoint: Vec<u8>,
+    },
     CreateVolume {
         name: String,
         max_bytes: u64,
@@ -151,6 +155,7 @@ pub enum ControlResponse {
         storage_id: u64,
         storages: Vec<StoragePeerInfo>,
     },
+    UpdateStorageEndpoint,
     CreateVolume {
         volume_id: u64,
     },

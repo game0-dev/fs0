@@ -646,17 +646,19 @@ impl Fs0Client {
 
     pub(crate) async fn storage_session(&self, storage: &StoragePeerInfo) -> Arc<StorageSession> {
         let mut sessions = self.storage_sessions.lock().await;
-        sessions
-            .entry(storage.storage_id)
-            .or_insert_with(|| {
-                Arc::new(StorageSession::new(
-                    self.config.clone(),
-                    self.transport.clone(),
-                    self.client_id(),
-                    storage.iroh_endpoint.clone(),
-                ))
-            })
-            .clone()
+        if let Some(session) = sessions.get(&storage.storage_id) {
+            return session.clone();
+        }
+
+        let session = Arc::new(StorageSession::new(
+            self.config.clone(),
+            self.transport.clone(),
+            Arc::clone(&self.central),
+            self.client_id(),
+            storage.storage_id,
+        ));
+        sessions.insert(storage.storage_id, session.clone());
+        session
     }
 }
 

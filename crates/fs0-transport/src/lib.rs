@@ -1,7 +1,7 @@
 mod connection;
 
 pub use connection::Connection;
-pub use iroh::{EndpointAddr, EndpointId, SecretKey};
+pub use iroh::{EndpointAddr, EndpointId, SecretKey, Watcher};
 
 use fs0_config::RelayClientConfig;
 use fs0_core::{Fs0Error, Fs0Result};
@@ -57,6 +57,10 @@ impl Transport {
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    pub fn watch_addr(&self) -> impl Watcher<Value = EndpointAddr> + use<> {
+        self.endpoint.watch_addr()
     }
 
     pub async fn connect(

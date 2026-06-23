@@ -1,5 +1,6 @@
 use crate::{Fs0Error, Fs0Result, server::CentralServer};
 use fs0_core::protocol::{BundleReplicaEvent, BundleReplicaEventKind, ControlResponse};
+use tracing::info;
 
 pub(super) fn validate_client_auth(
     server: &CentralServer,
@@ -64,6 +65,24 @@ pub(super) fn report_bundle_replica(
     tx.commit()?;
 
     Ok(ControlResponse::ReportBundleReplica)
+}
+
+pub(super) fn update_storage_endpoint(
+    server: &CentralServer,
+    storage_id: u64,
+    iroh_endpoint: Vec<u8>,
+) -> Fs0Result<ControlResponse> {
+    let mut storages = server.storages.write();
+    let storage = storages.get_mut(&storage_id).ok_or(Fs0Error::NotFound)?;
+    let endpoint_len = iroh_endpoint.len();
+
+    storage.peer.iroh_endpoint = iroh_endpoint;
+    info!(
+        storage_id,
+        endpoint_len, "central updated storage iroh endpoint"
+    );
+
+    Ok(ControlResponse::UpdateStorageEndpoint)
 }
 
 pub(super) fn update_storage_volume_offset(

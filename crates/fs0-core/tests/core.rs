@@ -185,6 +185,10 @@ fn control_requests_roundtrip() {
         volumes: storage_peer().volumes,
         iroh_endpoint: vec![1, 2, 3],
     });
+    assert_postcard_roundtrip(&ControlRequest::UpdateStorageEndpoint {
+        storage_id: 7,
+        iroh_endpoint: vec![4, 5, 6],
+    });
     assert_postcard_roundtrip(&ControlRequest::CreateVolume {
         name: "hot".to_owned(),
         max_bytes: 1024,
@@ -272,6 +276,7 @@ fn control_responses_roundtrip() {
         storage_id: 7,
         storages: vec![storage.clone()],
     });
+    assert_postcard_roundtrip(&ControlResponse::UpdateStorageEndpoint);
     assert_postcard_roundtrip(&ControlResponse::CreateVolume { volume_id: 2 });
     assert_postcard_roundtrip(&ControlResponse::CentralStatus {
         clients_count: 1,

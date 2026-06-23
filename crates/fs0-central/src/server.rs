@@ -4,7 +4,7 @@ mod spawn;
 use crate::{CentralConfig, Fs0Result, db::CentralDb};
 use fs0_core::{
     Fs0Error, TRANSPORT_CONTROL_ALPN,
-    protocol::{StoragePeerInfo, StorageVolumeInfo},
+    protocol::{ProtocolEvent, StoragePeerInfo, StorageVolumeInfo},
 };
 use fs0_transport::{Connection, EndpointAddr, SecretKey, Transport};
 use parking_lot::{Mutex, RwLock};
@@ -17,7 +17,7 @@ use std::{
     },
 };
 use tokio::{sync::Notify, task::JoinHandle};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct CentralServer {
@@ -155,6 +155,40 @@ impl CentralServer {
         peers
     }
 
+    pub(crate) fn storage_peer(&self, storage_id: u64) -> Option<StoragePeerInfo> {
+        self.storages
+            .read()
+            .get(&storage_id)
+            .map(|storage| storage.peer.clone())
+    }
+
+    pub(crate) async fn broadcast_event(&self, event: ProtocolEvent) {
+        let connections = {
+            let client_connections = self
+                .clients
+                .read()
+                .values()
+                .map(|client| client.connection.clone())
+                .collect::<Vec<_>>();
+            let storage_connections = self
+                .storages
+                .read()
+                .values()
+                .map(|storage| storage.connection.clone())
+                .collect::<Vec<_>>();
+            client_connections
+                .into_iter()
+                .chain(storage_connections.into_iter())
+                .collect::<Vec<_>>()
+        };
+
+        for connection in connections {
+            if let Err(err) = connection.send_event(&event).await {
+                warn!(error = %err, event = ?event, "central failed to broadcast event");
+            }
+        }
+    }
+
     pub(crate) fn register_client(
         &self,
         token: String,
@@ -238,19 +272,30 @@ impl CentralServer {
         Ok((storage_id, self.storage_peers_snapshot()))
     }
 
-    pub(crate) fn unregister_storage(&self, storage_id: u64) {
-        if let Some(storage) = self.storages.write().remove(&storage_id) {
+    pub(crate) fn unregister_storage(&self, storage_id: u64) -> Option<ProtocolEvent> {
+        let removed = if let Some(storage) = self.storages.write().remove(&storage_id) {
             storage.connection.close(b"central storage unregistered");
-        }
+            true
+        } else {
+            false
+        };
         self.online_volumes
             .write()
             .retain(|_, mounted_storage_id| *mounted_storage_id != storage_id);
+
+        removed.then_some(ProtocolEvent::StorageRemoved { storage_id })
     }
 
-    pub(crate) fn unregister_identity(&self, identity: ControlConnectionIdentity) {
+    pub(crate) fn unregister_identity(
+        &self,
+        identity: ControlConnectionIdentity,
+    ) -> Option<ProtocolEvent> {
         match identity {
-            ControlConnectionIdentity::Anonymous => {}
-            ControlConnectionIdentity::Client(client_id) => self.unregister_client(client_id),
+            ControlConnectionIdentity::Anonymous => None,
+            ControlConnectionIdentity::Client(client_id) => {
+                self.unregister_client(client_id);
+                None
+            }
             ControlConnectionIdentity::Storage(storage_id) => self.unregister_storage(storage_id),
         }
     }

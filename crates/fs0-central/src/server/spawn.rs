@@ -87,7 +87,10 @@ async fn handle_control_connection(server: Arc<CentralServer>, connection: Conne
         }
     }
 
-    server.unregister_identity(*identity.lock().await);
+    let event = server.unregister_identity(*identity.lock().await);
+    if let Some(event) = event {
+        server.broadcast_event(event).await;
+    }
     connection.close(b"central control closed");
     info!("central control connection closed");
 }
