@@ -42,6 +42,15 @@ pub(crate) enum Command {
         #[arg(long)]
         prefer_volume: Option<String>,
     },
+    #[command(about = "Recursively upload a local directory")]
+    PutDir {
+        remote_dir: String,
+        local_dir: PathBuf,
+        #[arg(long)]
+        prefer_volume: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     #[command(about = "Delete a remote file")]
     Rm { remote_path: String },
     #[command(about = "Copy a remote file")]

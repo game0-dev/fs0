@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+description = "Local volume metadata and byte storage for fs0."
+readme = "../../README.md"
 
 [dependencies]
 blake3.workspace = true

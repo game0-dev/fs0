@@ -8,6 +8,10 @@ use crate::{
 use fs0_core::Fs0Result;
 use std::path::PathBuf;
 
+#[path = "client/put_dir.rs"]
+mod put_dir_impl;
+pub(super) use put_dir_impl::put_dir;
+
 pub(super) async fn ls(
     config: &Option<PathBuf>,
     json: bool,

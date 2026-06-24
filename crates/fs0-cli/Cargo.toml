@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+description = "Command-line interface for fs0 distributed storage."
+readme = "../../README.md"
 
 [[bin]]
 name = "fs0"

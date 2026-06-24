@@ -32,6 +32,22 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             )
             .await
         }
+        Command::PutDir {
+            remote_dir,
+            local_dir,
+            prefer_volume,
+            dry_run,
+        } => {
+            client::put_dir(
+                &cli.config,
+                cli.json,
+                remote_dir,
+                local_dir,
+                prefer_volume,
+                dry_run,
+            )
+            .await
+        }
         Command::Rm { remote_path } => client::rm(&cli.config, remote_path).await,
         Command::Cp {
             source_path,
