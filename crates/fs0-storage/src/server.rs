@@ -49,6 +49,19 @@ impl StorageServer {
         let bind_addr = config
             .bind_port
             .map(|port| SocketAddr::from(([0, 0, 0, 0], port)));
+        match &config.relay {
+            Some(relay) => {
+                info!(
+                    relay_url = %relay.url,
+                    relay_quic_port = relay.quic_port,
+                    relay_ca_cert_configured = relay.ca_cert.is_some(),
+                    "storage iroh relay client configured"
+                );
+            }
+            None => {
+                info!("storage iroh relay client disabled; endpoint will not publish relay addrs");
+            }
+        }
         let transport = Transport::bind(
             vec![fs0_core::TRANSPORT_DATA_ALPN],
             None,
@@ -133,6 +146,7 @@ impl StorageServer {
 
         let tasks = std::mem::take(&mut *self.tasks.lock());
         for task in tasks {
+            task.abort();
             let _ = task.await;
         }
     }

@@ -11,7 +11,7 @@ use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -21,6 +21,7 @@ pub(crate) struct CentralSession {
     transport: Transport,
     name: Option<String>,
     client_id: AtomicU64,
+    event_listener_stopping: Arc<AtomicBool>,
     connection: Mutex<Option<Connection>>,
     storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
 }
@@ -43,6 +44,7 @@ impl CentralSession {
             transport,
             name,
             client_id: AtomicU64::new(0),
+            event_listener_stopping: Arc::new(AtomicBool::new(false)),
             connection: Mutex::new(None),
             storages: Arc::new(RwLock::new(Vec::new())),
         }
@@ -80,6 +82,7 @@ impl CentralSession {
     }
 
     pub(crate) async fn close(&self, reason: &[u8]) {
+        self.event_listener_stopping.store(true, Ordering::Release);
         if let Some(connection) = self.connection.lock().await.take() {
             connection.close(reason);
         }
@@ -99,6 +102,7 @@ impl CentralSession {
 
         let central_endpoint = self.config.central_endpoint.into();
         info!(endpoint = ?central_endpoint, "client connecting to central");
+        self.event_listener_stopping.store(false, Ordering::Release);
         let new_connection = self
             .transport
             .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
@@ -142,14 +146,22 @@ impl CentralSession {
         );
         self.client_id.store(client_id, Ordering::Release);
         *self.storages.write() = storages;
-        spawn_event_listener(new_connection.clone(), Arc::clone(&self.storages));
+        spawn_event_listener(
+            new_connection.clone(),
+            Arc::clone(&self.storages),
+            Arc::clone(&self.event_listener_stopping),
+        );
         *connection = Some(new_connection.clone());
 
         Ok(new_connection)
     }
 }
 
-fn spawn_event_listener(connection: Connection, storages: Arc<RwLock<Vec<StoragePeerInfo>>>) {
+fn spawn_event_listener(
+    connection: Connection,
+    storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
+    stopping: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         let result = connection
             .serve(move |request| {
@@ -179,7 +191,9 @@ fn spawn_event_listener(connection: Connection, storages: Arc<RwLock<Vec<Storage
                 }
             })
             .await;
-        if let Err(err) = result {
+        if let Err(err) = result
+            && !stopping.load(Ordering::Acquire)
+        {
             warn!(error = %err, "client central event listener stopped");
         }
     });

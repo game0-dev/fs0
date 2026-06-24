@@ -187,7 +187,8 @@ impl CentralConnection {
                     _ = sleep(Duration::from_secs(2)) => {}
                 }
 
-                let endpoint = match encode_endpoint_addr(addr_watcher.get()) {
+                let endpoint_addr = addr_watcher.get();
+                let endpoint = match encode_endpoint_addr(endpoint_addr.clone()) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
                         warn!(error = %err, "storage failed to encode iroh endpoint update");
@@ -199,10 +200,17 @@ impl CentralConnection {
                     pending_report = false;
                     continue;
                 }
+                info!(
+                    endpoint = ?endpoint_addr,
+                    "storage observed iroh endpoint address update"
+                );
 
                 let Some(server) = weak_server.upgrade() else {
                     return;
                 };
+                if server.is_exiting() {
+                    return;
+                }
                 match server
                     .central_connection
                     .update_storage_endpoint(endpoint.clone())
@@ -213,6 +221,9 @@ impl CentralConnection {
                         pending_report = false;
                     }
                     Err(err) => {
+                        if server.is_exiting() {
+                            return;
+                        }
                         warn!(error = %err, "storage failed to update central iroh endpoint");
                         pending_report = true;
                         tokio::select! {
