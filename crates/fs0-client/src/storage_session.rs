@@ -11,17 +11,24 @@ use fs0_core::{
     },
     zstd_compress, zstd_decompress,
 };
-use fs0_transport::{Connection, Transport};
+use fs0_transport::{Connection, SelectedPath, Transport};
 use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use self::request_scheduler::HashRequestScheduler;
+
+const STORAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const STORAGE_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+const STORAGE_HAS_TIMEOUT: Duration = Duration::from_secs(15);
+const STORAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const STORAGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
+const STORAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct StorageSession {
     pub(crate) inner: Arc<StorageSessionInner>,
@@ -54,6 +61,7 @@ pub(crate) struct StorageSessionInner {
     client_id: u64,
     storage_id: u64,
     connection: Mutex<Option<Connection>>,
+    selected_path: parking_lot::RwLock<Option<SelectedPath>>,
 }
 
 impl StorageSession {
@@ -74,6 +82,7 @@ impl StorageSession {
             client_id,
             storage_id,
             connection: Mutex::new(None),
+            selected_path: parking_lot::RwLock::new(None),
         });
         let upload_scheduler = HashRequestScheduler::new(upload_concurrency, {
             let inner = Arc::clone(&inner);
@@ -291,11 +300,16 @@ impl StorageSessionInner {
             .ok_or(Fs0Error::NotFound)?;
         let data_endpoint = postcard::from_bytes(&storage.iroh_endpoint).map_err(Fs0Error::from)?;
         info!(endpoint = ?data_endpoint, "client connecting to storage");
-        let connection = self
-            .transport
-            .connect(data_endpoint, TRANSPORT_DATA_ALPN)
-            .await?;
+        let connection = tokio::time::timeout(
+            STORAGE_CONNECT_TIMEOUT,
+            self.transport.connect(data_endpoint, TRANSPORT_DATA_ALPN),
+        )
+        .await
+        .map_err(|_| Fs0Error::Internal {
+            message: format!("storage connect timed out after {STORAGE_CONNECT_TIMEOUT:?}"),
+        })??;
         self.authenticate(connection.clone()).await?;
+        self.log_selected_path_if_changed(&connection, "client storage data");
 
         *current = Some(connection.clone());
 
@@ -304,10 +318,14 @@ impl StorageSessionInner {
 
     async fn authenticate(&self, connection: Connection) -> Fs0Result<()> {
         match connection
-            .rpc(ProtocolRequest::Data(DataRequest::Authenticate {
-                client_id: self.client_id,
-                client_token: self.config.token.clone(),
-            }))
+            .rpc_timeout(
+                ProtocolRequest::Data(DataRequest::Authenticate {
+                    client_id: self.client_id,
+                    client_token: self.config.token.clone(),
+                }),
+                STORAGE_AUTH_TIMEOUT,
+                "storage authentication",
+            )
             .await
         {
             Ok(ProtocolResponse::Data(DataResponse::Authenticate {
@@ -340,13 +358,29 @@ impl StorageSessionInner {
 
     pub(crate) async fn request(&self, request: DataRequest) -> Fs0Result<DataResponse> {
         let connection = self.ensure_connected().await?;
-        let response = match connection.rpc(ProtocolRequest::Data(request)).await? {
+        self.log_selected_path_if_changed(&connection, "client storage data");
+        let (timeout, context) = match &request {
+            DataRequest::HasChunk { .. } | DataRequest::HasBundle { .. } => {
+                (STORAGE_HAS_TIMEOUT, "storage existence check")
+            }
+            DataRequest::UploadChunk(_) => (STORAGE_UPLOAD_TIMEOUT, "storage upload chunk"),
+            DataRequest::CommitBundle(_) => (STORAGE_COMMIT_TIMEOUT, "storage commit bundle"),
+            DataRequest::DownloadChunk(_) | DataRequest::ListBundleChunks { .. } => {
+                (STORAGE_DOWNLOAD_TIMEOUT, "storage download/read request")
+            }
+            DataRequest::Authenticate { .. } => (STORAGE_AUTH_TIMEOUT, "storage authentication"),
+        };
+        let response = match connection
+            .rpc_timeout(ProtocolRequest::Data(request), timeout, context)
+            .await?
+        {
             ProtocolResponse::Error(err) => Err(err),
             ProtocolResponse::Data(response) => Ok(response),
             response => Err(Fs0Error::InvalidFrame {
                 message: format!("unexpected data response: {response:?}"),
             }),
         };
+        self.log_selected_path_if_changed(&connection, "client storage data");
         if response.is_err() && connection.is_closed() {
             *self.connection.lock().await = None;
         }
@@ -357,6 +391,30 @@ impl StorageSessionInner {
     async fn close(&self, reason: &[u8]) {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.close(reason);
+        }
+        *self.selected_path.write() = None;
+    }
+
+    fn log_selected_path_if_changed(&self, connection: &Connection, label: &'static str) {
+        let selected_path = connection.selected_path();
+        if *self.selected_path.read() == selected_path {
+            return;
+        }
+
+        *self.selected_path.write() = selected_path.clone();
+        match selected_path {
+            Some(path) => {
+                info!(
+                    connection = label,
+                    path_kind = path.kind.as_str(),
+                    remote_addr = %path.remote_addr,
+                    relay_proxy = path.kind == fs0_transport::SelectedPathKind::Relay,
+                    "iroh selected path"
+                );
+            }
+            None => {
+                info!(connection = label, "iroh selected path pending");
+            }
         }
     }
 }

@@ -41,6 +41,7 @@ pub(super) fn spawn_connection_accept_loop(
                     match accepted.alpn() {
                         TRANSPORT_DATA_ALPN => {
                             info!("storage accepted data connection");
+                            log_selected_path(&accepted, "storage data");
                             let shutdown_notify = shutdown_notify.clone();
                             let connection_server = server.clone();
                             server.tasks.lock().push(tokio::spawn(async move {
@@ -125,6 +126,20 @@ pub(super) fn spawn_connection_accept_loop(
             }
         }
     })
+}
+
+fn log_selected_path(connection: &fs0_transport::Connection, label: &'static str) {
+    if let Some(path) = connection.selected_path() {
+        info!(
+            connection = label,
+            path_kind = path.kind.as_str(),
+            remote_addr = %path.remote_addr,
+            relay_proxy = path.kind == fs0_transport::SelectedPathKind::Relay,
+            "iroh selected path"
+        );
+    } else {
+        info!(connection = label, "iroh selected path pending");
+    }
 }
 
 pub(super) fn spawn_bundle_reporter_loop(

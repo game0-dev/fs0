@@ -107,7 +107,19 @@ pub(super) async fn commit_update(
     let storage_id = {
         let mut db = server.db.lock();
         let tx = db.tx()?;
-        let volume_id = tx.active_update_lease_volume(lease_id, file_id)?;
+        let volume_id = tx
+            .active_update_lease_volume(lease_id, file_id)
+            .map_err(|err| {
+                if err == Fs0Error::NotFound {
+                    Fs0Error::VersionConflict {
+                        message: format!(
+                            "update lease {lease_id} for file {file_id} expired before commit"
+                        ),
+                    }
+                } else {
+                    err
+                }
+            })?;
         tx.commit()?;
         server.online_volumes.read().get(&volume_id).copied()
     };
@@ -115,7 +127,20 @@ pub(super) async fn commit_update(
         let mut db = server.db.lock();
         let tx = db.tx()?;
         let now = now_ms();
-        let lease = tx.load_active_update_lease(request.lease_id, request.file_id)?;
+        let lease = tx
+            .load_active_update_lease(request.lease_id, request.file_id)
+            .map_err(|err| {
+                if err == Fs0Error::NotFound {
+                    Fs0Error::VersionConflict {
+                        message: format!(
+                            "update lease {} for file {} expired before commit",
+                            request.lease_id, request.file_id
+                        ),
+                    }
+                } else {
+                    err
+                }
+            })?;
         if lease.base_size_bytes != request.base_size {
             return Err(Fs0Error::VersionConflict {
                 message: "file changed while update lease was active".to_owned(),

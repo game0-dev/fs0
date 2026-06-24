@@ -51,7 +51,15 @@ async fn upload_files(
 ) -> Fs0Result<PutDirSummary> {
     let mut summary = PutDirSummary::default();
 
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
+        if !json {
+            eprintln!(
+                "checking {}/{} {}",
+                index + 1,
+                files.len(),
+                file.remote_path
+            );
+        }
         let remote_exists_with_same_size = match client.get_file_read_plan(&file.remote_path).await
         {
             Ok(plan) => plan.size == file.bytes,
@@ -67,6 +75,15 @@ async fn upload_files(
             continue;
         }
 
+        if !json {
+            eprintln!(
+                "uploading {}/{} {} {} bytes",
+                index + 1,
+                files.len(),
+                file.remote_path,
+                file.bytes
+            );
+        }
         let uploaded = client
             .upload_file(
                 &file.remote_path,

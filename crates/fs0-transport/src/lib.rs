@@ -1,6 +1,6 @@
 mod connection;
 
-pub use connection::Connection;
+pub use connection::{Connection, SelectedPath, SelectedPathKind};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey, Watcher};
 
 use fs0_config::RelayClientConfig;

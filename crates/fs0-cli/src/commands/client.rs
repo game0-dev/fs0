@@ -68,6 +68,9 @@ pub(super) async fn put(
     prefer_volume: Option<String>,
 ) -> Fs0Result<()> {
     let client = connect_client(config).await?;
+    if !json {
+        eprintln!("uploading {local_path} -> {remote_path}");
+    }
     let plan = if local_path == "-" {
         client
             .upload(&remote_path, tokio::io::stdin(), prefer_volume)

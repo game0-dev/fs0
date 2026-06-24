@@ -9,12 +9,18 @@ use fs0_core::{
 };
 use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+const CENTRAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CENTRAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) struct CentralSession {
     config: ClientConfig,
@@ -52,7 +58,14 @@ impl CentralSession {
 
     pub(crate) async fn request(&self, request: ControlRequest) -> Fs0Result<ControlResponse> {
         let connection = self.ensure_connected().await?;
-        match connection.rpc(ProtocolRequest::Control(request)).await? {
+        match connection
+            .rpc_timeout(
+                ProtocolRequest::Control(request),
+                CENTRAL_REQUEST_TIMEOUT,
+                "central request",
+            )
+            .await?
+        {
             ProtocolResponse::Error(err) => Err(err),
             ProtocolResponse::Control(response) => Ok(response),
             response => Err(Fs0Error::InvalidFrame {
@@ -103,16 +116,25 @@ impl CentralSession {
         let central_endpoint = self.config.central_endpoint.into();
         info!(endpoint = ?central_endpoint, "client connecting to central");
         self.event_listener_stopping.store(false, Ordering::Release);
-        let new_connection = self
-            .transport
-            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN)
-            .await?;
+        let new_connection = tokio::time::timeout(
+            CENTRAL_CONNECT_TIMEOUT,
+            self.transport
+                .connect(central_endpoint, TRANSPORT_CONTROL_ALPN),
+        )
+        .await
+        .map_err(|_| Fs0Error::Internal {
+            message: format!("central connect timed out after {CENTRAL_CONNECT_TIMEOUT:?}"),
+        })??;
         let response = match new_connection
-            .rpc(ProtocolRequest::Control(ControlRequest::RegisterClient {
-                name: self.name.clone(),
-                token: self.config.token.clone(),
-                version: FS0_VERSION.to_owned(),
-            }))
+            .rpc_timeout(
+                ProtocolRequest::Control(ControlRequest::RegisterClient {
+                    name: self.name.clone(),
+                    token: self.config.token.clone(),
+                    version: FS0_VERSION.to_owned(),
+                }),
+                CENTRAL_REQUEST_TIMEOUT,
+                "client central registration",
+            )
             .await?
         {
             ProtocolResponse::Error(err) => {

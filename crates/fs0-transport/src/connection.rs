@@ -4,7 +4,7 @@ use fs0_core::{
 };
 use iroh::endpoint::{Connection as IrohConnection, SendStream};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Clone)]
@@ -57,6 +57,19 @@ impl Connection {
             message: err.to_string(),
         })?;
         read_frame(&mut recv).await
+    }
+
+    pub async fn rpc_timeout(
+        &self,
+        request: ProtocolRequest,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Fs0Result<ProtocolResponse> {
+        tokio::time::timeout(timeout, self.rpc(request))
+            .await
+            .map_err(|_| Fs0Error::Internal {
+                message: format!("{context} timed out after {timeout:?}"),
+            })?
     }
 
     #[must_use]
@@ -133,6 +146,51 @@ impl Connection {
 
     pub fn close(&self, reason: &[u8]) {
         self.inner.iroh_connection.close(0u32.into(), reason);
+    }
+
+    pub fn selected_path(&self) -> Option<SelectedPath> {
+        self.inner
+            .iroh_connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| {
+                let remote_addr = path.remote_addr();
+                let kind = if remote_addr.is_relay() {
+                    SelectedPathKind::Relay
+                } else if remote_addr.is_ip() {
+                    SelectedPathKind::Direct
+                } else {
+                    SelectedPathKind::Other
+                };
+                SelectedPath {
+                    kind,
+                    remote_addr: remote_addr.to_string(),
+                }
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPath {
+    pub kind: SelectedPathKind,
+    pub remote_addr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedPathKind {
+    Direct,
+    Relay,
+    Other,
+}
+
+impl SelectedPathKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Other => "other",
+        }
     }
 }
 

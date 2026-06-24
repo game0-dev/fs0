@@ -13,7 +13,7 @@ pub use sqlite::*;
 /// Default zstd compression level used by fs0 clients.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 /// fs0 wire compatibility version required during client and storage registration.
-pub const FS0_VERSION: &str = "0.2.2";
+pub const FS0_VERSION: &str = "0.2.4";
 /// ALPN protocol identifier for central control-plane connections.
 pub const TRANSPORT_CONTROL_ALPN: &[u8] = b"/fs0/control/1";
 /// ALPN protocol identifier for storage data-plane connections.
