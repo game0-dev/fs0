@@ -14,10 +14,12 @@ use fs0_core::{
 use fs0_transport::{ConnectOptions, ConnectRetry, Connection, Transport};
 use std::{
     fmt,
-    path::{Path, PathBuf},
+    io::SeekFrom,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -36,13 +38,21 @@ const STORAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct StorageSession {
     pub(crate) inner: Arc<StorageSessionInner>,
     upload_scheduler: HashRequestScheduler<UploadChunkJob, UploadChunkResponse>,
-    download_scheduler: HashRequestScheduler<DownloadChunkRequest, HashId>,
+    download_scheduler: HashRequestScheduler<DownloadChunkRequest, DownloadChunkResult>,
 }
 
 pub(crate) struct UploadChunkJob {
     pub(crate) lease_id: u64,
     pub(crate) file_id: u64,
     pub(crate) volume_id: u64,
+    pub(crate) chunk_id: HashId,
+    pub(crate) raw_len: u64,
+    pub(crate) source_path: PathBuf,
+    pub(crate) source_offset: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct DownloadChunkResult {
     pub(crate) chunk_id: HashId,
     pub(crate) raw_bytes: Vec<u8>,
 }
@@ -76,7 +86,6 @@ impl StorageSession {
     ) -> Self {
         let upload_concurrency = config.upload_concurrency;
         let download_concurrency = config.download_concurrency;
-        let download_cache_dir = Arc::new(download_cache_dir(&config));
         let inner = Arc::new(StorageSessionInner {
             config,
             transport,
@@ -94,13 +103,9 @@ impl StorageSession {
         });
         let download_scheduler = HashRequestScheduler::new(download_concurrency, {
             let inner = Arc::clone(&inner);
-            let download_cache_dir = Arc::clone(&download_cache_dir);
             move |job| {
                 let inner = Arc::clone(&inner);
-                let download_cache_dir = Arc::clone(&download_cache_dir);
-                Box::pin(async move {
-                    download_chunk_job(&inner, download_cache_dir.as_path(), job).await
-                })
+                Box::pin(async move { download_chunk_job(&inner, job).await })
             }
         });
 
@@ -133,7 +138,7 @@ impl StorageSession {
         on_complete: G,
     ) -> Fs0Result<()>
     where
-        G: FnOnce(Fs0Result<HashId>) + Send + 'static,
+        G: FnOnce(Fs0Result<DownloadChunkResult>) + Send + 'static,
     {
         let chunk_id = request.chunk_id;
         self.download_scheduler
@@ -151,10 +156,7 @@ async fn upload_chunk_job(
     job: UploadChunkJob,
 ) -> Fs0Result<UploadChunkResponse> {
     let chunk_id = job.chunk_id;
-    let raw_len = job.raw_bytes.len() as u64;
-    if blake3_hash(&job.raw_bytes) != chunk_id {
-        return Err(Fs0Error::HashMismatch { volume_offset: 0 });
-    }
+    let raw_len = job.raw_len;
 
     let has_chunk_started_at = Instant::now();
     match inner.has_chunk(job.volume_id, chunk_id).await {
@@ -183,9 +185,16 @@ async fn upload_chunk_job(
         }
     }
 
+    let raw_bytes = read_chunk_from_file(&job.source_path, job.source_offset, raw_len).await?;
+    if blake3_hash(&raw_bytes) != chunk_id {
+        return Err(Fs0Error::HashMismatch {
+            volume_offset: job.source_offset,
+        });
+    }
+
     let compress_started_at = Instant::now();
     let compressed_bytes = tokio::task::spawn_blocking(move || {
-        zstd_compress(job.raw_bytes.as_slice(), DEFAULT_ZSTD_LEVEL)
+        zstd_compress(raw_bytes.as_slice(), DEFAULT_ZSTD_LEVEL)
     })
     .await
     .map_err(|err| Fs0Error::Internal {
@@ -230,37 +239,19 @@ async fn upload_chunk_job(
 
 async fn download_chunk_job(
     inner: &StorageSessionInner,
-    download_cache_dir: &Path,
     request: DownloadChunkRequest,
-) -> Fs0Result<HashId> {
+) -> Fs0Result<DownloadChunkResult> {
     let chunk_id = request.chunk_id;
-    let cache_path = cache_path(download_cache_dir, chunk_id);
-    if let Ok(compressed_bytes) = tokio::fs::read(&cache_path).await {
-        if compressed_chunk_matches(chunk_id, compressed_bytes.as_slice()).is_ok() {
-            return Ok(chunk_id);
-        }
-        let _ = tokio::fs::remove_file(&cache_path).await;
-    }
-
     let compressed_bytes = inner.download_chunk(request).await?;
-    compressed_chunk_matches(chunk_id, compressed_bytes.as_slice())?;
-    write_cache_file(&cache_path, compressed_bytes.as_slice()).await?;
+    let raw_bytes = decompress_chunk(chunk_id, compressed_bytes.as_slice())?;
 
-    Ok(chunk_id)
+    Ok(DownloadChunkResult {
+        chunk_id,
+        raw_bytes,
+    })
 }
 
-fn cache_path(cache_dir: &Path, chunk_id: HashId) -> PathBuf {
-    cache_dir.join(format!("{}.zst", chunk_id.to_hex()))
-}
-
-fn download_cache_dir(config: &ClientConfig) -> PathBuf {
-    config
-        .download_cache_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("fs0-client-cache"))
-}
-
-fn compressed_chunk_matches(chunk_id: HashId, compressed_bytes: &[u8]) -> Fs0Result<()> {
+fn decompress_chunk(chunk_id: HashId, compressed_bytes: &[u8]) -> Fs0Result<Vec<u8>> {
     let max_raw_len = usize::try_from(fs0_core::VOLUME_RAW_CHUNK_SIZE).map_err(|_| {
         Fs0Error::IntegerConversion {
             message: format!("raw_len {} exceeds usize", fs0_core::VOLUME_RAW_CHUNK_SIZE),
@@ -271,15 +262,24 @@ fn compressed_chunk_matches(chunk_id: HashId, compressed_bytes: &[u8]) -> Fs0Res
         return Err(Fs0Error::HashMismatch { volume_offset: 0 });
     }
 
-    Ok(())
+    Ok(raw)
 }
 
-async fn write_cache_file(path: &Path, bytes: &[u8]) -> Fs0Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+async fn read_chunk_from_file(path: &PathBuf, offset: u64, raw_len: u64) -> Fs0Result<Vec<u8>> {
+    if raw_len > fs0_core::VOLUME_RAW_CHUNK_SIZE {
+        return Err(Fs0Error::InvalidData {
+            message: format!("chunk raw_len {raw_len} exceeds maximum"),
+        });
     }
-    tokio::fs::write(path, bytes).await?;
-    Ok(())
+    let raw_len = usize::try_from(raw_len).map_err(|_| Fs0Error::IntegerConversion {
+        message: format!("raw_len {raw_len} exceeds usize"),
+    })?;
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+    let mut raw_bytes = vec![0u8; raw_len];
+    file.read_exact(&mut raw_bytes).await?;
+
+    Ok(raw_bytes)
 }
 
 impl StorageSessionInner {
@@ -313,6 +313,7 @@ impl StorageSessionInner {
             .connect(data_endpoint, TRANSPORT_DATA_ALPN, Some(connect_options))
             .await?;
         self.authenticate(connection.clone()).await?;
+
         *current = Some(connection.clone());
 
         Ok(connection)

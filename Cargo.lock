@@ -1008,7 +1008,6 @@ dependencies = [
  "fs0-core",
  "fs0-storage",
  "fs0-volume",
- "serde_json",
  "tokio",
  "tracing-subscriber",
 ]

@@ -5,7 +5,6 @@ use fs0_core::{
 use iroh::{EndpointAddr, EndpointId};
 use serde::Deserialize;
 use std::{
-    env,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -35,7 +34,6 @@ use std::{
 /// central_addr = "1.2.3.4:7800"
 /// upload_concurrency = 32
 /// download_concurrency = 32
-/// download_cache_dir = ".local/client-cache"
 ///
 /// [client.relay]
 /// url = "https://1.2.3.4:7801"
@@ -157,8 +155,6 @@ pub struct ClientConfig {
     pub upload_concurrency: usize,
     #[serde(default = "default_client_data_concurrency")]
     pub download_concurrency: usize,
-    #[serde(default = "default_client_download_cache_dir")]
-    pub download_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -257,7 +253,6 @@ impl ClientConfig {
             relay,
             upload_concurrency: default_client_data_concurrency(),
             download_concurrency: default_client_data_concurrency(),
-            download_cache_dir: default_client_download_cache_dir(),
         }
     }
 }
@@ -292,16 +287,10 @@ fn default_client_data_concurrency() -> usize {
     DEFAULT_CLIENT_DATA_CONCURRENCY
 }
 
-fn default_client_download_cache_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .map(|home| home.join(".fs0").join("cache"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     const CENTRAL_ENDPOINT_ID: &str =
         "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18";
@@ -406,10 +395,6 @@ mod tests {
         assert_eq!(client.central_endpoint.addr.to_string(), "1.2.3.4:7800");
         assert_eq!(client.upload_concurrency, DEFAULT_CLIENT_DATA_CONCURRENCY);
         assert_eq!(client.download_concurrency, DEFAULT_CLIENT_DATA_CONCURRENCY);
-        assert_eq!(
-            client.download_cache_dir,
-            default_client_download_cache_dir()
-        );
         let client_endpoint = EndpointAddr::from(client.central_endpoint);
         assert_eq!(client_endpoint.id, client.central_endpoint.id);
         assert_eq!(

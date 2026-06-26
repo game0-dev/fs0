@@ -11,8 +11,6 @@ pub(crate) struct Cli {
         help = "Path to the fs0 config file; defaults to ~/.fs0/config.toml"
     )]
     pub(crate) config: Option<PathBuf>,
-    #[arg(long, global = true)]
-    pub(crate) json: bool,
     #[command(subcommand)]
     pub(crate) command: Command,
 }

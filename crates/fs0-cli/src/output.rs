@@ -1,7 +1,4 @@
-use fs0_core::{
-    Fs0Error,
-    protocol::{DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord},
-};
+use fs0_core::protocol::{DirectoryEntries, FileChangeLogs, FileReadPlan, FileRecord};
 
 pub(crate) fn print_directory_entries(entries: DirectoryEntries) {
     for entry in entries.entries {
@@ -60,10 +57,4 @@ pub(crate) fn print_volume_meta(meta: fs0_volume::VolumeMeta) {
     println!("active_volume_offset: {}", meta.active_volume_offset);
     println!("created_at_ms: {}", meta.created_at_ms);
     println!("updated_at_ms: {}", meta.updated_at_ms);
-}
-
-pub(crate) fn json_error(err: serde_json::Error) -> Fs0Error {
-    Fs0Error::InvalidData {
-        message: err.to_string(),
-    }
 }

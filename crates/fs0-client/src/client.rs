@@ -1,6 +1,6 @@
 use crate::{
     central_session::CentralSession,
-    storage_session::{StorageSession, UploadChunkJob},
+    storage_session::{DownloadChunkResult, StorageSession, UploadChunkJob},
 };
 pub use fs0_config::ClientConfig;
 use fs0_core::{
@@ -11,17 +11,17 @@ use fs0_core::{
         CommittedBundle, DirectoryEntries, DownloadChunkRequest, FileChangeLogs, FileReadPlan,
         FileRecord, StoragePeerInfo,
     },
-    zstd_decompress,
 };
 use fs0_transport::{Transport, TransportOptions};
 use std::{
     collections::HashMap,
-    path::Path,
+    io::SeekFrom,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, oneshot};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,15 +50,10 @@ pub struct Fs0Client {
     storage_sessions: Arc<Mutex<HashMap<u64, Arc<StorageSession>>>>,
 }
 
-#[derive(Debug)]
-struct ChunkJob {
-    chunk_id: HashId,
-    ready: bool,
-}
-
 struct InternalDownloadState {
-    jobs: Vec<ChunkJob>,
     remain_chunks: u64,
+    total_chunks: u64,
+    scheduling_done: bool,
     first_error: Option<Fs0Error>,
     done_tx: Option<oneshot::Sender<Fs0Result<()>>>,
 }
@@ -69,6 +64,11 @@ struct InternalUploadState {
     scheduling_done: bool,
     first_error: Option<Fs0Error>,
     done_tx: Option<oneshot::Sender<Fs0Result<()>>>,
+}
+
+struct DownloadWriteJob {
+    raw_offset: u64,
+    raw_bytes: Vec<u8>,
 }
 
 impl Fs0Client {
@@ -174,180 +174,18 @@ impl Fs0Client {
         self.central.get_file_read_plan(remote_path).await
     }
 
-    pub async fn upload<R>(
-        &self,
-        remote_path: &str,
-        reader: R,
-        prefer_volume_name: Option<String>,
-    ) -> Fs0Result<FileRecord>
-    where
-        R: AsyncRead + Unpin,
-    {
-        self.upload_reader(remote_path, reader, prefer_volume_name, None)
-            .await
-    }
-
     pub async fn upload_file(
         &self,
         remote_path: &str,
         local_path: impl AsRef<Path>,
         prefer_volume_name: Option<String>,
     ) -> Fs0Result<FileRecord> {
-        let local_path = local_path.as_ref();
-        let update_size_hint = Some(tokio::fs::metadata(local_path).await?.len());
-        let file = tokio::fs::File::open(local_path).await?;
-
-        self.upload_reader(remote_path, file, prefer_volume_name, update_size_hint)
-            .await
-    }
-
-    pub async fn download<W>(&self, remote_path: &str, mut writer: W) -> Fs0Result<TransferStats>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let plan = self.central.get_file_read_plan(remote_path).await?;
-        let storages = self.storage_peers();
-        let (done_tx, done_rx) = oneshot::channel();
-        let total_chunks = plan.size.div_ceil(fs0_core::VOLUME_RAW_CHUNK_SIZE);
-        let remain_chunks = total_chunks;
-        let download_state = Arc::new(StdMutex::new(InternalDownloadState {
-            jobs: Vec::new(),
-            remain_chunks,
-            first_error: None,
-            done_tx: Some(done_tx),
-        }));
-
-        for bundle in &plan.bundles {
-            for replica in &bundle.replicas {
-                let Some(storage) = storages
-                    .iter()
-                    .find(|storage| storage.storage_id == replica.storage_id)
-                else {
-                    continue;
-                };
-
-                let session = self.storage_session(storage).await;
-                let chunks = session
-                    .inner
-                    .list_bundle_chunks(replica.volume_id, bundle.bundle_id)
-                    .await?;
-
-                for chunk in &chunks {
-                    let chunk_id = chunk.chunk_id;
-                    let job_index = {
-                        let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
-                            message: "download state lock was poisoned".to_owned(),
-                        })?;
-                        let job_index = state.jobs.len();
-                        state.jobs.push(ChunkJob {
-                            chunk_id,
-                            ready: false,
-                        });
-                        job_index
-                    };
-
-                    let download_state = Arc::clone(&download_state);
-                    session
-                        .enqueue_download(
-                            DownloadChunkRequest {
-                                volume_id: replica.volume_id,
-                                chunk_id,
-                            },
-                            move |result| {
-                                let Ok(mut state) = download_state.lock() else {
-                                    return;
-                                };
-
-                                match result {
-                                    Ok(_) => {
-                                        if let Some(entry) = state.jobs.get_mut(job_index) {
-                                            entry.ready = true;
-                                        } else if state.first_error.is_none() {
-                                            state.first_error = Some(Fs0Error::Internal {
-                                                message: format!(
-                                                    "download job {job_index} was not tracked"
-                                                ),
-                                            });
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if state.first_error.is_none() {
-                                            state.first_error = Some(err);
-                                        }
-                                    }
-                                }
-
-                                state.remain_chunks = state.remain_chunks.saturating_sub(1);
-                                let completed_chunks =
-                                    total_chunks.saturating_sub(state.remain_chunks);
-                                info!(completed_chunks, total_chunks, "download chunks completed");
-                                if state.remain_chunks == 0
-                                    && let Some(done_tx) = state.done_tx.take()
-                                {
-                                    let result = match state.first_error.take() {
-                                        Some(err) => Err(err),
-                                        None => Ok(()),
-                                    };
-                                    let _ = done_tx.send(result);
-                                }
-                            },
-                        )
-                        .await?;
-                }
-            }
-        }
-
-        if remain_chunks > 0 {
-            done_rx.await.map_err(|_| Fs0Error::Internal {
-                message: "download completion channel closed".to_owned(),
-            })??;
-        }
-
-        let chunk_jobs = {
-            let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
-                message: "download state lock was poisoned".to_owned(),
-            })?;
-            std::mem::take(&mut state.jobs)
-        };
-        let download_cache_dir = self
-            .config
-            .download_cache_dir
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("fs0-client-cache"));
-
-        for job in &chunk_jobs {
-            if !job.ready {
-                return Err(Fs0Error::Internal {
-                    message: "download job was not ready before write".to_owned(),
-                });
-            }
-
-            let cache_path = download_cache_dir.join(format!("{}.zst", job.chunk_id.to_hex()));
-            let compressed = tokio::fs::read(&cache_path).await?;
-            let max_raw_len = usize::try_from(VOLUME_RAW_CHUNK_SIZE).map_err(|_| {
-                Fs0Error::IntegerConversion {
-                    message: format!("raw_len {VOLUME_RAW_CHUNK_SIZE} exceeds usize"),
-                }
-            })?;
-            let raw = match zstd_decompress(&compressed, max_raw_len) {
-                Ok(raw) => raw,
-                Err(error) => {
-                    let _ = tokio::fs::remove_file(&cache_path).await;
-                    return Err(error);
-                }
-            };
-            if raw.len() as u64 > VOLUME_RAW_CHUNK_SIZE || blake3_hash(&raw) != job.chunk_id {
-                let _ = tokio::fs::remove_file(&cache_path).await;
-                return Err(Fs0Error::HashMismatch { volume_offset: 0 });
-            }
-            writer.write_all(&raw).await?;
-        }
-        writer.flush().await?;
-
-        Ok(TransferStats {
-            chunks: total_chunks,
-            size: plan.size,
-        })
+        self.upload_file_inner(
+            remote_path,
+            local_path.as_ref().to_path_buf(),
+            prefer_volume_name,
+        )
+        .await
     }
 
     pub async fn download_file(
@@ -355,20 +193,238 @@ impl Fs0Client {
         remote_path: &str,
         local_path: impl AsRef<Path>,
     ) -> Fs0Result<TransferStats> {
-        let file = tokio::fs::File::create(local_path).await?;
-        self.download(remote_path, file).await
+        let local_path = local_path.as_ref().to_path_buf();
+        let plan = self.central.get_file_read_plan(remote_path).await?;
+        let storages = self.storage_peers();
+        let mut output = tokio::fs::File::create(&local_path).await?;
+        output.set_len(plan.size).await?;
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<DownloadWriteJob>();
+        let writer = tokio::spawn(async move {
+            while let Some(job) = write_rx.recv().await {
+                output.seek(SeekFrom::Start(job.raw_offset)).await?;
+                output.write_all(&job.raw_bytes).await?;
+            }
+            output.flush().await?;
+            Ok::<_, Fs0Error>(())
+        });
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let download_state = Arc::new(StdMutex::new(InternalDownloadState {
+            remain_chunks: 0,
+            total_chunks: 0,
+            scheduling_done: false,
+            first_error: None,
+            done_tx: Some(done_tx),
+        }));
+
+        let download_result = self
+            .download_file_chunks(&plan, &storages, &download_state, done_rx, write_tx.clone())
+            .await;
+        drop(write_tx);
+
+        let writer_result = writer.await.map_err(|err| Fs0Error::Internal {
+            message: err.to_string(),
+        })?;
+        download_result?;
+        writer_result?;
+
+        Ok(TransferStats {
+            chunks: plan.size.div_ceil(VOLUME_RAW_CHUNK_SIZE),
+            size: plan.size,
+        })
     }
 
-    async fn upload_reader<R>(
+    async fn download_file_chunks(
+        &self,
+        plan: &FileReadPlan,
+        storages: &[StoragePeerInfo],
+        download_state: &Arc<StdMutex<InternalDownloadState>>,
+        done_rx: oneshot::Receiver<Fs0Result<()>>,
+        write_tx: mpsc::UnboundedSender<DownloadWriteJob>,
+    ) -> Fs0Result<()> {
+        for bundle in &plan.bundles {
+            let bundle_offset = bundle
+                .bundle_index
+                .checked_mul(VOLUME_BUNDLE_RAW_SIZE)
+                .ok_or_else(|| Fs0Error::IntegerConversion {
+                    message: "download bundle offset overflow".to_owned(),
+                })?;
+            let Some((replica, storage)) = bundle.replicas.iter().find_map(|replica| {
+                storages
+                    .iter()
+                    .find(|storage| storage.storage_id == replica.storage_id)
+                    .map(|storage| (replica, storage))
+            }) else {
+                return Err(Fs0Error::NotFound);
+            };
+
+            let session = self.storage_session(storage).await;
+            let mut chunks = session
+                .inner
+                .list_bundle_chunks(replica.volume_id, bundle.bundle_id)
+                .await?;
+            chunks.sort_by_key(|chunk| chunk.chunk_index);
+
+            for chunk in chunks {
+                let chunk_offset = chunk
+                    .chunk_index
+                    .checked_mul(VOLUME_RAW_CHUNK_SIZE)
+                    .ok_or_else(|| Fs0Error::IntegerConversion {
+                        message: "download chunk offset overflow".to_owned(),
+                    })?;
+                if chunk_offset >= bundle.raw_len {
+                    return Err(Fs0Error::InvalidData {
+                        message: "download chunk offset exceeds bundle raw_len".to_owned(),
+                    });
+                }
+                let raw_len = VOLUME_RAW_CHUNK_SIZE.min(bundle.raw_len - chunk_offset);
+                let raw_offset = bundle_offset.checked_add(chunk_offset).ok_or_else(|| {
+                    Fs0Error::IntegerConversion {
+                        message: "download file offset overflow".to_owned(),
+                    }
+                })?;
+                if raw_offset
+                    .checked_add(raw_len)
+                    .is_none_or(|end| end > plan.size)
+                {
+                    return Err(Fs0Error::InvalidData {
+                        message: "download chunk exceeds file size".to_owned(),
+                    });
+                }
+
+                {
+                    let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
+                        message: "download state lock was poisoned".to_owned(),
+                    })?;
+                    state.remain_chunks += 1;
+                    state.total_chunks += 1;
+                }
+
+                let chunk_id = chunk.chunk_id;
+                let download_state = Arc::clone(download_state);
+                let write_tx = write_tx.clone();
+                let download_started_at = Instant::now();
+                session
+                    .enqueue_download(
+                        DownloadChunkRequest {
+                            volume_id: replica.volume_id,
+                            chunk_id,
+                        },
+                        move |result| {
+                            let Ok(mut state) = download_state.lock() else {
+                                return;
+                            };
+
+                            match result {
+                                Ok(DownloadChunkResult {
+                                    chunk_id: response_chunk_id,
+                                    raw_bytes,
+                                }) => {
+                                    if response_chunk_id != chunk_id
+                                        || raw_bytes.len() as u64 != raw_len
+                                    {
+                                        warn!(
+                                            %chunk_id,
+                                            raw_len,
+                                            response_chunk_id = %response_chunk_id,
+                                            response_raw_len = raw_bytes.len(),
+                                            elapsed_ms = download_started_at.elapsed().as_millis(),
+                                            "download chunk metadata mismatch"
+                                        );
+                                        if state.first_error.is_none() {
+                                            state.first_error = Some(Fs0Error::InvalidData {
+                                                message:
+                                                    "downloaded chunk metadata does not match request"
+                                                        .to_owned(),
+                                            });
+                                        }
+                                    } else if write_tx
+                                        .send(DownloadWriteJob {
+                                            raw_offset,
+                                            raw_bytes,
+                                        })
+                                        .is_err()
+                                        && state.first_error.is_none()
+                                    {
+                                        state.first_error = Some(Fs0Error::Internal {
+                                            message: "download writer task closed".to_owned(),
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        %chunk_id,
+                                        raw_len,
+                                        elapsed_ms = download_started_at.elapsed().as_millis(),
+                                        error = %err,
+                                        "download chunk failed"
+                                    );
+                                    if state.first_error.is_none() {
+                                        state.first_error = Some(err);
+                                    }
+                                }
+                            }
+
+                            state.remain_chunks = state.remain_chunks.saturating_sub(1);
+                            let completed_chunks =
+                                state.total_chunks.saturating_sub(state.remain_chunks);
+                            info!(
+                                completed_chunks,
+                                total_chunks = state.total_chunks,
+                                elapsed_ms = download_started_at.elapsed().as_millis(),
+                                "download chunks completed"
+                            );
+                            if state.scheduling_done
+                                && state.remain_chunks == 0
+                                && let Some(done_tx) = state.done_tx.take()
+                            {
+                                let result = match state.first_error.take() {
+                                    Some(err) => Err(err),
+                                    None => Ok(()),
+                                };
+                                let _ = done_tx.send(result);
+                            }
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        let should_wait = {
+            let mut state = download_state.lock().map_err(|_| Fs0Error::Internal {
+                message: "download state lock was poisoned".to_owned(),
+            })?;
+            state.scheduling_done = true;
+            if state.remain_chunks == 0 {
+                if let Some(done_tx) = state.done_tx.take() {
+                    let result = match state.first_error.take() {
+                        Some(err) => Err(err),
+                        None => Ok(()),
+                    };
+                    let _ = done_tx.send(result);
+                }
+                false
+            } else {
+                true
+            }
+        };
+        if should_wait {
+            done_rx.await.map_err(|_| Fs0Error::Internal {
+                message: "download completion channel closed".to_owned(),
+            })??;
+        }
+
+        Ok(())
+    }
+
+    async fn upload_file_inner(
         &self,
         remote_path: &str,
-        mut reader: R,
+        local_path: PathBuf,
         prefer_volume_name: Option<String>,
-        update_size_hint: Option<u64>,
-    ) -> Fs0Result<FileRecord>
-    where
-        R: AsyncRead + Unpin,
-    {
+    ) -> Fs0Result<FileRecord> {
+        let update_size_hint = Some(tokio::fs::metadata(&local_path).await?.len());
+        let mut reader = tokio::fs::File::open(&local_path).await?;
         let lease = self
             .central
             .begin_update(BeginUpdateRequest {
@@ -419,10 +475,14 @@ impl Fs0Client {
                         break;
                     }
 
+                    let chunk_offset = new_size.checked_add(raw_len).ok_or_else(|| {
+                        Fs0Error::IntegerConversion {
+                            message: "uploaded chunk offset overflow".to_owned(),
+                        }
+                    })?;
                     let raw = &buffer[..read];
                     let chunk_id = blake3_hash(raw);
                     let chunk_index = chunks.len() as u64;
-                    let raw_bytes = raw.to_vec();
                     chunks.push(BundleChunkRef {
                         chunk_index,
                         chunk_id,
@@ -437,13 +497,15 @@ impl Fs0Client {
                         state.total_chunks += 1;
                     }
 
-                    let raw_len = raw_bytes.len() as u64;
+                    let raw_len = read as u64;
                     let job = UploadChunkJob {
                         lease_id: lease.lease_id,
                         file_id: lease.file_id,
                         volume_id,
                         chunk_id,
-                        raw_bytes,
+                        raw_len,
+                        source_path: local_path.clone(),
+                        source_offset: chunk_offset,
                     };
                     let upload_state = Arc::clone(&upload_state);
                     let upload_started_at = Instant::now();

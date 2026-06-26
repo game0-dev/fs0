@@ -1,4 +1,4 @@
-use crate::{commands::connect_client, output::json_error};
+use crate::commands::connect_client;
 use fs0_client::Fs0Client;
 use fs0_core::{Fs0Error, Fs0Result};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,6 @@ struct PutDirSummary {
 
 pub(in crate::commands) async fn put_dir(
     config: &Option<PathBuf>,
-    json: bool,
     remote_dir: String,
     local_dir: PathBuf,
     prefer_volume: Option<String>,
@@ -30,36 +29,34 @@ pub(in crate::commands) async fn put_dir(
     let files = collect_upload_files(&local_dir, &remote_dir)?;
 
     if dry_run {
-        print_dry_run(json, &files)?;
+        print_dry_run(&files);
         return Ok(());
     }
 
     let client = connect_client(config).await?;
-    let result = upload_files(&client, json, &files, prefer_volume).await;
+    let result = upload_files(&client, &files, prefer_volume).await;
     let shutdown = client.shutdown().await;
     let summary = result?;
     shutdown?;
 
-    print_summary(json, &summary)
+    print_summary(&summary);
+    Ok(())
 }
 
 async fn upload_files(
     client: &Fs0Client,
-    json: bool,
     files: &[UploadFile],
     prefer_volume: Option<String>,
 ) -> Fs0Result<PutDirSummary> {
     let mut summary = PutDirSummary::default();
 
     for (index, file) in files.iter().enumerate() {
-        if !json {
-            eprintln!(
-                "checking {}/{} {}",
-                index + 1,
-                files.len(),
-                file.remote_path
-            );
-        }
+        eprintln!(
+            "checking {}/{} {}",
+            index + 1,
+            files.len(),
+            file.remote_path
+        );
         let remote_exists_with_same_size = match client.get_file_read_plan(&file.remote_path).await
         {
             Ok(plan) => plan.size == file.bytes,
@@ -69,21 +66,17 @@ async fn upload_files(
         if remote_exists_with_same_size {
             summary.skipped_files += 1;
             summary.skipped_bytes += file.bytes;
-            if !json {
-                println!("skip {} {} bytes", file.remote_path, file.bytes);
-            }
+            println!("skip {} {} bytes", file.remote_path, file.bytes);
             continue;
         }
 
-        if !json {
-            eprintln!(
-                "uploading {}/{} {} {} bytes",
-                index + 1,
-                files.len(),
-                file.remote_path,
-                file.bytes
-            );
-        }
+        eprintln!(
+            "uploading {}/{} {} {} bytes",
+            index + 1,
+            files.len(),
+            file.remote_path,
+            file.bytes
+        );
         let uploaded = client
             .upload_file(
                 &file.remote_path,
@@ -93,9 +86,7 @@ async fn upload_files(
             .await?;
         summary.uploaded_files += 1;
         summary.uploaded_bytes += uploaded.size_bytes;
-        if !json {
-            println!("put {} {} bytes", uploaded.path, uploaded.size_bytes);
-        }
+        println!("put {} {} bytes", uploaded.path, uploaded.size_bytes);
     }
 
     Ok(summary)
@@ -176,58 +167,23 @@ fn normalize_remote_dir(remote_dir: &str) -> String {
     }
 }
 
-fn print_dry_run(json: bool, files: &[UploadFile]) -> Fs0Result<()> {
-    if json {
-        let files = files
-            .iter()
-            .map(|file| {
-                serde_json::json!({
-                    "local_path": file.local_path,
-                    "remote_path": file.remote_path,
-                    "bytes": file.bytes,
-                })
-            })
-            .collect::<Vec<_>>();
+fn print_dry_run(files: &[UploadFile]) {
+    for file in files {
         println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "files": files }))
-                .map_err(json_error)?
+            "{} -> {} {} bytes",
+            file.local_path.display(),
+            file.remote_path,
+            file.bytes
         );
-    } else {
-        for file in files {
-            println!(
-                "{} -> {} {} bytes",
-                file.local_path.display(),
-                file.remote_path,
-                file.bytes
-            );
-        }
     }
-
-    Ok(())
 }
 
-fn print_summary(json: bool, summary: &PutDirSummary) -> Fs0Result<()> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "uploaded_files": summary.uploaded_files,
-                "uploaded_bytes": summary.uploaded_bytes,
-                "skipped_files": summary.skipped_files,
-                "skipped_bytes": summary.skipped_bytes,
-            }))
-            .map_err(json_error)?
-        );
-    } else {
-        println!(
-            "uploaded {} files {} bytes, skipped {} files {} bytes",
-            summary.uploaded_files,
-            summary.uploaded_bytes,
-            summary.skipped_files,
-            summary.skipped_bytes
-        );
-    }
-
-    Ok(())
+fn print_summary(summary: &PutDirSummary) {
+    println!(
+        "uploaded {} files {} bytes, skipped {} files {} bytes",
+        summary.uploaded_files,
+        summary.uploaded_bytes,
+        summary.skipped_files,
+        summary.skipped_bytes
+    );
 }

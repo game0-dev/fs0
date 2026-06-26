@@ -10,10 +10,8 @@ use std::{env, path::PathBuf};
 
 pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
     match cli.command {
-        Command::Ls { dir, limit, cursor } => {
-            client::ls(&cli.config, cli.json, dir, limit, cursor).await
-        }
-        Command::Stat { remote_path } => client::stat(&cli.config, cli.json, remote_path).await,
+        Command::Ls { dir, limit, cursor } => client::ls(&cli.config, dir, limit, cursor).await,
+        Command::Stat { remote_path } => client::stat(&cli.config, remote_path).await,
         Command::Get {
             remote_path,
             local_path,
@@ -22,45 +20,24 @@ pub(crate) async fn run(cli: Cli) -> Fs0Result<()> {
             remote_path,
             local_path,
             prefer_volume,
-        } => {
-            client::put(
-                &cli.config,
-                cli.json,
-                remote_path,
-                local_path,
-                prefer_volume,
-            )
-            .await
-        }
+        } => client::put(&cli.config, remote_path, local_path, prefer_volume).await,
         Command::PutDir {
             remote_dir,
             local_dir,
             prefer_volume,
             dry_run,
-        } => {
-            client::put_dir(
-                &cli.config,
-                cli.json,
-                remote_dir,
-                local_dir,
-                prefer_volume,
-                dry_run,
-            )
-            .await
-        }
+        } => client::put_dir(&cli.config, remote_dir, local_dir, prefer_volume, dry_run).await,
         Command::Rm { remote_path } => client::rm(&cli.config, remote_path).await,
         Command::Cp {
             source_path,
             target_path,
-        } => client::cp(&cli.config, cli.json, source_path, target_path).await,
+        } => client::cp(&cli.config, source_path, target_path).await,
         Command::Mv {
             source_path,
             target_path,
-        } => client::mv(&cli.config, cli.json, source_path, target_path).await,
-        Command::Changes { cursor, limit } => {
-            client::changes(&cli.config, cli.json, cursor, limit).await
-        }
-        Command::Peers => client::peers(&cli.config, cli.json).await,
+        } => client::mv(&cli.config, source_path, target_path).await,
+        Command::Changes { cursor, limit } => client::changes(&cli.config, cursor, limit).await,
+        Command::Peers => client::peers(&cli.config).await,
         Command::Central { command } => match command {
             CentralCommand::Run => server::run_central(&cli.config).await,
         },
