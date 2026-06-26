@@ -11,7 +11,7 @@ use fs0_core::{
     },
     zstd_compress, zstd_decompress,
 };
-use fs0_transport::{Connection, SelectedPath, Transport};
+use fs0_transport::{ConnectOptions, ConnectRetry, Connection, Transport};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -24,6 +24,9 @@ use tracing::{info, warn};
 use self::request_scheduler::HashRequestScheduler;
 
 const STORAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const STORAGE_CONNECT_RETRY_ATTEMPTS: usize = 3;
+const STORAGE_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const STORAGE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const STORAGE_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 const STORAGE_HAS_TIMEOUT: Duration = Duration::from_secs(15);
 const STORAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -61,7 +64,6 @@ pub(crate) struct StorageSessionInner {
     client_id: u64,
     storage_id: u64,
     connection: Mutex<Option<Connection>>,
-    selected_path: parking_lot::RwLock<Option<SelectedPath>>,
 }
 
 impl StorageSession {
@@ -82,7 +84,6 @@ impl StorageSession {
             client_id,
             storage_id,
             connection: Mutex::new(None),
-            selected_path: parking_lot::RwLock::new(None),
         });
         let upload_scheduler = HashRequestScheduler::new(upload_concurrency, {
             let inner = Arc::clone(&inner);
@@ -300,17 +301,18 @@ impl StorageSessionInner {
             .ok_or(Fs0Error::NotFound)?;
         let data_endpoint = postcard::from_bytes(&storage.iroh_endpoint).map_err(Fs0Error::from)?;
         info!(endpoint = ?data_endpoint, "client connecting to storage");
-        let connection = tokio::time::timeout(
-            STORAGE_CONNECT_TIMEOUT,
-            self.transport.connect(data_endpoint, TRANSPORT_DATA_ALPN),
-        )
-        .await
-        .map_err(|_| Fs0Error::Internal {
-            message: format!("storage connect timed out after {STORAGE_CONNECT_TIMEOUT:?}"),
-        })??;
+        let connect_options = ConnectOptions::new()
+            .with_timeout(STORAGE_CONNECT_TIMEOUT)
+            .with_retry(ConnectRetry::new(
+                STORAGE_CONNECT_RETRY_ATTEMPTS,
+                STORAGE_CONNECT_RETRY_DELAY,
+                STORAGE_CONNECT_RETRY_MAX_DELAY,
+            ));
+        let connection = self
+            .transport
+            .connect(data_endpoint, TRANSPORT_DATA_ALPN, Some(connect_options))
+            .await?;
         self.authenticate(connection.clone()).await?;
-        self.log_selected_path_if_changed(&connection, "client storage data");
-
         *current = Some(connection.clone());
 
         Ok(connection)
@@ -318,13 +320,12 @@ impl StorageSessionInner {
 
     async fn authenticate(&self, connection: Connection) -> Fs0Result<()> {
         match connection
-            .rpc_timeout(
+            .rpc(
                 ProtocolRequest::Data(DataRequest::Authenticate {
                     client_id: self.client_id,
                     client_token: self.config.token.clone(),
                 }),
-                STORAGE_AUTH_TIMEOUT,
-                "storage authentication",
+                Some(STORAGE_AUTH_TIMEOUT),
             )
             .await
         {
@@ -358,20 +359,17 @@ impl StorageSessionInner {
 
     pub(crate) async fn request(&self, request: DataRequest) -> Fs0Result<DataResponse> {
         let connection = self.ensure_connected().await?;
-        self.log_selected_path_if_changed(&connection, "client storage data");
-        let (timeout, context) = match &request {
-            DataRequest::HasChunk { .. } | DataRequest::HasBundle { .. } => {
-                (STORAGE_HAS_TIMEOUT, "storage existence check")
-            }
-            DataRequest::UploadChunk(_) => (STORAGE_UPLOAD_TIMEOUT, "storage upload chunk"),
-            DataRequest::CommitBundle(_) => (STORAGE_COMMIT_TIMEOUT, "storage commit bundle"),
+        let timeout = match &request {
+            DataRequest::HasChunk { .. } | DataRequest::HasBundle { .. } => STORAGE_HAS_TIMEOUT,
+            DataRequest::UploadChunk(_) => STORAGE_UPLOAD_TIMEOUT,
+            DataRequest::CommitBundle(_) => STORAGE_COMMIT_TIMEOUT,
             DataRequest::DownloadChunk(_) | DataRequest::ListBundleChunks { .. } => {
-                (STORAGE_DOWNLOAD_TIMEOUT, "storage download/read request")
+                STORAGE_DOWNLOAD_TIMEOUT
             }
-            DataRequest::Authenticate { .. } => (STORAGE_AUTH_TIMEOUT, "storage authentication"),
+            DataRequest::Authenticate { .. } => STORAGE_AUTH_TIMEOUT,
         };
         let response = match connection
-            .rpc_timeout(ProtocolRequest::Data(request), timeout, context)
+            .rpc(ProtocolRequest::Data(request), Some(timeout))
             .await?
         {
             ProtocolResponse::Error(err) => Err(err),
@@ -380,7 +378,6 @@ impl StorageSessionInner {
                 message: format!("unexpected data response: {response:?}"),
             }),
         };
-        self.log_selected_path_if_changed(&connection, "client storage data");
         if response.is_err() && connection.is_closed() {
             *self.connection.lock().await = None;
         }
@@ -391,30 +388,6 @@ impl StorageSessionInner {
     async fn close(&self, reason: &[u8]) {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.close(reason);
-        }
-        *self.selected_path.write() = None;
-    }
-
-    fn log_selected_path_if_changed(&self, connection: &Connection, label: &'static str) {
-        let selected_path = connection.selected_path();
-        if *self.selected_path.read() == selected_path {
-            return;
-        }
-
-        *self.selected_path.write() = selected_path.clone();
-        match selected_path {
-            Some(path) => {
-                info!(
-                    connection = label,
-                    path_kind = path.kind.as_str(),
-                    remote_addr = %path.remote_addr,
-                    relay_proxy = path.kind == fs0_transport::SelectedPathKind::Relay,
-                    "iroh selected path"
-                );
-            }
-            None => {
-                info!(connection = label, "iroh selected path pending");
-            }
         }
     }
 }

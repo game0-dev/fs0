@@ -4,8 +4,9 @@ mod tasks;
 
 use crate::{Fs0Result, StorageConfig};
 use fs0_core::{Fs0Error, protocol::StorageVolumeInfo};
-use fs0_transport::Transport;
+use fs0_transport::{Transport, TransportOptions};
 use fs0_volume::{Volume, VolumeMeta};
+use iroh::protocol::Router;
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
@@ -30,6 +31,7 @@ pub struct StorageServer {
     pub(crate) volumes: Arc<HashMap<u64, Arc<Volume>>>,
     pub(crate) upload_leases: RwLock<HashMap<u64, UploadLeaseState>>,
     transport: Transport,
+    router: Mutex<Option<Router>>,
     exit: AtomicBool,
     shutdown_notify: Arc<Notify>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -62,13 +64,12 @@ impl StorageServer {
                 info!("storage iroh relay client disabled; endpoint will not publish relay addrs");
             }
         }
-        let transport = Transport::bind(
-            vec![fs0_core::TRANSPORT_DATA_ALPN],
-            None,
-            bind_addr,
-            config.relay.clone(),
-        )
-        .await?;
+        let mut transport_options = TransportOptions::new(vec![fs0_core::TRANSPORT_DATA_ALPN])
+            .with_relay(config.relay.clone());
+        if let Some(bind_addr) = bind_addr {
+            transport_options = transport_options.with_bind_addr(bind_addr);
+        }
+        let transport = Transport::bind(transport_options).await?;
         info!(endpoint = ?transport.addr(), "storage data transport bound");
         let central_connection = CentralConnection::new();
         central_connection
@@ -86,20 +87,17 @@ impl StorageServer {
             volumes,
             upload_leases: RwLock::new(HashMap::new()),
             transport,
+            router: Mutex::new(None),
             exit: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
             tasks: Mutex::new(Vec::new()),
         });
 
         server.central_connection.spawn(Arc::downgrade(&server))?;
+        *server.router.lock() = Some(tasks::spawn_connection_router(&server));
 
         server.tasks.lock().extend([
             CentralConnection::spawn_endpoint_addr_watcher(
-                Arc::downgrade(&server),
-                server.shutdown_notify.clone(),
-            ),
-            tasks::spawn_connection_accept_loop(
-                server.transport.clone(),
                 Arc::downgrade(&server),
                 server.shutdown_notify.clone(),
             ),
@@ -142,7 +140,14 @@ impl StorageServer {
 
         self.shutdown_notify.notify_waiters();
         self.central_connection.close(b"storage shutdown");
-        self.transport.close().await;
+        let router = self.router.lock().take();
+        if let Some(router) = router {
+            if let Err(err) = router.shutdown().await {
+                tracing::warn!(error = %err, "storage transport router shutdown failed");
+            }
+        } else {
+            self.transport.close().await;
+        }
 
         let tasks = std::mem::take(&mut *self.tasks.lock());
         for task in tasks {

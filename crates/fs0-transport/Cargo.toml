@@ -12,10 +12,12 @@ fs0-config.workspace = true
 fs0-core.workspace = true
 iroh.workspace = true
 iroh-relay.workspace = true
+n0-future.workspace = true
 postcard.workspace = true
 rustls.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

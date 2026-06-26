@@ -1076,10 +1076,12 @@ dependencies = [
  "fs0-core",
  "iroh",
  "iroh-relay",
+ "n0-future",
  "postcard",
  "rustls",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use fs0_core::{
     Fs0Error, TRANSPORT_CONTROL_ALPN,
     protocol::{ProtocolEvent, StoragePeerInfo, StorageVolumeInfo},
 };
-use fs0_transport::{Connection, EndpointAddr, SecretKey, Transport};
+use fs0_transport::{Connection, EndpointAddr, SecretKey, Transport, TransportOptions};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 #[derive(Debug)]
@@ -30,7 +30,7 @@ pub struct CentralServer {
     pub(crate) db: Mutex<CentralDb>,
     exit: AtomicBool,
     shutdown_notify: Arc<Notify>,
-    _join_handles: Mutex<Option<JoinHandle<()>>>,
+    tasks: Mutex<Option<spawn::CentralTasks>>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,10 +70,9 @@ impl CentralServer {
                     message: format!("invalid central.secret_key: {err}"),
                 })?;
         let transport = Transport::bind(
-            vec![TRANSPORT_CONTROL_ALPN],
-            Some(secret_key),
-            Some(SocketAddr::from(([0, 0, 0, 0], config.bind_port))),
-            None,
+            TransportOptions::new(vec![TRANSPORT_CONTROL_ALPN])
+                .with_secret_key(secret_key)
+                .with_bind_addr(SocketAddr::from(([0, 0, 0, 0], config.bind_port))),
         )
         .await?;
         info!(endpoint = ?transport.addr(), "central control transport bound");
@@ -89,10 +88,10 @@ impl CentralServer {
             db: Mutex::new(db),
             exit: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
-            _join_handles: Mutex::new(None),
+            tasks: Mutex::new(None),
         });
 
-        *server._join_handles.lock() = Some(spawn::spawn_central_tasks(
+        *server.tasks.lock() = Some(spawn::spawn_central_tasks(
             server.transport.clone(),
             relay,
             Arc::downgrade(&server),
@@ -121,11 +120,11 @@ impl CentralServer {
         }
 
         self.shutdown_notify.notify_waiters();
-        self.transport.close().await;
-
-        let join_handle = self._join_handles.lock().take();
-        if let Some(task) = join_handle {
-            let _ = task.await;
+        let tasks = self.tasks.lock().take();
+        if let Some(tasks) = tasks {
+            let _ = tasks.shutdown().await;
+        } else {
+            self.transport.close().await;
         }
     }
 

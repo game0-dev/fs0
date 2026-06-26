@@ -7,7 +7,7 @@ use fs0_core::{
         StoragePeerInfo,
     },
 };
-use fs0_transport::{Connection, Transport};
+use fs0_transport::{ConnectOptions, ConnectRetry, Connection, Transport};
 use parking_lot::RwLock;
 use std::{
     sync::{
@@ -20,6 +20,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 const CENTRAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CENTRAL_CONNECT_RETRY_ATTEMPTS: usize = 3;
+const CENTRAL_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const CENTRAL_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const CENTRAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) struct CentralSession {
@@ -59,10 +62,9 @@ impl CentralSession {
     pub(crate) async fn request(&self, request: ControlRequest) -> Fs0Result<ControlResponse> {
         let connection = self.ensure_connected().await?;
         match connection
-            .rpc_timeout(
+            .rpc(
                 ProtocolRequest::Control(request),
-                CENTRAL_REQUEST_TIMEOUT,
-                "central request",
+                Some(CENTRAL_REQUEST_TIMEOUT),
             )
             .await?
         {
@@ -116,24 +118,29 @@ impl CentralSession {
         let central_endpoint = self.config.central_endpoint.into();
         info!(endpoint = ?central_endpoint, "client connecting to central");
         self.event_listener_stopping.store(false, Ordering::Release);
-        let new_connection = tokio::time::timeout(
-            CENTRAL_CONNECT_TIMEOUT,
-            self.transport
-                .connect(central_endpoint, TRANSPORT_CONTROL_ALPN),
-        )
-        .await
-        .map_err(|_| Fs0Error::Internal {
-            message: format!("central connect timed out after {CENTRAL_CONNECT_TIMEOUT:?}"),
-        })??;
+        let connect_options = ConnectOptions::new()
+            .with_timeout(CENTRAL_CONNECT_TIMEOUT)
+            .with_retry(ConnectRetry::new(
+                CENTRAL_CONNECT_RETRY_ATTEMPTS,
+                CENTRAL_CONNECT_RETRY_DELAY,
+                CENTRAL_CONNECT_RETRY_MAX_DELAY,
+            ));
+        let new_connection = self
+            .transport
+            .connect(
+                central_endpoint,
+                TRANSPORT_CONTROL_ALPN,
+                Some(connect_options),
+            )
+            .await?;
         let response = match new_connection
-            .rpc_timeout(
+            .rpc(
                 ProtocolRequest::Control(ControlRequest::RegisterClient {
                     name: self.name.clone(),
                     token: self.config.token.clone(),
                     version: FS0_VERSION.to_owned(),
                 }),
-                CENTRAL_REQUEST_TIMEOUT,
-                "client central registration",
+                Some(CENTRAL_REQUEST_TIMEOUT),
             )
             .await?
         {
@@ -184,39 +191,45 @@ fn spawn_event_listener(
     storages: Arc<RwLock<Vec<StoragePeerInfo>>>,
     stopping: Arc<AtomicBool>,
 ) {
-    tokio::spawn(async move {
-        let result = connection
-            .serve(move |request| {
-                let storages = Arc::clone(&storages);
-                async move {
-                    match request {
-                        ProtocolRequest::Event(ProtocolEvent::StorageChanged(peer)) => {
-                            let mut storages = storages.write();
-                            match storages
-                                .iter_mut()
-                                .find(|storage| storage.storage_id == peer.storage_id)
-                            {
-                                Some(storage) => *storage = peer,
-                                None => storages.push(peer),
-                            }
-                            storages.sort_by_key(|storage| storage.storage_id);
-                            Ok(None)
+    let accept_task = connection.spawn_accept(
+        move |request| {
+            let storages = Arc::clone(&storages);
+            async move {
+                match request {
+                    ProtocolRequest::Event(ProtocolEvent::StorageChanged(peer)) => {
+                        let mut storages = storages.write();
+                        match storages
+                            .iter_mut()
+                            .find(|storage| storage.storage_id == peer.storage_id)
+                        {
+                            Some(storage) => *storage = peer,
+                            None => storages.push(peer),
                         }
-                        ProtocolRequest::Event(ProtocolEvent::StorageRemoved { storage_id }) => {
-                            storages
-                                .write()
-                                .retain(|storage| storage.storage_id != storage_id);
-                            Ok(None)
-                        }
-                        _ => Err(Fs0Error::InvalidRequest),
+                        storages.sort_by_key(|storage| storage.storage_id);
+                        Ok(None)
                     }
+                    ProtocolRequest::Event(ProtocolEvent::StorageRemoved { storage_id }) => {
+                        storages
+                            .write()
+                            .retain(|storage| storage.storage_id != storage_id);
+                        Ok(None)
+                    }
+                    _ => Err(Fs0Error::InvalidRequest),
                 }
-            })
-            .await;
-        if let Err(err) = result
-            && !stopping.load(Ordering::Acquire)
-        {
-            warn!(error = %err, "client central event listener stopped");
+            }
+        },
+        std::future::pending(),
+    );
+    tokio::spawn(async move {
+        match accept_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if !stopping.load(Ordering::Acquire) => {
+                warn!(error = %err, "client central event listener stopped");
+            }
+            Err(err) if !stopping.load(Ordering::Acquire) => {
+                warn!(error = %err, "client central event listener task failed");
+            }
+            Ok(Err(_)) | Err(_) => {}
         }
     });
 }

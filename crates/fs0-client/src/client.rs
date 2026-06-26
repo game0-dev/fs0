@@ -13,7 +13,7 @@ use fs0_core::{
     },
     zstd_decompress,
 };
-use fs0_transport::Transport;
+use fs0_transport::{Transport, TransportOptions};
 use std::{
     collections::HashMap,
     path::Path,
@@ -73,7 +73,9 @@ struct InternalUploadState {
 
 impl Fs0Client {
     pub async fn connect(config: ClientConfig) -> Fs0Result<Self> {
-        let transport = Transport::bind(Vec::new(), None, None, config.relay.clone()).await?;
+        let transport =
+            Transport::bind(TransportOptions::new(Vec::new()).with_relay(config.relay.clone()))
+                .await?;
         let storage_sessions = Arc::new(Mutex::new(HashMap::new()));
         let central = Arc::new(CentralSession::new(
             config.clone(),

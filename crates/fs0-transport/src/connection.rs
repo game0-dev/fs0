@@ -2,113 +2,267 @@ use fs0_core::{
     Fs0Error, Fs0Result, TRANSPORT_FRAME_LEN_BYTES, TRANSPORT_MAX_FRAME_BODY_LEN,
     protocol::{ProtocolEvent, ProtocolRequest, ProtocolResponse},
 };
-use iroh::endpoint::{Connection as IrohConnection, SendStream};
+use iroh::endpoint::{Connection as IrohConnection, PathEvent};
+use n0_future::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt, sync::Arc, time::Duration};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    task::{JoinHandle, JoinSet},
+};
+use tracing::{info, warn};
+
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct Connection {
-    inner: Arc<ConnectionInner>,
+    iroh_connection: IrohConnection,
 }
 
 impl fmt::Debug for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
-            .field("alpn", &self.alpn())
-            .field("remote_id", &self.inner.iroh_connection.remote_id())
+            .field("remote_id", &self.iroh_connection.remote_id())
             .finish_non_exhaustive()
     }
 }
 
-struct ConnectionInner {
-    alpn: Vec<u8>,
-    iroh_connection: IrohConnection,
-    uni_stream: tokio::sync::Mutex<Option<SendStream>>,
-}
-
 impl Connection {
-    pub(crate) fn new(alpn: Vec<u8>, iroh_connection: IrohConnection) -> Self {
-        Self {
-            inner: Arc::new(ConnectionInner {
-                alpn,
-                iroh_connection,
-                uni_stream: tokio::sync::Mutex::new(None),
-            }),
-        }
+    pub fn new(iroh_connection: IrohConnection) -> Self {
+        let connection = Self { iroh_connection };
+        connection.start_watch_connection_path();
+        connection
     }
 
-    #[must_use]
-    pub fn alpn(&self) -> &[u8] {
-        &self.inner.alpn
-    }
-
-    pub async fn rpc(&self, request: ProtocolRequest) -> Fs0Result<ProtocolResponse> {
-        let (mut send, mut recv) =
-            self.inner
-                .iroh_connection
-                .open_bi()
-                .await
-                .map_err(|err| Fs0Error::Internal {
-                    message: err.to_string(),
-                })?;
-        write_frame(&mut send, &request).await?;
-        send.finish().map_err(|err| Fs0Error::Internal {
-            message: err.to_string(),
-        })?;
-        read_frame(&mut recv).await
-    }
-
-    pub async fn rpc_timeout(
+    pub async fn rpc(
         &self,
         request: ProtocolRequest,
-        timeout: Duration,
-        context: &'static str,
+        timeout: Option<Duration>,
     ) -> Fs0Result<ProtocolResponse> {
-        tokio::time::timeout(timeout, self.rpc(request))
-            .await
-            .map_err(|_| Fs0Error::Internal {
-                message: format!("{context} timed out after {timeout:?}"),
-            })?
+        let started = Instant::now();
+        let timeout = timeout.unwrap_or(DEFAULT_RPC_TIMEOUT);
+        let rpc = async {
+            let (mut send, mut recv) =
+                self.iroh_connection
+                    .open_bi()
+                    .await
+                    .map_err(|err| Fs0Error::Internal {
+                        message: err.to_string(),
+                    })?;
+            write_frame(&mut send, &request).await?;
+            send.finish().map_err(|err| Fs0Error::Internal {
+                message: err.to_string(),
+            })?;
+            read_frame(&mut recv).await
+        };
+
+        tokio::time::timeout(timeout, rpc).await.map_err(|_| {
+            warn!(
+                remote_id = ?self.iroh_connection.remote_id(),
+                timeout = ?timeout,
+                elapsed_ms = started.elapsed().as_millis(),
+                "iroh rpc timed out"
+            );
+            Fs0Error::Internal {
+                message: format!("transport rpc timed out after {timeout:?}"),
+            }
+        })?
     }
 
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.inner.iroh_connection.close_reason().is_some()
+        self.iroh_connection.close_reason().is_some()
     }
 
-    pub async fn serve<F, Fut>(&self, handler: F) -> Fs0Result<()>
+    pub fn spawn_accept<F, Fut, Exit>(&self, handler: F, exit: Exit) -> JoinHandle<Fs0Result<()>>
+    where
+        F: Fn(ProtocolRequest) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Fs0Result<Option<ProtocolResponse>>> + Send + 'static,
+        Exit: Future<Output = ()> + Send + 'static,
+    {
+        let connection = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = connection.accept_loop(handler) => result,
+                _ = exit => Ok(()),
+            }
+        })
+    }
+
+    pub async fn send_event(&self, event: &ProtocolEvent) -> Fs0Result<()> {
+        let mut stream =
+            self.iroh_connection
+                .open_uni()
+                .await
+                .map_err(|err| Fs0Error::Internal {
+                    message: err.to_string(),
+                })?;
+
+        if let Err(err) = write_frame(&mut stream, event).await {
+            warn!(
+                remote_id = ?self.iroh_connection.remote_id(),
+                error = %err,
+                "iroh failed to send event"
+            );
+            return Err(err);
+        }
+        stream.finish().map_err(|err| {
+            let err = Fs0Error::Internal {
+                message: err.to_string(),
+            };
+            warn!(
+                remote_id = ?self.iroh_connection.remote_id(),
+                error = %err,
+                "iroh failed to finish event stream"
+            );
+            err
+        })?;
+
+        Ok(())
+    }
+
+    pub fn close(&self, reason: &[u8]) {
+        info!(
+            remote_id = ?self.iroh_connection.remote_id(),
+            reason = %String::from_utf8_lossy(reason),
+            "iroh connection closing"
+        );
+        self.iroh_connection.close(0u32.into(), reason);
+    }
+
+    fn start_watch_connection_path(&self) {
+        let iroh_connection = self.iroh_connection.clone();
+        tokio::spawn(async move {
+            let remote_id = iroh_connection.remote_id();
+            let mut events = iroh_connection.path_events();
+
+            while let Some(event) = events.next().await {
+                match event {
+                    PathEvent::Selected { id, remote_addr } => {
+                        let path_kind = if remote_addr.is_relay() {
+                            "relay"
+                        } else if remote_addr.is_ip() {
+                            "direct"
+                        } else {
+                            "other"
+                        };
+                        info!(
+                            remote_id = ?remote_id,
+                            path_id = ?id,
+                            path_kind,
+                            remote_addr = %remote_addr,
+                            relay_proxy = remote_addr.is_relay(),
+                            "iroh path selected"
+                        );
+                    }
+                    PathEvent::Lagged { missed } => {
+                        warn!(
+                            remote_id = ?remote_id,
+                            missed,
+                            "iroh path event listener lagged"
+                        );
+                    }
+                    PathEvent::Opened { .. } | PathEvent::Closed { .. } => {}
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    async fn accept_loop<F, Fut>(self, handler: F) -> Fs0Result<()>
     where
         F: Fn(ProtocolRequest) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Fs0Result<Option<ProtocolResponse>>> + Send + 'static,
     {
+        let connection = self;
+        let mut stream_tasks = JoinSet::new();
+        info!(
+            remote_id = ?connection.iroh_connection.remote_id(),
+            "iroh connection accept started"
+        );
+
         loop {
             tokio::select! {
-                stream = self.inner.iroh_connection.accept_bi() => {
-                    let (mut send, mut recv) = stream.map_err(|err| Fs0Error::Internal {
-                        message: err.to_string(),
+                result = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        if err.is_panic() {
+                            return Err(Fs0Error::Internal {
+                                message: format!("transport stream task panicked: {err}"),
+                            });
+                        }
+                    }
+                }
+                stream = connection.iroh_connection.accept_bi() => {
+                    let (mut send, mut recv) = stream.map_err(|err| {
+                        let err = Fs0Error::Internal {
+                            message: err.to_string(),
+                        };
+                        warn!(
+                            remote_id = ?connection.iroh_connection.remote_id(),
+                            error = %err,
+                            "iroh failed to accept bidirectional stream"
+                        );
+                        err
                     })?;
                     let handler = handler.clone();
-                    tokio::spawn(async move {
+                    let remote_id = connection.iroh_connection.remote_id();
+                    stream_tasks.spawn(async move {
                         let response = match read_frame(&mut recv).await {
-                            Ok(request) => match handler(request).await {
-                                Ok(Some(response)) => response,
-                                Ok(None) => ProtocolResponse::Error(Fs0Error::InvalidRequest),
-                                Err(err) => ProtocolResponse::Error(err),
-                            },
+                            Ok(request) => {
+                                info!(
+                                    remote_id = ?remote_id,
+                                    request_kind = protocol_request_kind(&request),
+                                    "iroh rpc request received"
+                                );
+                                match handler(request).await {
+                                    Ok(Some(response)) => response,
+                                    Ok(None) => ProtocolResponse::Error(Fs0Error::InvalidRequest),
+                                    Err(err) => ProtocolResponse::Error(err),
+                                }
+                            }
                             Err(err) => ProtocolResponse::Error(err),
                         };
+                        let response_kind = protocol_response_kind(&response);
 
-                        let _ = write_frame(&mut send, &response).await;
-                        let _ = send.finish();
+                        if let Err(err) = write_frame(&mut send, &response).await {
+                            warn!(
+                                remote_id = ?remote_id,
+                                error = %err,
+                                "iroh failed to write response"
+                            );
+                            return;
+                        }
+                        if let Err(err) = send.finish() {
+                            warn!(
+                                remote_id = ?remote_id,
+                                error = %err,
+                                "iroh failed to finish response stream"
+                            );
+                        }
+                        info!(
+                            remote_id = ?remote_id,
+                            response_kind,
+                            "iroh rpc response sent"
+                        );
                     });
                 }
-                stream = self.inner.iroh_connection.accept_uni() => {
-                    let mut stream = stream.map_err(|err| Fs0Error::Internal {
-                        message: err.to_string(),
+                stream = connection.iroh_connection.accept_uni() => {
+                    let mut stream = stream.map_err(|err| {
+                        let err = Fs0Error::Internal {
+                            message: err.to_string(),
+                        };
+                        warn!(
+                            remote_id = ?connection.iroh_connection.remote_id(),
+                            error = %err,
+                            "iroh failed to accept unidirectional stream"
+                        );
+                        err
                     })?;
                     let handler = handler.clone();
-                    tokio::spawn(async move {
+                    stream_tasks.spawn(async move {
                         loop {
                             let event = match read_frame(&mut stream).await {
                                 Ok(event) => event,
@@ -120,76 +274,6 @@ impl Connection {
                     });
                 }
             };
-        }
-    }
-
-    pub async fn send_event(&self, event: &ProtocolEvent) -> Fs0Result<()> {
-        let mut uni_stream = self.inner.uni_stream.lock().await;
-        if uni_stream.is_none() {
-            *uni_stream = Some(self.inner.iroh_connection.open_uni().await.map_err(|err| {
-                Fs0Error::Internal {
-                    message: err.to_string(),
-                }
-            })?);
-        }
-
-        let stream = uni_stream.as_mut().ok_or_else(|| Fs0Error::Internal {
-            message: "uni stream is not open".to_owned(),
-        })?;
-        if let Err(err) = write_frame(stream, event).await {
-            *uni_stream = None;
-            return Err(err);
-        }
-
-        Ok(())
-    }
-
-    pub fn close(&self, reason: &[u8]) {
-        self.inner.iroh_connection.close(0u32.into(), reason);
-    }
-
-    pub fn selected_path(&self) -> Option<SelectedPath> {
-        self.inner
-            .iroh_connection
-            .paths()
-            .iter()
-            .find(|path| path.is_selected())
-            .map(|path| {
-                let remote_addr = path.remote_addr();
-                let kind = if remote_addr.is_relay() {
-                    SelectedPathKind::Relay
-                } else if remote_addr.is_ip() {
-                    SelectedPathKind::Direct
-                } else {
-                    SelectedPathKind::Other
-                };
-                SelectedPath {
-                    kind,
-                    remote_addr: remote_addr.to_string(),
-                }
-            })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedPath {
-    pub kind: SelectedPathKind,
-    pub remote_addr: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectedPathKind {
-    Direct,
-    Relay,
-    Other,
-}
-
-impl SelectedPathKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Relay => "relay",
-            Self::Other => "other",
         }
     }
 }
@@ -231,6 +315,26 @@ where
     writer.write_all(&body).await?;
     writer.flush().await?;
     Ok(())
+}
+
+fn protocol_request_kind(request: &ProtocolRequest) -> &'static str {
+    match request {
+        ProtocolRequest::Control(_) => "control",
+        ProtocolRequest::Data(_) => "data",
+        ProtocolRequest::Event(_) => "event",
+        ProtocolRequest::CentralAdmin(_) => "central_admin",
+        ProtocolRequest::StorageAdmin(_) => "storage_admin",
+    }
+}
+
+fn protocol_response_kind(response: &ProtocolResponse) -> &'static str {
+    match response {
+        ProtocolResponse::Error(_) => "error",
+        ProtocolResponse::Control(_) => "control",
+        ProtocolResponse::Data(_) => "data",
+        ProtocolResponse::CentralAdmin(_) => "central_admin",
+        ProtocolResponse::StorageAdmin(_) => "storage_admin",
+    }
 }
 
 #[cfg(test)]

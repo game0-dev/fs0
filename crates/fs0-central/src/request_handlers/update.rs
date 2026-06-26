@@ -7,6 +7,9 @@ use fs0_core::{
     },
     utils::now_ms,
 };
+use std::time::Duration;
+
+const STORAGE_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) async fn begin_update(
     server: &CentralServer,
@@ -265,7 +268,13 @@ async fn grant_upload_lease_to_specific_storage(
         prefer_volume_name: lease.prefer_volume_name.clone(),
     });
 
-    match connection.rpc(ProtocolRequest::Control(request)).await? {
+    match connection
+        .rpc(
+            ProtocolRequest::Control(request),
+            Some(STORAGE_CONTROL_REQUEST_TIMEOUT),
+        )
+        .await?
+    {
         ProtocolResponse::Control(ControlResponse::GrantUploadLease { lease_id })
             if lease_id == lease.lease_id =>
         {
@@ -289,9 +298,10 @@ async fn revoke_storage_upload_lease(server: &CentralServer, storage_id: u64, le
     };
 
     let _: Fs0Result<ProtocolResponse> = connection
-        .rpc(ProtocolRequest::Control(
-            ControlRequest::RevokeUploadLease { lease_id },
-        ))
+        .rpc(
+            ProtocolRequest::Control(ControlRequest::RevokeUploadLease { lease_id }),
+            Some(STORAGE_CONTROL_REQUEST_TIMEOUT),
+        )
         .await;
 }
 
