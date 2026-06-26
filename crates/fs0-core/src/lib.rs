@@ -34,6 +34,8 @@ pub const VOLUME_DEFAULT_DATA_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4G
 pub const VOLUME_DB_FILE: &str = ".fs0.sqlite";
 /// Prefix for each backing data file within a volume.
 pub const VOLUME_DATA_FILE_PREFIX: &str = ".fs0.data.";
+/// RPC timeout for client chunk upload and download requests.
+pub const CLIENT_CHUNK_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Current volume metadata format version.
 pub const VOLUME_FORMAT_VERSION: u64 = 1;
 /// Maximum number of concurrent chunk reads from a volume.

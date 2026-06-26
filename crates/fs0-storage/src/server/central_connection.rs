@@ -8,9 +8,7 @@ use fs0_core::{
         StoragePeerInfo,
     },
 };
-use fs0_transport::{
-    ConnectOptions, ConnectRetry, Connection, EndpointAddr, Transport, Watcher as _,
-};
+use fs0_transport::{Connection, EndpointAddr, Transport, Watcher as _};
 use fs0_volume::Volume;
 use parking_lot::RwLock;
 use std::{
@@ -23,12 +21,6 @@ use std::{
 };
 use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
-
-const CENTRAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const CENTRAL_CONNECT_RETRY_ATTEMPTS: usize = 3;
-const CENTRAL_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
-const CENTRAL_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
-const CENTRAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 pub(crate) struct CentralConnection {
@@ -54,19 +46,8 @@ impl CentralConnection {
     ) -> Fs0Result<Connection> {
         let central_endpoint = config.central_endpoint.into();
         info!(endpoint = ?central_endpoint, "connecting storage to central");
-        let connect_options = ConnectOptions::new()
-            .with_timeout(CENTRAL_CONNECT_TIMEOUT)
-            .with_retry(ConnectRetry::new(
-                CENTRAL_CONNECT_RETRY_ATTEMPTS,
-                CENTRAL_CONNECT_RETRY_DELAY,
-                CENTRAL_CONNECT_RETRY_MAX_DELAY,
-            ));
         let connection = transport
-            .connect(
-                central_endpoint,
-                TRANSPORT_CONTROL_ALPN,
-                Some(connect_options),
-            )
+            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN, None)
             .await?;
         let (storage_id, _storages, iroh_endpoint) = match self
             .register_storage(config, transport, volumes, &connection)
@@ -286,7 +267,7 @@ impl CentralConnection {
                     volumes,
                     iroh_endpoint: data_endpoint.clone(),
                 }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {
@@ -318,7 +299,7 @@ impl CentralConnection {
                     client_id,
                     client_token,
                 }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {
@@ -351,7 +332,7 @@ impl CentralConnection {
                     storage_id,
                     iroh_endpoint,
                 }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {
@@ -380,7 +361,7 @@ impl CentralConnection {
         match connection
             .rpc(
                 ProtocolRequest::Control(ControlRequest::ReportBundleReplica { events }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {
@@ -409,7 +390,7 @@ impl CentralConnection {
                     volume_id,
                     max_volume_offset,
                 }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {

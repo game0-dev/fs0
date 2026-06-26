@@ -4,36 +4,20 @@ mod request_scheduler;
 use crate::{Fs0Error, Fs0Result, central_session::CentralSession};
 use fs0_config::ClientConfig;
 use fs0_core::{
-    DEFAULT_ZSTD_LEVEL, HashId, TRANSPORT_DATA_ALPN, blake3_hash,
+    CLIENT_CHUNK_RPC_TIMEOUT, DEFAULT_ZSTD_LEVEL, HashId, TRANSPORT_DATA_ALPN, blake3_hash,
     protocol::{
         DataRequest, DataResponse, DownloadChunkRequest, ProtocolRequest, ProtocolResponse,
         UploadChunkRequest, UploadChunkResponse,
     },
     zstd_compress, zstd_decompress,
 };
-use fs0_transport::{ConnectOptions, ConnectRetry, Connection, Transport};
-use std::{
-    fmt,
-    io::SeekFrom,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use fs0_transport::{Connection, Transport};
+use std::{fmt, io::SeekFrom, path::PathBuf, sync::Arc, time::Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use self::request_scheduler::HashRequestScheduler;
-
-const STORAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const STORAGE_CONNECT_RETRY_ATTEMPTS: usize = 3;
-const STORAGE_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
-const STORAGE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
-const STORAGE_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
-const STORAGE_HAS_TIMEOUT: Duration = Duration::from_secs(15);
-const STORAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const STORAGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
-const STORAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct StorageSession {
     pub(crate) inner: Arc<StorageSessionInner>,
@@ -301,16 +285,9 @@ impl StorageSessionInner {
             .ok_or(Fs0Error::NotFound)?;
         let data_endpoint = postcard::from_bytes(&storage.iroh_endpoint).map_err(Fs0Error::from)?;
         info!(endpoint = ?data_endpoint, "client connecting to storage");
-        let connect_options = ConnectOptions::new()
-            .with_timeout(STORAGE_CONNECT_TIMEOUT)
-            .with_retry(ConnectRetry::new(
-                STORAGE_CONNECT_RETRY_ATTEMPTS,
-                STORAGE_CONNECT_RETRY_DELAY,
-                STORAGE_CONNECT_RETRY_MAX_DELAY,
-            ));
         let connection = self
             .transport
-            .connect(data_endpoint, TRANSPORT_DATA_ALPN, Some(connect_options))
+            .connect(data_endpoint, TRANSPORT_DATA_ALPN, None)
             .await?;
         self.authenticate(connection.clone()).await?;
 
@@ -326,7 +303,7 @@ impl StorageSessionInner {
                     client_id: self.client_id,
                     client_token: self.config.token.clone(),
                 }),
-                Some(STORAGE_AUTH_TIMEOUT),
+                None,
             )
             .await
         {
@@ -361,16 +338,17 @@ impl StorageSessionInner {
     pub(crate) async fn request(&self, request: DataRequest) -> Fs0Result<DataResponse> {
         let connection = self.ensure_connected().await?;
         let timeout = match &request {
-            DataRequest::HasChunk { .. } | DataRequest::HasBundle { .. } => STORAGE_HAS_TIMEOUT,
-            DataRequest::UploadChunk(_) => STORAGE_UPLOAD_TIMEOUT,
-            DataRequest::CommitBundle(_) => STORAGE_COMMIT_TIMEOUT,
-            DataRequest::DownloadChunk(_) | DataRequest::ListBundleChunks { .. } => {
-                STORAGE_DOWNLOAD_TIMEOUT
+            DataRequest::UploadChunk(_) | DataRequest::DownloadChunk(_) => {
+                Some(CLIENT_CHUNK_RPC_TIMEOUT)
             }
-            DataRequest::Authenticate { .. } => STORAGE_AUTH_TIMEOUT,
+            DataRequest::Authenticate { .. }
+            | DataRequest::HasChunk { .. }
+            | DataRequest::HasBundle { .. }
+            | DataRequest::CommitBundle(_)
+            | DataRequest::ListBundleChunks { .. } => None,
         };
         let response = match connection
-            .rpc(ProtocolRequest::Data(request), Some(timeout))
+            .rpc(ProtocolRequest::Data(request), timeout)
             .await?
         {
             ProtocolResponse::Error(err) => Err(err),

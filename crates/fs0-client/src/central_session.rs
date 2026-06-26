@@ -7,23 +7,14 @@ use fs0_core::{
         StoragePeerInfo,
     },
 };
-use fs0_transport::{ConnectOptions, ConnectRetry, Connection, Transport};
+use fs0_transport::{Connection, Transport};
 use parking_lot::RwLock;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-
-const CENTRAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const CENTRAL_CONNECT_RETRY_ATTEMPTS: usize = 3;
-const CENTRAL_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
-const CENTRAL_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
-const CENTRAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) struct CentralSession {
     config: ClientConfig,
@@ -62,10 +53,7 @@ impl CentralSession {
     pub(crate) async fn request(&self, request: ControlRequest) -> Fs0Result<ControlResponse> {
         let connection = self.ensure_connected().await?;
         match connection
-            .rpc(
-                ProtocolRequest::Control(request),
-                Some(CENTRAL_REQUEST_TIMEOUT),
-            )
+            .rpc(ProtocolRequest::Control(request), None)
             .await?
         {
             ProtocolResponse::Error(err) => Err(err),
@@ -118,20 +106,9 @@ impl CentralSession {
         let central_endpoint = self.config.central_endpoint.into();
         info!(endpoint = ?central_endpoint, "client connecting to central");
         self.event_listener_stopping.store(false, Ordering::Release);
-        let connect_options = ConnectOptions::new()
-            .with_timeout(CENTRAL_CONNECT_TIMEOUT)
-            .with_retry(ConnectRetry::new(
-                CENTRAL_CONNECT_RETRY_ATTEMPTS,
-                CENTRAL_CONNECT_RETRY_DELAY,
-                CENTRAL_CONNECT_RETRY_MAX_DELAY,
-            ));
         let new_connection = self
             .transport
-            .connect(
-                central_endpoint,
-                TRANSPORT_CONTROL_ALPN,
-                Some(connect_options),
-            )
+            .connect(central_endpoint, TRANSPORT_CONTROL_ALPN, None)
             .await?;
         let response = match new_connection
             .rpc(
@@ -140,7 +117,7 @@ impl CentralSession {
                     token: self.config.token.clone(),
                     version: FS0_VERSION.to_owned(),
                 }),
-                Some(CENTRAL_REQUEST_TIMEOUT),
+                None,
             )
             .await?
         {
